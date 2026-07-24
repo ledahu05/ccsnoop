@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // ccsnoop — single CLI entrypoint with argv-subcommand dispatch.
-// Live: start / stop / status (daemon lifecycle, spec §3.4). init/report stubbed.
+// Live: start / stop / status (daemon lifecycle, spec §3.4) + report (spec §3.5). init stubbed.
 
 import { start } from '../src/proxy.js';
 import * as daemon from '../src/daemon.js';
+import { generateReport } from '../src/report.js';
 
 const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report'];
 
@@ -35,8 +36,9 @@ async function main() {
   if (sub === 'start') return runStart(home, args);
   if (sub === 'stop') return runStop(home, args);
   if (sub === 'status') return runStatus(home, args);
+  if (sub === 'report') return runReport(args);
 
-  // Stubs for the not-yet-live subcommands (init/report slices).
+  // Stub for the not-yet-live subcommands (init slice).
   console.log(`ccsnoop ${sub}: not implemented yet (stub)`);
 }
 
@@ -114,6 +116,23 @@ async function runServe(args) {
 }
 
 /**
+ * Render the static HTML report from a captured session (spec §2, §3.5).
+ * @param {string[]} args
+ */
+function runReport(args) {
+  const result = generateReport({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    session: getFlag(args, '--session'),
+    out: getFlag(args, '--out'),
+    all: hasFlag(args, '--all'),
+  });
+  console.log(`ccsnoop report: wrote ${result.outPath}`);
+  console.log(`  session: ${result.sessionId} (${result.exchanges} request${result.exchanges === 1 ? '' : 's'})`);
+  console.log(`  open it in a browser — self-contained, works offline`);
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -122,6 +141,16 @@ async function runServe(args) {
 function getFlag(args, name) {
   const i = args.indexOf(name);
   return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+}
+
+/**
+ * Test whether a boolean flag is present in argv.
+ * @param {string[]} args
+ * @param {string} name
+ * @returns {boolean}
+ */
+function hasFlag(args, name) {
+  return args.includes(name);
 }
 
 function printUsage() {
@@ -135,8 +164,12 @@ Commands:
              --sessions-dir <p>   capture root (default ~/.ccsnoop/sessions)
   stop     Stop the daemon (drain, then terminate)
   status   Report daemon status (running → exit 0, stopped → exit 1)
-  init      (stub) prepare settings.local.json + gitignore
-  report    (stub) render the static HTML report`);
+  report   Render a captured session to a self-contained static HTML file
+             --root <path>        capture root (default ./.ccsnoop)
+             --session <id>       session to render (default: latest)
+             --all                widen discovery across ~/.ccsnoop/routes.json
+             --out <path>         output file (default <session-dir>/report.html)
+  init      (stub) prepare settings.local.json + gitignore`);
 }
 
 main().catch((err) => {
