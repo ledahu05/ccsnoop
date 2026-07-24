@@ -91,15 +91,20 @@ async function runServe(args) {
   const home = getFlag(args, '--home') ?? daemon.defaultHome();
   const port = Number(getFlag(args, '--port') ?? daemon.configuredPort(home));
   const host = getFlag(args, '--host') ?? '127.0.0.1';
-  const sessionsDir = getFlag(args, '--sessions-dir')
-    ?? process.env.CCSNOOP_SESSIONS_DIR
-    ?? daemon.paths(home).sessions;
+
+  // Default: path-token routing (spec §3.3) — one daemon serves many repos via
+  // `routes.json`. An explicit `--sessions-dir` (or CCSNOOP_SESSIONS_DIR) pins
+  // the daemon to a single capture dir instead (capture-core / testing mode).
+  const sessionsDirOverride = getFlag(args, '--sessions-dir') ?? process.env.CCSNOOP_SESSIONS_DIR;
+  const routesFile = sessionsDirOverride ? undefined : daemon.paths(home).routes;
+  const sessionsDir = sessionsDirOverride ?? daemon.paths(home).sessions;
+  const capturingTo = routesFile ? `routes.json (${daemon.countRoutes(home)} repos)` : sessionsDir;
 
   try {
-    const server = await start({ port, host, sessionsDir });
+    const server = await start({ port, host, sessionsDir, routesFile });
     const addr = server.address();
     const boundPort = typeof addr === 'object' && addr ? addr.port : port;
-    console.log(`[ccsnoop] daemon up: pid ${process.pid}, http://${host}:${boundPort}, capturing to ${sessionsDir}`);
+    console.log(`[ccsnoop] daemon up: pid ${process.pid}, http://${host}:${boundPort}, capturing to ${capturingTo}`);
 
     const shutdown = () => {
       console.log(`[ccsnoop] draining and shutting down (pid ${process.pid})`);

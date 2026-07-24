@@ -18,16 +18,24 @@ import {
   buildRequestBlob,
   turnStem,
 } from './capture.js';
+import { splitToken, readRoutes, routeDir, unknownTokenError } from './routes.js';
 
 /**
  * @typedef {object} ProxyOptions
- * @property {string} [sessionsDir]   Capture-dir root (default: ./sessions).
+ * @property {string} [sessionsDir]   Capture-dir root (default: ./sessions). Used
+ *   only in single-repo mode (no `routesFile`).
+ * @property {string} [routesFile]    Path to `routes.json`. When set, the proxy
+ *   runs in path-token routing mode (spec §3.3): each request's leading URL
+ *   segment is a token resolved to a per-repo capture dir, and `/<dir>/sessions`
+ *   is the tee target.
  * @property {string} [upstreamHost]  Upstream host (default: api.anthropic.com).
  * @property {number} [upstreamPort]  Upstream port (default: 443).
  * @property {typeof https.request} [requestFn]  Upstream request fn — injectable
  *   for tests (default: https.request; use http.request against a fake upstream).
  * @property {string} [lifecycleId]   Fallback single-session id (default: derived
  *   at server creation).
+ * @property {(line: string) => void} [log]  Structured-line sink → `daemon.log`
+ *   (default: console.log). Used for the unknown-token error entry (spec §3.3).
  */
 
 /**
@@ -38,16 +46,62 @@ import {
  */
 export function createProxyServer(options = {}) {
   const sessionsDir = options.sessionsDir ?? path.resolve(process.cwd(), 'sessions');
+  const routesFile = options.routesFile;
   const upstreamHost = options.upstreamHost ?? UPSTREAM_HOST;
   const upstreamPort = options.upstreamPort ?? 443;
   const requestFn = options.requestFn ?? https.request;
   const lifecycleId = options.lifecycleId ?? `proxy-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+  const log = options.log ?? ((line) => console.log(line));
 
   /** Per-directory turn counter (capture order). @type {Map<string, number>} */
   const turns = new Map();
 
   const server = http.createServer((creq, cres) => {
     const requestReceivedAt = new Date().toISOString();
+    const rawUrl = creq.url ?? '/';
+
+    // Path-token routing (spec §3.3): strip `/<token>`, resolve the per-repo
+    // capture dir, forward the stripped path upstream. Single-repo mode
+    // (no routesFile) forwards the URL untouched to the fixed `sessionsDir`.
+    let targetSessionsDir = sessionsDir;
+    let upstreamPath = rawUrl;
+    if (routesFile) {
+      const { token, rest, restPath } = splitToken(rawUrl);
+
+      // Pre-flight `HEAD /<token>/api/hello` (prefix-preserving) must answer 200
+      // for ANY token — a 4xx makes CC never send the real request (spec §3.3).
+      // HEAD is never failed, even on an unknown token.
+      if (creq.method === 'HEAD' && restPath === '/api/hello') {
+        creq.resume();
+        cres.writeHead(200);
+        cres.end();
+        return;
+      }
+
+      const dir = routeDir(readRoutes(routesFile), token);
+      if (dir == null) {
+        // HEAD is never failed (spec §3.3); only POST breaks loud.
+        if (creq.method === 'HEAD') {
+          creq.resume();
+          cres.writeHead(200);
+          cres.end();
+          return;
+        }
+        // Unknown token — fail LOUD with an Anthropic-shaped body CC renders
+        // verbatim, and one matching `daemon.log` entry (spec §3.3).
+        const errBody = unknownTokenError(token);
+        log(errBody);
+        creq.resume();
+        cres.writeHead(502, { 'content-type': 'application/json' });
+        cres.end(errBody);
+        return;
+      }
+
+      // Known token — a deleted-but-registered dir is a live route: `sessions`
+      // is (re)created below via mkdirSync per turn, so capture just continues.
+      targetSessionsDir = path.join(dir, 'sessions');
+      upstreamPath = rest;
+    }
 
     // Buffer the request body: we need it whole to derive the session boundary
     // and to write the request blob. Only the RESPONSE must stream (spec §1.4).
@@ -61,7 +115,7 @@ export function createProxyServer(options = {}) {
       // Session boundary (spec §1.5) with proxy-lifecycle fallback.
       const session = deriveSession(body) ?? { sessionId: lifecycleId, parentSessionId: null };
       const dirId = sanitizeId(folderSessionId(session));
-      const dir = path.join(sessionsDir, dirId);
+      const dir = path.join(targetSessionsDir, dirId);
       const turn = (turns.get(dirId) ?? 0) + 1;
       turns.set(dirId, turn);
       const stem = turnStem(turn);
@@ -74,7 +128,7 @@ export function createProxyServer(options = {}) {
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(
           path.join(dir, requestBlob),
-          buildRequestBlob({ method: creq.method ?? 'GET', url: creq.url ?? '/', rawHeaders: creq.rawHeaders, body })
+          buildRequestBlob({ method: creq.method ?? 'GET', url: upstreamPath, rawHeaders: creq.rawHeaders, body })
         );
       } catch {
         endWithError(cres, 500);
@@ -88,7 +142,7 @@ export function createProxyServer(options = {}) {
         {
           hostname: upstreamHost,
           port: upstreamPort,
-          path: creq.url,
+          path: upstreamPath,
           method: creq.method,
           headers,
         },
