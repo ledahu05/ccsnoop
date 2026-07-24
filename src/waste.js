@@ -401,23 +401,29 @@ function laneKey(threadId, _index) {
  * @param {Segment[][]} allSegments
  */
 function markStatic(exchanges, allSegments) {
-  // lane → slot → Set<hash>
-  /** @type {Map<string, Map<string, Set<string>>>} */
+  // lane → slot → { count: appearances, hashes: distinct content hashes }
+  /** @type {Map<string, Map<string, { count: number, hashes: Set<string> }>>} */
   const lanes = new Map();
   exchanges.forEach((e, i) => {
     const key = laneKey(e.threadId, i);
     let slots = lanes.get(key);
     if (!slots) lanes.set(key, (slots = new Map()));
     for (const seg of allSegments[i]) {
-      let hashes = slots.get(seg.slot);
-      if (!hashes) slots.set(seg.slot, (hashes = new Set()));
-      hashes.add(seg.hash);
+      let entry = slots.get(seg.slot);
+      if (!entry) slots.set(seg.slot, (entry = { count: 0, hashes: new Set() }));
+      entry.count++;
+      entry.hashes.add(seg.hash);
     }
   });
   exchanges.forEach((e, i) => {
     const slots = lanes.get(laneKey(e.threadId, i));
     for (const seg of allSegments[i]) {
-      seg.static = (slots?.get(seg.slot)?.size ?? 0) === 1;
+      const entry = slots?.get(seg.slot);
+      // Static = a RECURRING slot (≥2 appearances) whose content never changed.
+      // A slot seen only once can't be "unchanged across turns"; calling it static
+      // would mislabel a brand-new, one-off block (e.g. the final current turn) as
+      // recurring. Flagship is unaffected — reused-uncached always recurs.
+      seg.static = entry != null && entry.count >= 2 && entry.hashes.size === 1;
     }
   });
 }

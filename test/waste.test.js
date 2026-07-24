@@ -240,3 +240,41 @@ test('computeWaste counts bloat separately from the re-sent tally', () => {
   // A first-request bloat is not re-sent waste — separate signal.
   assert.equal(summary.reusedUncachedBytes, 0);
 });
+
+test('a slot that appears only once is NOT static (single-appearance blocks never recur)', () => {
+  // One request in its lineage — every slot appears exactly once, so nothing can be
+  // "unchanged across turns". A brand-new one-off block must not carry a static flag.
+  const { perExchange } = computeWaste([
+    { threadId: 'A', requestBody: { system: 'sys', messages: [{ role: 'user', content: 'q1' }] }, usage: usage({ input: 10 }) },
+  ]);
+  assert.ok(perExchange[0].segments.every((s) => s.kind === 'new'));
+  assert.ok(perExchange[0].segments.every((s) => s.static === false), 'no once-seen slot is static');
+});
+
+test('the final current turn (a one-off slot) is not mislabeled static across a growing lineage', () => {
+  // As the conversation grows, the last message of each request is new that turn and
+  // recurs (unchanged) as history later — so it IS static. But the LAST request\'s
+  // current turn never recurs; it must stay non-static.
+  const mk = (n) => ({ system: 'sys', messages: Array.from({ length: n }, (_, k) => ({ role: 'user', content: 'q' + k })) });
+  const { perExchange } = computeWaste([
+    { threadId: 'A', requestBody: mk(1), usage: usage({ input: 10 }) },
+    { threadId: 'A', requestBody: mk(2), usage: usage({ input: 5, cacheRead: 1000 }) },
+    { threadId: 'A', requestBody: mk(3), usage: usage({ input: 5, cacheRead: 1000 }) },
+  ]);
+  // message#0 recurs unchanged across all three → static.
+  const m0 = perExchange[2].segments.find((s) => s.slot === 'message#0');
+  assert.equal(m0.static, true);
+  // message#2 is the final current turn, seen only in the last request → not static.
+  const last = perExchange[2].segments.find((s) => s.slot === 'message#2');
+  assert.equal(last.kind, 'new');
+  assert.equal(last.static, false);
+});
+
+test('static requires unchanged content — a slot whose content changes is not static', () => {
+  const { perExchange } = computeWaste([
+    { threadId: 'A', requestBody: { system: 'v1', messages: [{ role: 'user', content: 'q1' }] }, usage: usage({ input: 10 }) },
+    { threadId: 'A', requestBody: { system: 'v2', messages: [{ role: 'user', content: 'q1' }] }, usage: usage({ input: 5, cacheRead: 1000 }) },
+  ]);
+  const sys = perExchange[1].segments.find((s) => s.slot === 'system');
+  assert.equal(sys.static, false, 'content changed between turns → not static');
+});
