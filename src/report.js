@@ -11,6 +11,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { computeWaste } from './waste.js';
+
 /**
  * @typedef {object} Usage
  * @property {number} inputTokens
@@ -214,6 +216,9 @@ export function buildExchange(line, requestBuf, responseBuf) {
     url: req.url,
     requestBlob: req.text,
     requestBytes: requestBuf.length,
+    // Parsed body is kept only for waste computation in loadSession, then dropped
+    // before the model is embedded (the redacted raw blob already carries it).
+    requestJson: req.json,
     anatomy,
     usage,
   };
@@ -223,11 +228,16 @@ export function buildExchange(line, requestBuf, responseBuf) {
  * Load a captured session directory into a report model. Reads the manifest
  * (capture order) and each exchange's raw blobs.
  *
+ * Waste signals (spec §2.4) are computed here over the whole session: each
+ * exchange is annotated with its segment classification, and a session-level
+ * waste summary is returned alongside.
+ *
  * @param {string} dir  The `sessions/<session_id>/` directory.
  * @param {string} [id] Session id (defaults to the dir's basename).
- * @returns {{ sessionId: string, exchanges: object[] }}
+ * @param {Partial<import('./waste.js').WasteConfig>} [wasteConfig] Report-time overrides (spec §2.6).
+ * @returns {{ sessionId: string, exchanges: object[], waste: object, wasteConfig: object }}
  */
-export function loadSession(dir, id) {
+export function loadSession(dir, id, wasteConfig) {
   const manifestPath = path.join(dir, 'manifest.jsonl');
   const lines = fs
     .readFileSync(manifestPath, 'utf8')
@@ -244,7 +254,27 @@ export function loadSession(dir, id) {
     }
     return buildExchange(line, requestBuf, responseBuf);
   });
-  return { sessionId: id ?? path.basename(dir), exchanges };
+
+  const { perExchange, summary, config } = computeWaste(
+    exchanges.map((e) => ({ threadId: e.threadId, requestBody: e.requestJson, usage: e.usage })),
+    wasteConfig ?? {}
+  );
+  exchanges.forEach((e, i) => {
+    const w = perExchange[i];
+    e.segments = w.segments;
+    e.waste = {
+      cacheBoundary: w.cacheBoundary,
+      cold: w.cold,
+      reusedUncachedBytes: w.reusedUncachedBytes,
+      reusedUncachedByBucket: w.reusedUncachedByBucket,
+      bloatCount: w.bloatCount,
+      flagshipCount: w.flagshipCount,
+      flagshipBytes: w.flagshipBytes,
+    };
+    delete e.requestJson; // computation-only; not embedded in the report
+  });
+
+  return { sessionId: id ?? path.basename(dir), exchanges, waste: summary, wasteConfig: config };
 }
 
 /**
@@ -321,7 +351,7 @@ function readRoutesRoots() {
 /**
  * Discover, load, render and write a report (spec §3.5 discovery + §2 content).
  *
- * @param {{ cwd?: string, root?: string, session?: string, all?: boolean, out?: string }} [opts]
+ * @param {{ cwd?: string, root?: string, session?: string, all?: boolean, out?: string, waste?: object }} [opts]
  * @returns {{ outPath: string, sessionId: string, exchanges: number, root: string }}
  */
 export function generateReport(opts = {}) {
@@ -344,7 +374,7 @@ export function generateReport(opts = {}) {
     chosen = pickLatestSession(sessions);
   }
 
-  const model = loadSession(chosen.dir, chosen.id);
+  const model = loadSession(chosen.dir, chosen.id, opts.waste);
   const html = renderReport(model);
   const outPath = opts.out ? path.resolve(cwd, opts.out) : path.join(chosen.dir, 'report.html');
   fs.writeFileSync(outPath, html);
@@ -434,6 +464,31 @@ body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Robot
 .raw h3{font-size:13px;margin:18px 0 6px}
 pre.raw-blob{background:#0a0c11;border:1px solid var(--edge);border-radius:6px;padding:12px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#cfd6e6}
 .empty{color:var(--muted);padding:40px;text-align:center}
+/* Waste signals (spec §2.4–2.5): 3-tier segment coloring, badges, cache overlay. */
+:root{--k-new:#5b9dff;--k-cached:#4a5163;--k-waste:#e5566b}
+.wmark{font-variant-numeric:tabular-nums;font-size:11px;color:var(--muted)}
+.wmark .waste{color:var(--k-waste)}
+.wmark .bloat{color:var(--hist)}
+.summary .waste{color:var(--k-waste)}
+.seglist{margin:6px 0 0}
+.seg-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-left:3px solid var(--k-cached);background:#12151d;border-radius:0 4px 4px 0;margin-bottom:3px;font-size:12px}
+.seg-row.new{border-left-color:var(--k-new)}
+.seg-row.reused-cached{border-left-color:var(--k-cached);opacity:.7}
+.seg-row.reused-uncached{border-left-color:var(--k-waste);background:#241419}
+.seg-row .lab{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seg-row .sb{color:var(--muted);font-variant-numeric:tabular-nums}
+.badge{font-size:10px;padding:1px 6px;border-radius:8px;border:1px solid var(--edge);white-space:nowrap}
+.badge.k-new{color:var(--k-new)}
+.badge.k-reused-cached{color:var(--muted)}
+.badge.k-reused-uncached{color:var(--k-waste);border-color:var(--k-waste)}
+.badge.static{color:var(--sys);border-color:var(--sys)}
+.badge.bloat{color:var(--hist);border-color:var(--hist)}
+.badge.flagship{color:#fff;background:var(--k-waste);border-color:var(--k-waste)}
+.cache-div{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--tools);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.cache-div::before,.cache-div::after{content:"";flex:1;height:1px;background:var(--tools);opacity:.5}
+.acc .wstate{font-size:11px}
+.acc .wstate .re{color:var(--k-waste)}
+.acc .wstate .bl{color:var(--hist)}
 `;
 
 // Client renderer. Kept dependency-free and small; builds DOM (no innerHTML for
@@ -456,12 +511,17 @@ const REPORT_JS = `
   var totalIn = ex.reduce(function(s,e){ return s + (e.usage?e.usage.inputTokens:0); },0);
   var totalOut = ex.reduce(function(s,e){ return s + (e.usage?e.usage.outputTokens:0); },0);
   var totalCacheRead = ex.reduce(function(s,e){ return s + (e.usage?e.usage.cacheReadInputTokens:0); },0);
+  var w = model.waste || {reusedUncachedBytes:0,bloatCount:0,flagshipCount:0,flagshipBytes:0};
   var sum = document.getElementById('summary');
   sum.innerHTML='';
   sum.appendChild(span(ex.length+' requests'));
   sum.appendChild(span(' · in <b>'+fmt(totalIn)+'</b> tok'));
   sum.appendChild(span(' · out <b>'+fmt(totalOut)+'</b> tok'));
   sum.appendChild(span(' · cache-read <b>'+fmt(totalCacheRead)+'</b> tok'));
+  // Headline waste = reused-uncached bytes (a proxy); bloat flags counted separately.
+  sum.appendChild(span(' · <span class="waste">re-sent <b>'+bytes(w.reusedUncachedBytes)+'</b></span> <span title="byte proxy — no per-segment token count">(proxy)</span>'));
+  sum.appendChild(span(' · <b>'+fmt(w.bloatCount)+'</b> bloat'));
+  if(w.flagshipCount>0) sum.appendChild(span(' · <span class="waste"><b>'+fmt(w.flagshipCount)+'</b> flagship</span>'));
   function span(html){ var s=document.createElement('span'); s.innerHTML=html; return s; }
 
   // Growth chart: bar height = input tokens (usage); stacked by anatomy byte share.
@@ -488,7 +548,16 @@ const REPORT_JS = `
   var master = document.getElementById('master');
   ex.forEach(function(e,i){
     var row = el('div','row'); row.dataset.i=i;
-    row.appendChild(el('span','rn','#'+(e.turn!=null?e.turn:(i+1))));
+    var left = el('div'); left.style.display='flex'; left.style.flexDirection='column'; left.style.gap='2px';
+    left.appendChild(el('span','rn','#'+(e.turn!=null?e.turn:(i+1))));
+    // Per-request waste marker: reused-uncached bytes + bloat-flag count (spec §2.5).
+    var ew = e.waste || {reusedUncachedBytes:0,bloatCount:0};
+    var mark = el('span','wmark');
+    if(ew.reusedUncachedBytes>0){ var rs=el('span','waste','↺ '+bytes(ew.reusedUncachedBytes)); mark.appendChild(rs); }
+    if(ew.bloatCount>0){ if(mark.childNodes.length) mark.appendChild(document.createTextNode(' ')); mark.appendChild(el('span','bloat','⚑'+ew.bloatCount)); }
+    if(!mark.childNodes.length) mark.textContent='—';
+    left.appendChild(mark);
+    row.appendChild(left);
     row.appendChild(el('span','rin', bytes(e.anatomy.total)));
     row.addEventListener('click', function(){ select(i); });
     master.appendChild(row);
@@ -518,20 +587,49 @@ const REPORT_JS = `
     } else {
       usage.appendChild(chip('Usage','none captured'));
     }
+    var ew = e.waste || {};
+    usage.appendChild(chip('Re-sent (proxy)', bytes(ew.reusedUncachedBytes||0)));
+    if(ew.cold) usage.appendChild(chip('Cache','cold — reused re-billed'));
     detail.appendChild(usage);
+
+    // Segments carry their global order; group by bucket but keep the global index
+    // so the cache-boundary overlay can be dropped at the right seam.
+    var segs = e.segments || [];
+    var byBucket = {system:[],tools:[],history:[],currentTurn:[]};
+    segs.forEach(function(sg,gi){ if(byBucket[sg.bucket]) byBucket[sg.bucket].push({s:sg,gi:gi}); });
+    var boundary = ew.cacheBoundary||0;
 
     var total = e.anatomy.total||0;
     ANATOMY.forEach(function(a){
       var sz = e.anatomy[a.key]||0;
       var pct = total>0 ? Math.round(sz/total*100) : 0;
+      var rows = byBucket[a.key]||[];
+      var reBytes = (ew.reusedUncachedByBucket && ew.reusedUncachedByBucket[a.key])||0;
+      var blCount = rows.filter(function(r){ return r.s.bloated; }).length;
       var d = el('details','acc'); if(a.key==='currentTurn') d.open=true;
       var s = el('summary');
       var left = el('span'); var sw=el('span','swatch'); sw.style.background=a.color; left.appendChild(sw); left.appendChild(document.createTextNode(a.label));
+      // Waste-state label on the section (spec §2.2 level 2).
+      var ws = el('span','wstate');
+      if(reBytes>0){ ws.appendChild(el('span','re',' · re-sent '+bytes(reBytes))); }
+      if(blCount>0){ ws.appendChild(el('span','bl',' · bloated ×'+blCount)); }
+      left.appendChild(ws);
       s.appendChild(left);
       s.appendChild(el('span','sz', bytes(sz)+'  ·  '+pct+'%'));
       d.appendChild(s);
       var b = el('div','body');
       var bar = el('div','bar'); var fill=el('i'); fill.style.width=pct+'%'; fill.style.background=a.color; bar.appendChild(fill); b.appendChild(bar);
+      // 3-tier colored segment list + cache-boundary overlay + badges (spec §2.5).
+      if(rows.length){
+        var list = el('div','seglist');
+        rows.forEach(function(r){
+          if(r.gi===boundary && boundary>0 && boundary<segs.length){
+            list.appendChild(el('div','cache-div','cache boundary — cached prefix ends'));
+          }
+          list.appendChild(segRow(r.s));
+        });
+        b.appendChild(list);
+      }
       d.appendChild(b);
       detail.appendChild(d);
     });
@@ -543,6 +641,20 @@ const REPORT_JS = `
     detail.appendChild(raw);
   }
   function chip(k,v){ var c=el('div','chip'); c.innerHTML='<span>'+k+'</span> <b></b>'; c.querySelector('b').textContent=v; return c; }
+
+  // One segment line: left border colored by kind, label, size, kind + waste badges.
+  var KIND_LABEL = {'new':'new','reused-cached':'cached','reused-uncached':'re-sent'};
+  function segRow(sg){
+    var kind = sg.kind||'new';
+    var row = el('div','seg-row '+kind);
+    row.appendChild(el('span','lab', sg.label||sg.slot||''));
+    row.appendChild(el('span','sb', bytes(sg.bytes||0)));
+    row.appendChild(el('span','badge k-'+kind, KIND_LABEL[kind]||kind));
+    if(sg.flagship) row.appendChild(el('span','badge flagship','flagship'));
+    else if(sg.static) row.appendChild(el('span','badge static','static'));
+    if(sg.bloated) row.appendChild(el('span','badge bloat','bloat '+bytes(sg.bloatBytes||0)));
+    return row;
+  }
 
   if(ex.length===0){ detail.appendChild(el('div','empty','No exchanges captured in this session.')); }
   else select(0);

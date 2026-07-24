@@ -341,3 +341,107 @@ test('generateReport throws a helpful error when no sessions exist', () => {
   const root = mkTmpDir();
   assert.throws(() => generateReport({ cwd: '/nonexistent', root }), /no captured sessions/);
 });
+
+// ── waste signals wired into the model + report (spec §2.4–2.5, issue #22) ─────
+
+/** Write a two-request session whose second request re-sends a cold-cache prefix. */
+function writeWasteSession(root, id) {
+  const dir = path.join(root, 'sessions', id);
+  fs.mkdirSync(dir, { recursive: true });
+  const bigSys = 'S'.repeat(6000);
+  const mkReq = (messages) =>
+    buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-x', system: bigSys, tools: [{ name: 'Bash' }], messages })),
+    });
+  const mkResp = (input, cacheRead) =>
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":' +
+    input +
+    ',"cache_read_input_tokens":' +
+    cacheRead +
+    ',"cache_creation_input_tokens":0,"output_tokens":1}}}\n\n' +
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n';
+
+  fs.writeFileSync(path.join(dir, '0001.request.http'), mkReq([{ role: 'user', content: 'q1' }]));
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), mkResp(2000, 0));
+  // Second request re-sends the identical big system on a COLD cache → waste.
+  fs.writeFileSync(
+    path.join(dir, '0002.request.http'),
+    mkReq([{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }])
+  );
+  fs.writeFileSync(path.join(dir, '0002.response.sse'), mkResp(3000, 0));
+
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) +
+      '\n' +
+      JSON.stringify({ turn: 2, thread_id: id, request_blob: '0002.request.http', response_blob: '0002.response.sse' }) +
+      '\n'
+  );
+  return dir;
+}
+
+test('loadSession attaches per-exchange waste + a session waste summary', () => {
+  const root = mkTmpDir();
+  const dir = writeWasteSession(root, 'sess-waste');
+  const model = loadSession(dir, 'sess-waste');
+
+  assert.ok(model.waste, 'session waste summary present');
+  assert.ok(model.wasteConfig, 'resolved config echoed back');
+  // First request: all new, no waste.
+  assert.equal(model.exchanges[0].waste.reusedUncachedBytes, 0);
+  // Second request: cold cache re-sends the big system block → reused-uncached waste.
+  const e2 = model.exchanges[1];
+  assert.ok(e2.waste.reusedUncachedBytes >= 6000, 'big system counted as re-sent waste');
+  assert.equal(e2.waste.cold, true);
+  const sys = e2.segments.find((s) => s.slot === 'system');
+  assert.equal(sys.kind, 'reused-uncached');
+  assert.equal(sys.flagship, true, 'static ∩ reused-uncached = flagship');
+  assert.ok(model.waste.reusedUncachedBytes >= 6000);
+  // The parsed body is dropped from the embedded model.
+  assert.equal(model.exchanges[0].requestJson, undefined);
+});
+
+test('renderReport surfaces waste markers, tier coloring, and the headline metric', () => {
+  const root = mkTmpDir();
+  const dir = writeWasteSession(root, 'sess-waste-html');
+  const html = renderReport(loadSession(dir, 'sess-waste-html'));
+  // Headline waste metric labelled a proxy (spec §2.5).
+  assert.ok(/re-sent/.test(html));
+  assert.ok(/proxy/.test(html));
+  // Tier + flagship rendering hooks are present in the client.
+  assert.ok(html.includes('reused-uncached'));
+  assert.ok(html.includes('flagship'));
+  assert.ok(html.includes('cache boundary'));
+});
+
+test('generateReport honours report-time bloat threshold overrides', () => {
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'sess-bloat');
+  fs.mkdirSync(dir, { recursive: true });
+  const big = 'x'.repeat(20000);
+  const body = {
+    model: 'claude-x',
+    messages: [
+      { role: 'user', content: [{ type: 'tool_result', content: 'tiny' }, { type: 'tool_result', content: big }] },
+    ],
+  };
+  fs.writeFileSync(
+    path.join(dir, '0001.request.http'),
+    buildRequestBlob({ method: 'POST', url: '/v1/messages', rawHeaders: ['Content-Type', 'application/json'], body: Buffer.from(JSON.stringify(body)) })
+  );
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), 'data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}\n\n');
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, thread_id: 'sess-bloat', request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
+  );
+
+  // Default floor flags the outlier.
+  const def = loadSession(dir, 'sess-bloat');
+  assert.equal(def.waste.bloatCount, 1);
+  // A floor above the outlier suppresses it.
+  const raised = loadSession(dir, 'sess-bloat', { bloatFloorBytes: 100000 });
+  assert.equal(raised.waste.bloatCount, 0);
+});
