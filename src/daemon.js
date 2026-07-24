@@ -351,12 +351,10 @@ export async function start(home, opts = {}) {
  * @param {object} [opts]
  * @param {number} [opts.graceMs] Drain window before SIGKILL (default 5000).
  * @param {number} [opts.pollMs]  Liveness poll interval (default 100).
- * @param {number} [opts.now]     Injected clock for testing.
  */
 export async function stop(home, opts = {}) {
   const graceMs = opts.graceMs ?? 5000;
   const pollMs = opts.pollMs ?? 100;
-  const clock = () => (opts.now != null ? opts.now : Date.now());
 
   const pid = readPid(home);
   if (!pid || !isAlive(pid)) {
@@ -370,7 +368,7 @@ export async function stop(home, opts = {}) {
     // race: already gone.
   }
 
-  const deadline = clock() + graceMs;
+  const deadline = Date.now() + graceMs;
   while (Date.now() < deadline && isAlive(pid)) {
     await sleep(pollMs);
   }

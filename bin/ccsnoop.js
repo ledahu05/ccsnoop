@@ -2,7 +2,6 @@
 // ccsnoop — single CLI entrypoint with argv-subcommand dispatch.
 // Live: start / stop / status (daemon lifecycle, spec §3.4). init/report stubbed.
 
-import path from 'node:path';
 import { start } from '../src/proxy.js';
 import * as daemon from '../src/daemon.js';
 
