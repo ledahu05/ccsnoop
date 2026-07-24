@@ -240,6 +240,60 @@ test('survives an upstream drop mid-response (ures error) — no crash, next req
   }
 });
 
+test('survives a client hangup mid-response (cres error) — no crash, next request still served', async () => {
+  const sessionsDir = mkTmpDir();
+
+  // Fake upstream that flushes headers + first chunk, then keeps streaming so
+  // the proxy keeps writing to `cres` AFTER the client yanks its socket — the
+  // write-after-disconnect that surfaces as 'error'/'close' on `cres` (#25).
+  let dropOnce = true;
+  let interval;
+  /** @type {import('node:net').Socket | null | undefined} */
+  let firstUpstreamSocket;
+  const upstream = http.createServer((req, res) => {
+    if (dropOnce) {
+      dropOnce = false;
+      firstUpstreamSocket = res.socket;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      interval = setInterval(() => res.write('event: ping\ndata: {}\n\n'), 10);
+      res.on('close', () => clearInterval(interval));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n');
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer({ sessionsDir, upstreamHost: '127.0.0.1', upstreamPort, requestFn: http.request });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // Client reads the first chunk, then hangs up its own socket mid-stream.
+    await new Promise((resolve) => {
+      const req = http.request(
+        { hostname: '127.0.0.1', port: proxyPort, method: 'POST', path: '/v1/messages' },
+        (res) => res.once('data', () => { req.destroy(); resolve(); })
+      );
+      req.on('error', () => {});
+      req.end(JSON.stringify({ metadata: { user_id: JSON.stringify({ session_id: 'client-drop' }) } }));
+    });
+
+    // The proxy must survive the client hangup and still serve the next request.
+    const res = await driveRequest(proxyPort, {
+      body: JSON.stringify({ metadata: { user_id: JSON.stringify({ session_id: 'ok2' }) } }),
+    });
+    assert.equal(res.status, 200);
+    assert.ok(res.body.includes('message_stop'), 'proxy still serving after the client hangup');
+  } finally {
+    // Guaranteed teardown: if the guard fired it already destroyed the upstream
+    // socket, but don't rely on that here — closeAll must not hang either way.
+    clearInterval(interval);
+    firstUpstreamSocket?.destroy();
+    await closeAll(proxy, upstream);
+  }
+});
+
 test('does not buffer the full response body (bytes flow through before upstream ends)', async () => {
   const sessionsDir = mkTmpDir();
 
