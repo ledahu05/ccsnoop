@@ -45,9 +45,8 @@ server.listen(0, '127.0.0.1', async () => {
     ANTHROPIC_BASE_URL: baseUrl,
     ANTHROPIC_API_KEY: 'sk-ant-probe-dummy-key',
     ANTHROPIC_CUSTOM_HEADERS: `${CUSTOM_HEADER_NAME}: ${CUSTOM_HEADER_VALUE}`,
-    // avoid the child CC reusing/omitting requests
-    CLAUDE_CODE_ENTRYPOINT: undefined,
   };
+  // Drop any inherited entrypoint marker so the child launches as a fresh CLI invocation.
   delete env.CLAUDE_CODE_ENTRYPOINT;
 
   const child = spawn('claude', ['-p', 'say hi', '--model', 'claude-haiku-4-5-20251001'], {
