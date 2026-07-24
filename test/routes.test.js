@@ -145,6 +145,34 @@ test('HEAD /<token>/api/hello returns 200 for known and unknown tokens', async (
   }
 });
 
+test('HEAD /<token>/api/hello for a KNOWN token is answered locally, never forwarded', async () => {
+  // The pre-flight must resolve to 200 without hitting the upstream, so that a
+  // known repo's hello check never depends on api.anthropic.com's answer to a
+  // HEAD /api/hello (spec §3.3).
+  const home = mkTmpDir();
+  const dir = path.join(mkTmpDir(), 'repo', '.ccsnoop');
+  const token = deriveToken(dir);
+  const routesFile = path.join(home, 'routes.json');
+  fs.writeFileSync(routesFile, JSON.stringify({ [token]: dir }));
+
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamHits++;
+    res.end('should-not-reach');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer({ routesFile, upstreamHost: '127.0.0.1', upstreamPort, requestFn: http.request });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const r = await driveRequest(proxyPort, { method: 'HEAD', path: `/${token}/api/hello` });
+    assert.equal(r.status, 200);
+    assert.equal(upstreamHits, 0, 'known-token preflight is served locally, not proxied upstream');
+  } finally {
+    await closeAll(proxy, upstream);
+  }
+});
+
 test('POST with an unknown token → 502 + Anthropic-shaped body, logged, never forwarded', async () => {
   const home = mkTmpDir();
   const routesFile = path.join(home, 'routes.json');
