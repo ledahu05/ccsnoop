@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // ccsnoop — single CLI entrypoint with argv-subcommand dispatch.
-// Live: start / stop / status (daemon lifecycle, spec §3.4) + report (spec §3.5). init stubbed.
+// Live: init (spec §3.2) + start / stop / status (daemon lifecycle, §3.4) + report (§3.5).
 
 import { start } from '../src/proxy.js';
 import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
+import { init } from '../src/init.js';
 
 const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report'];
 
@@ -33,13 +34,28 @@ async function main() {
   const args = argv.slice(1);
   const home = getFlag(args, '--home') ?? daemon.defaultHome();
 
+  if (sub === 'init') return runInit(home, args);
   if (sub === 'start') return runStart(home, args);
   if (sub === 'stop') return runStop(home, args);
   if (sub === 'status') return runStatus(home, args);
   if (sub === 'report') return runReport(args);
+}
 
-  // Stub for the not-yet-live subcommands (init slice).
-  console.log(`ccsnoop ${sub}: not implemented yet (stub)`);
+/**
+ * `init` — activate capture for the current repo (spec §3.2): settings.local.json
+ * env surgery, gitignore, route registration; `--undo` reverts it.
+ * @param {string} home
+ * @param {string[]} args
+ */
+function runInit(home, args) {
+  const result = init({
+    cwd: process.cwd(),
+    home,
+    force: hasFlag(args, '--force'),
+    undo: hasFlag(args, '--undo'),
+  });
+  for (const line of result.lines) console.log(line);
+  process.exit(result.exitCode);
 }
 
 /**
@@ -173,6 +189,10 @@ function printUsage() {
 Usage: ccsnoop <command> [options]
 
 Commands:
+  init     Activate capture for the current repo (writes .claude/settings.local.json
+           env, gitignores .ccsnoop/, registers the route). Restart Claude Code after.
+             --force              overwrite a foreign ANTHROPIC_BASE_URL
+             --undo               revert exactly what a prior init added
   start    Start the capture-proxy daemon (detached; returns immediately)
              --port <n>           listen port (persisted to ~/.ccsnoop/config.json)
              --sessions-dir <p>   capture root (default ~/.ccsnoop/sessions)
@@ -184,8 +204,7 @@ Commands:
              --all                widen discovery across ~/.ccsnoop/routes.json
              --out <path>         output file (default <session-dir>/report.html)
              --bloat-floor <n>    bloat: absolute byte floor (default 4096)
-             --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
-  init      (stub) prepare settings.local.json + gitignore`);
+             --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)`);
 }
 
 main().catch((err) => {
