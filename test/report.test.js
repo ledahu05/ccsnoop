@@ -98,6 +98,18 @@ test('readUsage returns null when no usage is present', () => {
   assert.equal(readUsage(''), null);
   assert.equal(readUsage('ok'), null);
   assert.equal(readUsage('event: ping\ndata: {"type":"ping"}\n\n'), null);
+  // An empty usage object carries no accounting either.
+  assert.equal(readUsage('data: {"type":"message_start","message":{"usage":{}}}\n\n'), null);
+});
+
+test('readUsage keeps message_start input/cache figures when the delta omits usage', () => {
+  const sse =
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":40,"output_tokens":1}}}\n\n' +
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n';
+  const u = readUsage(sse);
+  assert.equal(u.inputTokens, 100);
+  assert.equal(u.cacheReadInputTokens, 40);
+  assert.equal(u.stopReason, 'end_turn');
 });
 
 // ── computeAnatomy (byte-length buckets, never token counts) ──────────────────
@@ -157,6 +169,30 @@ test('buildExchange assembles derived model with duration and anatomy', () => {
   assert.ok(e.requestBlob.includes('POST /v1/messages'));
 });
 
+test('buildExchange yields durationMs null for missing or unparseable timestamps', () => {
+  const req = buildRequestBlob({ method: 'POST', url: '/v1/messages', rawHeaders: [], body: Buffer.from('{}') });
+  const resp = Buffer.alloc(0);
+  const mk = (recv, comp) =>
+    buildExchange({ request_received_at: recv, response_completed_at: comp, request_blob: 'r', response_blob: 's' }, req, resp);
+
+  // No timestamps at all.
+  assert.equal(mk(undefined, undefined).durationMs, null);
+  // Only one side present.
+  assert.equal(mk('2026-07-24T10:00:00.000Z', undefined).durationMs, null);
+  // Both present but unparseable — must be null, never NaN (would render "NaN ms").
+  const bad = mk('not-a-date', 'also-bad').durationMs;
+  assert.equal(bad, null);
+  assert.ok(!Number.isNaN(bad));
+  // A completed-before-received clock skew clamps to 0, not a negative.
+  assert.equal(mk('2026-07-24T10:00:05.000Z', '2026-07-24T10:00:00.000Z').durationMs, 0);
+});
+
+test('buildExchange reads usage null when the response blob is missing', () => {
+  const req = buildRequestBlob({ method: 'POST', url: '/v1/messages', rawHeaders: [], body: Buffer.from('{}') });
+  const e = buildExchange({ turn: 1, request_blob: 'r', response_blob: 's' }, req, Buffer.alloc(0));
+  assert.equal(e.usage, null);
+});
+
 // ── discovery ─────────────────────────────────────────────────────────────────
 
 test('pickLatestSession returns the most recently written session', () => {
@@ -184,6 +220,16 @@ test('listSessions finds session dirs with a manifest under <root>/sessions', ()
   const found = listSessions(root);
   assert.equal(found.length, 1);
   assert.equal(found[0].id, 'sess-x');
+});
+
+test('listSessions falls back to session dirs directly under the root', () => {
+  const root = mkTmpDir();
+  const sdir = path.join(root, 'sess-bare');
+  fs.mkdirSync(sdir, { recursive: true });
+  fs.writeFileSync(path.join(sdir, 'manifest.jsonl'), '{"turn":1}\n');
+  const found = listSessions(root);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].id, 'sess-bare');
 });
 
 // ── end-to-end: capture-shaped fixture → HTML ────────────────────────────────

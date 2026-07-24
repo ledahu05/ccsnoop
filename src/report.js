@@ -174,6 +174,20 @@ export function computeAnatomy(body) {
 }
 
 /**
+ * Elapsed milliseconds between two ISO timestamps, or null when either is
+ * absent or unparseable (a `NaN` would otherwise render as "NaN ms").
+ *
+ * @param {string | null} received
+ * @param {string | null} completed
+ * @returns {number | null}
+ */
+function computeDurationMs(received, completed) {
+  if (!received || !completed) return null;
+  const ms = Date.parse(completed) - Date.parse(received);
+  return Number.isFinite(ms) ? Math.max(0, ms) : null;
+}
+
+/**
  * Build the derived model for one exchange from its manifest line and raw blobs.
  * Pure — all I/O happens in {@link loadSession}.
  *
@@ -188,8 +202,7 @@ export function buildExchange(line, requestBuf, responseBuf) {
   const usage = readUsage(responseBuf);
   const received = line.request_received_at ?? null;
   const completed = line.response_completed_at ?? null;
-  const durationMs =
-    received && completed ? Math.max(0, Date.parse(completed) - Date.parse(received)) : null;
+  const durationMs = computeDurationMs(received, completed);
   return {
     turn: typeof line.turn === 'number' ? line.turn : null,
     threadId: line.thread_id ?? null,
