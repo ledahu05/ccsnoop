@@ -125,12 +125,21 @@ async function runServe(args) {
  * @param {string[]} args
  */
 function runReport(args) {
+  const num = (name) => {
+    const v = getFlag(args, name);
+    return v === undefined ? undefined : Number(v);
+  };
   const result = generateReport({
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
     session: getFlag(args, '--session'),
     out: getFlag(args, '--out'),
     all: hasFlag(args, '--all'),
+    // Waste-signal thresholds (spec §2.6) — sane defaults, overridable at report time.
+    waste: {
+      bloatFloorBytes: num('--bloat-floor'),
+      bloatSiblingMultiplier: num('--bloat-multiplier'),
+    },
   });
   console.log(`ccsnoop report: wrote ${result.outPath}`);
   console.log(`  session: ${result.sessionId} (${result.exchanges} request${result.exchanges === 1 ? '' : 's'})`);
@@ -174,6 +183,8 @@ Commands:
              --session <id>       session to render (default: latest)
              --all                widen discovery across ~/.ccsnoop/routes.json
              --out <path>         output file (default <session-dir>/report.html)
+             --bloat-floor <n>    bloat: absolute byte floor (default 4096)
+             --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
   init      (stub) prepare settings.local.json + gitignore`);
 }
 
