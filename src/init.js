@@ -196,10 +196,10 @@ function applyInit(P, home, force) {
   // ── settings.local.json — strict-JSON read-modify-write ─────────────────────
   const existed = fs.existsSync(P.settings);
   const settings = existed ? readJsonStrict(P.settings, {}) : {};
-  if (settings == null || typeof settings !== 'object') {
+  if (settings == null || typeof settings !== 'object' || Array.isArray(settings)) {
     throw new InitError(`${P.settings} is not a JSON object — refusing to overwrite it`);
   }
-  const env = settings.env && typeof settings.env === 'object' ? settings.env : {};
+  const env = settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env) ? settings.env : {};
   const existingUrl = env.ANTHROPIC_BASE_URL;
   if (typeof existingUrl === 'string' && existingUrl !== '' && !CCSNOOP_URL_RE.test(existingUrl) && !force) {
     throw new InitError(
@@ -301,7 +301,8 @@ function undoInit(P) {
     }
   } else if (fs.existsSync(P.settings)) {
     const settings = readJsonStrict(P.settings, {});
-    const env = settings && typeof settings.env === 'object' ? settings.env : null;
+    const env =
+      settings && typeof settings.env === 'object' && !Array.isArray(settings.env) ? settings.env : null;
     if (env) {
       const prev = m.env_prev && typeof m.env_prev === 'object' ? m.env_prev : {};
       // Restore each managed key to its exact pre-init value: absent-before →

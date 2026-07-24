@@ -251,3 +251,93 @@ test('undo preserves other repos\' routes', () => {
   assert.equal(daemon.countRoutes(home), 1);
   assert.ok(routes[deriveToken(path.join(repoB, '.ccsnoop'))], 'repo B route untouched');
 });
+
+// ── malformed inputs ─────────────────────────────────────────────────────────
+
+test('a settings file that is not a JSON object is refused, not silently clobbered', () => {
+  // A top-level array is `typeof === "object"` but drops any keys on re-serialize
+  // — init must reject it rather than report success while writing back `[]`.
+  const repo = mkRepo();
+  const home = mkHome();
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  const file = path.join(repo, '.claude', 'settings.local.json');
+  fs.writeFileSync(file, '[]');
+
+  assert.throws(() => init({ cwd: repo, home }), InitError);
+  assert.equal(fs.readFileSync(file, 'utf8'), '[]', 'the array file is left untouched');
+  assert.equal(daemon.countRoutes(home), 0, 'no route registered on refusal');
+});
+
+test('an env that is not a plain object is discarded, keys still written', () => {
+  const repo = mkRepo();
+  const home = mkHome();
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  fs.writeFileSync(
+    path.join(repo, '.claude', 'settings.local.json'),
+    JSON.stringify({ model: 'opus', env: ['not', 'a', 'map'] }),
+  );
+
+  const res = init({ cwd: repo, home });
+  const s = readSettings(repo);
+  assert.equal(s.model, 'opus', 'unrelated top-level key preserved');
+  assert.equal(s.env.ANTHROPIC_BASE_URL, `http://localhost:41377/${res.token}`);
+  assert.equal(s.env.ENABLE_TOOL_SEARCH, 'true');
+});
+
+test('a settings file that is not valid JSON is refused, not clobbered', () => {
+  const repo = mkRepo();
+  const home = mkHome();
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  const file = path.join(repo, '.claude', 'settings.local.json');
+  fs.writeFileSync(file, '{ not: valid json ]');
+
+  assert.throws(() => init({ cwd: repo, home }), /not valid JSON/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{ not: valid json ]', 'left untouched');
+});
+
+test('a malformed routes.json aborts init rather than dropping other repos\' routes', () => {
+  const repo = mkRepo();
+  const home = mkHome();
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(daemon.paths(home).routes, '{ broken');
+
+  assert.throws(() => init({ cwd: repo, home }), /not valid JSON/);
+  // settings were never written either — the whole run aborts atomically enough
+  // that no partial ccsnoop route is registered.
+  assert.ok(!fs.existsSync(path.join(repo, '.claude', 'settings.local.json')));
+});
+
+// ── undo: post-init user edits ───────────────────────────────────────────────
+
+test('undo leaves alone a base URL the user changed to a foreign value after init', () => {
+  const repo = mkRepo();
+  const home = mkHome();
+  // User-owned settings so init does not delete the whole file on undo.
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ env: {} }));
+  init({ cwd: repo, home });
+
+  // The user re-points the base URL somewhere of their own after init.
+  const s0 = readSettings(repo);
+  s0.env.ANTHROPIC_BASE_URL = 'https://corp.proxy.example/v1';
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify(s0));
+
+  init({ cwd: repo, home, undo: true });
+  const s = readSettings(repo);
+  assert.equal(
+    s.env.ANTHROPIC_BASE_URL,
+    'https://corp.proxy.example/v1',
+    'a non-ccsnoop base URL is the user\'s, not ours to remove',
+  );
+  assert.ok(!('ENABLE_TOOL_SEARCH' in s.env), 'our ENABLE_TOOL_SEARCH is still reverted');
+});
+
+test('undo is idempotent — a second undo reports nothing to undo', () => {
+  const repo = mkRepo();
+  const home = mkHome();
+  init({ cwd: repo, home });
+  init({ cwd: repo, home, undo: true });
+  const res = init({ cwd: repo, home, undo: true });
+  assert.equal(res.exitCode, 0);
+  assert.match(res.lines.join('\n'), /nothing to undo/);
+});
