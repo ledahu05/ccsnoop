@@ -181,6 +181,65 @@ test('missing metadata falls back to a single proxy-lifecycle session (no crash)
   }
 });
 
+test('survives an upstream drop mid-response (ures error) — no crash, next request still served', async () => {
+  const sessionsDir = mkTmpDir();
+
+  // Fake upstream that flushes headers + a partial SSE chunk, then yanks the
+  // socket — the classic flaky-upstream mid-stream drop (issue #25).
+  let dropOnce = true;
+  const upstream = http.createServer((req, res) => {
+    if (dropOnce) {
+      dropOnce = false;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      // Let the headers + partial chunk reach the proxy (so `ures` fires and
+      // pipes) BEFORE yanking the socket — that's what makes `ures` emit
+      // 'error' with a live pipe and no listener (the crash in #25).
+      setTimeout(() => res.socket.destroy(), 30);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n');
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer({ sessionsDir, upstreamHost: '127.0.0.1', upstreamPort, requestFn: http.request });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // First request: upstream drops mid-stream. With no `ures` 'error' handler
+    // the client is left hanging (the tee pipe never closes `cres`) and, on
+    // some runtimes, the unhandled 'error' takes the whole process down. The
+    // guarded proxy resets the client connection, so any terminal signal
+    // (aborted / error / close / end) counts as "settled, not hung".
+    const drive = new Promise((resolve) => {
+      const req = http.request(
+        { hostname: '127.0.0.1', port: proxyPort, method: 'POST', path: '/v1/messages' },
+        (res) => {
+          res.on('data', () => {});
+          for (const ev of ['end', 'aborted', 'error', 'close']) res.on(ev, () => resolve('settled'));
+        }
+      );
+      req.on('error', () => resolve('settled'));
+      req.end(JSON.stringify({ metadata: { user_id: JSON.stringify({ session_id: 'drop' }) } }));
+    });
+    let hangTimer;
+    const hang = new Promise((resolve) => (hangTimer = setTimeout(() => resolve('hung'), 3000)));
+    const firstSettled = await Promise.race([drive, hang]);
+    clearTimeout(hangTimer);
+    assert.equal(firstSettled, 'settled', 'client left hanging after the upstream mid-response drop');
+
+    // The proxy must still be alive to capture the next exchange.
+    const res = await driveRequest(proxyPort, {
+      body: JSON.stringify({ metadata: { user_id: JSON.stringify({ session_id: 'ok' }) } }),
+    });
+    assert.equal(res.status, 200);
+    assert.ok(res.body.includes('message_stop'), 'proxy still serving after the mid-response drop');
+  } finally {
+    await closeAll(proxy, upstream);
+  }
+});
+
 test('does not buffer the full response body (bytes flow through before upstream ends)', async () => {
   const sessionsDir = mkTmpDir();
 

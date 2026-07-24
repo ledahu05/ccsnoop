@@ -167,6 +167,25 @@ export function createProxyServer(options = {}) {
             });
           });
           fileStream.on('error', () => {});
+
+          // Upstream drops the socket mid-response (flaky connection after
+          // headers, e.g. mid-SSE-stream). Without this listener the 'error'
+          // is unhandled — on some runtimes it crashes the whole proxy, and
+          // otherwise the tee pipe never closes `cres`, leaving the client
+          // hung (spec §1.4, issue #25). Headers are already flushed here, so
+          // reset the connection rather than trying to write a 502 body, and
+          // tear down the capture file (no `finish` → no bogus manifest line).
+          ures.on('error', () => {
+            fileStream.destroy();
+            cres.destroy();
+          });
+
+          // Client hangs up mid-stream (EPIPE on our pipes): stop pulling from
+          // upstream and close the capture file.
+          cres.on('error', () => {
+            ures.destroy();
+            fileStream.destroy();
+          });
         }
       );
       ureq.on('error', () => endWithError(cres, 502));
