@@ -2,7 +2,7 @@
 
 Snoop raw **Claude Code → Anthropic** traffic: **capture** the exchanges byte-faithfully, then render them as a **static HTML report** that makes context-window growth, the model/harness boundary, and token waste legible.
 
-This is a **spec for a builder** — no code ships from the planning effort behind it. It is the compiled result of the [ccsnoop wayfinder map](https://github.com/ledahu05/ccsnoop/issues/1) and its closed decision tickets (#2–#7); each section links the ticket that owns the detail. Where this spec and a ticket disagree, the ticket's resolution comment is authoritative.
+This is a **spec for a builder** — no code ships from the planning effort behind it. It compiles two wayfinder maps: the [capture/report map](https://github.com/ledahu05/ccsnoop/issues/1) with its closed tickets (#2–#7) → **Parts 1–2**, and the [install & distribution map](https://github.com/ledahu05/ccsnoop/issues/9) with its closed tickets (#10–#15) → **Part 3**. Each section links the ticket that owns the detail. Where this spec and a ticket disagree, the ticket's resolution comment is authoritative.
 
 ## Scope
 
@@ -172,12 +172,91 @@ Context-window growth per turn · request anatomy (System / Tools / message hist
 
 ---
 
+## Part 3 — Install & Distribution  ([map #9](https://github.com/ledahu05/ccsnoop/issues/9))
+
+How the built tool is distributed, activated on a repo, and lifecycle-managed. **Project scope only for now** — machine-wide (user) scope is deferred (see §3.6). This part extends Parts 1–2: ccsnoop is a **Node reverse-proxy daemon** (§1.2) that Claude Code is pointed at via `ANTHROPIC_BASE_URL` (§1.1).
+
+```
+                       ~/.ccsnoop/                      one machine-level daemon
+                         config.json   ── port ──▶  ccsnoop start  ── listens :41377
+                         routes.json   ── token→dir map ──┐
+                         daemon.pid / daemon.log          │
+repo A/.claude/settings.local.json                        ▼
+   ANTHROPIC_BASE_URL=…:41377/<tokenA> ──http──▶  strip /<tokenA> → routes.json → repo A/.ccsnoop/sessions/
+repo B/.claude/settings.local.json                        │              then proxy upstream (Part 1)
+   ANTHROPIC_BASE_URL=…:41377/<tokenB> ──http──▶  strip /<tokenB> → repo B/.ccsnoop/sessions/
+```
+
+**Key insight: install ≠ activation.** One daemon per machine; per-repo `env` (via path token) decides which repo routes to it and where captures land. "Project scope" is not a second proxy per repo.
+
+### 3.1 Distribution — npm, global install  ([#10](https://github.com/ledahu05/ccsnoop/issues/10))
+
+- **Name `ccsnoop` is free on npm; ship as a GLOBAL install** (`preferGlobal: true`), **not** npx. A start/stop daemon needs a stable on-PATH binary at a fixed version, so a later `stop`/`status` from any shell hits the same install (matches `pm2`). npx would risk version drift and re-download.
+- **Single `bin`** — `bin/ccsnoop.js` with a shebang; `init | start | stop | status | report` are **argv subcommands**, not separate bins.
+- **Node ≥ 22** (current LTS; 18/20 are EOL).
+- Full research: [`docs/research/npm-distribution.md`](https://github.com/ledahu05/ccsnoop/issues/10) (on branch `research/npm-distribution`).
+
+### 3.2 Activation — `ccsnoop init`  ([#12](https://github.com/ledahu05/ccsnoop/issues/12))
+
+`init` performs settings-file surgery to route this repo at the daemon.
+
+- **Anchors to the git top-level** — errors if the cwd is not inside a repo.
+- **Writes one key**, `ANTHROPIC_BASE_URL=http://localhost:<port>/<token>`, into **`.claude/settings.local.json`** via a **strict-JSON read-modify-write** (no JSONC comment sentinel — CC rejects non-strict JSON). Port comes from `~/.ccsnoop/config.json` (default `41377`, §3.4); `<token>` per §3.3.
+- **Idempotent.** Re-running overwrites only *ccsnoop-shaped* values; a foreign `ANTHROPIC_BASE_URL` is **refused without `--force`**.
+- **gitignores `.ccsnoop/`** (and `settings.local.json` iff init created it) — see the security non-negotiable below.
+- **Undo = `ccsnoop init --undo`**, driven by a per-token manifest in `routes.json` (`created_local_settings`, `added_gitignore_*` flags) so it reverts *exactly* what init added and **never deletes `.ccsnoop/` capture data**.
+- Prints a **"restart Claude Code"** reminder (CC reads `env` at startup).
+
+> **Open seam — `ENABLE_TOOL_SEARCH`.** §1.1 makes `ENABLE_TOOL_SEARCH=true` a mandatory capture-fidelity setting, but #12 specifies `init` writing only the `ANTHROPIC_BASE_URL` key. A builder must reconcile these: either `init` also writes `ENABLE_TOOL_SEARCH=true` into the same `env` block, or capture setup documents it as a manual step. Not resolved by either map — flag at build time.
+
+### 3.3 Capture directory & path-token routing  ([#11](https://github.com/ledahu05/ccsnoop/issues/11), confirmed [#14](https://github.com/ledahu05/ccsnoop/issues/14))
+
+- **Per-scope root:** project → **`<repo>/.ccsnoop/`**; map #1's `sessions/<session_id>/` (§1.6) nests inside it.
+- **The daemon cannot read CC's `env`**, so routing is carried in the URL: `init` bakes **`/<token>`** into the base URL, where **`token = sha256(abs capture dir)[:8]`** (idempotent for a given dir). The registry **`~/.ccsnoop/routes.json`** maps `token → dir`; the daemon **strips `/<token>`**, resolves the dir, and tees to `<dir>/sessions/` before proxying upstream.
+- **Confirmed empirically ([#14](https://github.com/ledahu05/ccsnoop/issues/14), live `claude-cli/2.1.218`):** `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/probe-token` arrives as `POST /probe-token/v1/messages` — **prefix intact**, so path-token routing is viable. Also observed: `ANTHROPIC_CUSTOM_HEADERS` reaches upstream (a no-path routing fallback / insurance); plain HTTP accepted; CC sends a pre-flight **`HEAD /<token>/api/hello`** (prefix-preserving, *no* custom header) that the daemon **must answer, not 400** (see §3.4).
+- Full research: [`docs/research/base-url-path-prefix.md`](https://github.com/ledahu05/ccsnoop/issues/14).
+
+### 3.4 Daemon lifecycle — `start` / `stop` / `status`  ([#13](https://github.com/ledahu05/ccsnoop/issues/13))
+
+One machine-level daemon, explicit start/stop (no wrapper, no always-on service).
+
+- **Port — single source of truth = `~/.ccsnoop/config.json`.** Default `41377`; `ccsnoop start --port <n>` overrides and **writes the chosen port back** to `config.json`. `init` reads `config.json` (falling back to `41377` if no daemon has run yet) so the daemon and every repo's baked-in base URL stay in sync.
+- **Process tracking:** pidfile `~/.ccsnoop/daemon.pid`; detached stdout/stderr → `~/.ccsnoop/daemon.log`. `start` spawns detached + `unref()`s and **returns to the shell immediately**, printing `pid` + `port`. Liveness = `process.kill(pid, 0)`; a stale pidfile (dead pid) counts as "not running".
+- **`start` is idempotent:** live pidfile → print `already running (pid, port)`, exit 0. Stale → clean and start fresh. **Port collision** (`EADDRINUSE` from a foreign process) → **fail-fast** with a diagnostic (`port <n> busy; 'ccsnoop status' or use --port`); **no auto-increment** (would silently desync from the port `init` baked into base URLs).
+- **`stop`:** pidfile → `SIGTERM` → `server.close()` drains in-flight → wait ~5 s → `SIGKILL` if alive → remove `daemon.pid`. **Leaves `config.json` + `routes.json` intact** (port and routes must survive a restart). No/stale pidfile → `not running`, exit 0.
+- **`status`:** running → `running — pid <p>, port <port>, <n> routes, up <duration>` (uptime from `daemon.pid` mtime), **exit 0**; stopped → `stopped`, **exit 1** (systemctl-style, scriptable).
+- **Unknown route token — fail LOUD, POST-only.** The pre-flight `HEAD /<token>/api/hello` **always answers 200** (reachability probe; a 4xx makes CC never send the real request). The actual `POST /<token>/v1/messages` with an unknown token breaks with a **502 + Anthropic-shaped error body** (rendered verbatim by CC) and a `daemon.log` entry:
+  ```json
+  {"type":"error","error":{"type":"api_error","message":"ccsnoop: unknown route token <t> — run `ccsnoop init` in this repo, then restart Claude Code"}}
+  ```
+  A **known token whose capture root was deleted is NOT unknown** — it's a valid live route: the daemon `mkdir -p`s the root and captures on.
+
+### 3.5 Report discovery — `ccsnoop report`  ([#15](https://github.com/ledahu05/ccsnoop/issues/15))
+
+Scope = CLI entry + discovery only (the report *content* is Part 2).
+
+- **Default:** `<repo>/.ccsnoop/` resolved from cwd — no `routes.json` lookup.
+- **Widen:** `--root <path>`, and `--all` (over `routes.json`) once more than one project root exists.
+- **Select:** latest session by default; `--session <id>` override. No interactive picker — a multi-session *index* is report content (map #1), not a CLI concern.
+
+### 3.6 Out of scope (map #9)
+
+- **Wrapper-command activation** (`ccsnoop -- claude …`) — ruled out; `init` chosen.
+- **Always-on background service** (systemd/launchd, start-on-login) — ruled out; explicit start/stop chosen.
+- **Standalone binary distribution** (pkg/bun/deno compile) — ruled out; npm chosen.
+- **User (machine-wide) capture scope** — **deferred** (driver decision). Ripple: the user-root legs of the capture-directory model (#11) and report discovery (#15) are suspended, and [attribute user-scope sessions (#16)](https://github.com/ledahu05/ccsnoop/issues/16) is closed as moot. Returns only if the destination is redrawn.
+- **Building the tool** — spec-only, like map #1.
+- **Log rotation / size caps** on `daemon.log` — YAGNI for a dev tool; revisit only if growth bites.
+
+---
+
 ## Non-negotiables (any implementation must hold these)
 
 1. **Secret-header redaction before the write** (§1.3) — nothing unredacted touches disk.
 2. **Stream SSE through without buffering** (§1.4) — the proxy never holds the full body.
 3. **Redacted raw bytes are the only stored ground truth** (§1.3, §1.6) — all fields/tokens/anatomy/waste are derived at report time; never re-tokenize (read `usage`).
 4. **`ENABLE_TOOL_SEARCH=true` at capture** (§1.1) — else the captured payload is not faithful to a normal session.
+5. **`init` gitignores the capture dir** (§3.2) — `.ccsnoop/` holds raw request bodies (API key redacted per §1.3, but full conversation content) and must never be committable.
 
 ## Appendix — reference capture proxy (illustrative, Node)
 
@@ -220,3 +299,14 @@ Compiled from the [ccsnoop wayfinder map](https://github.com/ledahu05/ccsnoop/is
 | [#5](https://github.com/ledahu05/ccsnoop/issues/5) | Build-shape — from-scratch reverse-proxy byte-tee, plain http, h1, Node reference |
 | [#6](https://github.com/ledahu05/ccsnoop/issues/6) | Waste-signal computation — segmentation, usage-gated re-sent diff, bloat, static blocks |
 | [#7](https://github.com/ledahu05/ccsnoop/issues/7) | Confirmation — plain-http base URL + h1 upstream both work |
+
+Extended by the [install & distribution map](https://github.com/ledahu05/ccsnoop/issues/9):
+
+| Ticket | Decision |
+|---|---|
+| [#10](https://github.com/ledahu05/ccsnoop/issues/10) | Distribution — npm global install, single bin + argv subcommands, Node ≥22 |
+| [#11](https://github.com/ledahu05/ccsnoop/issues/11) | Capture-directory model — project `.ccsnoop/`, path-token routing via `routes.json` |
+| [#12](https://github.com/ledahu05/ccsnoop/issues/12) | `ccsnoop init` — settings.local.json surgery, idempotent, `--undo`, gitignore |
+| [#13](https://github.com/ledahu05/ccsnoop/issues/13) | Daemon lifecycle — start/stop/status, pidfile, port `41377`, unknown-token 502 |
+| [#14](https://github.com/ledahu05/ccsnoop/issues/14) | Confirmation — SDK preserves base-URL path prefix (path-token routing viable) |
+| [#15](https://github.com/ledahu05/ccsnoop/issues/15) | `ccsnoop report` — default cwd scope, `--root`/`--all`/`--session` discovery |
