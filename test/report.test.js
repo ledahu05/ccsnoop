@@ -9,6 +9,7 @@ import {
   readUsage,
   computeAnatomy,
   buildExchange,
+  contentForSlot,
   loadSession,
   listSessions,
   pickLatestSession,
@@ -55,6 +56,40 @@ test('parseRequestBlob tolerates a non-JSON body', () => {
   const parsed = parseRequestBlob('HEAD / HTTP/1.1\r\nHost: x\r\n\r\n');
   assert.equal(parsed.method, 'HEAD');
   assert.equal(parsed.json, null);
+});
+
+// ── contentForSlot (row expand: slot → raw content from the request body) ─────
+
+test('contentForSlot indexes system blocks, tools by name, and messages by index', () => {
+  const body = {
+    system: [{ type: 'text', text: 'block zero' }, { type: 'text', text: 'block one' }],
+    tools: [{ name: 'Bash', description: 'run' }, { name: 'Read' }],
+    messages: [
+      { role: 'user', content: 'earlier' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'current' },
+    ],
+  };
+  assert.deepEqual(contentForSlot(body, 'system#0'), { type: 'text', text: 'block zero' });
+  assert.deepEqual(contentForSlot(body, 'system#1'), { type: 'text', text: 'block one' });
+  assert.deepEqual(contentForSlot(body, 'tool:Bash'), { name: 'Bash', description: 'run' });
+  assert.deepEqual(contentForSlot(body, 'tool:Read'), { name: 'Read' });
+  assert.deepEqual(contentForSlot(body, 'message#0'), { role: 'user', content: 'earlier' });
+  assert.deepEqual(contentForSlot(body, 'message#2'), { role: 'user', content: 'current' });
+});
+
+test('contentForSlot resolves a bare string system prompt via the "system" slot', () => {
+  assert.equal(contentForSlot({ system: 'you are helpful' }, 'system'), 'you are helpful');
+});
+
+test('contentForSlot returns undefined for missing/unknown slots and non-object bodies', () => {
+  const body = { system: [{ text: 'a' }], tools: [{ name: 'Bash' }], messages: [{ role: 'user' }] };
+  assert.equal(contentForSlot(body, 'system#5'), undefined);
+  assert.equal(contentForSlot(body, 'tool:Nope'), undefined);
+  assert.equal(contentForSlot(body, 'message#9'), undefined);
+  assert.equal(contentForSlot(body, 'bogus'), undefined);
+  assert.equal(contentForSlot(null, 'system#0'), undefined);
+  assert.equal(contentForSlot(body, null), undefined);
 });
 
 // ── readUsage (SSE + JSON, no re-tokenization) ────────────────────────────────
@@ -316,6 +351,35 @@ test('renderReport emits ONE self-contained HTML — no external assets, redacti
   // Redaction rendered in the embedded raw payload; secret never leaks.
   assert.ok(html.includes(REDACTED), 'redaction token present in raw payload');
   assert.ok(!html.includes('sk-super-secret'), 'no secret leaked into the report');
+});
+
+test('renderReport ships the row-expand accordion wiring (issue #28)', () => {
+  const root = mkTmpDir();
+  const dir = writeFixtureSession(root, 'sess-expand');
+  const html = renderReport(loadSession(dir, 'sess-expand'));
+  // Nested <details> row accordion + raw pane + the shared slot resolver, all inline.
+  assert.ok(html.includes('seg-row-acc'), 'nested row accordion class present');
+  assert.ok(html.includes('seg-raw'), 'raw-content pane class present');
+  assert.ok(html.includes('function contentForSlot'), 'slot resolver shipped to the client');
+  assert.ok(html.includes('function segRow'), 'segRow builder present');
+  // The row is a <summary>, i.e. the click target for native expand.
+  assert.ok(/segRow[\s\S]*el\('summary'/.test(html), 'seg row is a summary (clickable)');
+});
+
+test('expanded row content is recoverable from the embedded redacted blob (issue #28)', () => {
+  const root = mkTmpDir();
+  const dir = writeFixtureSession(root, 'sess-recover');
+  const model = loadSession(dir, 'sess-recover');
+  const e = model.exchanges[0];
+  // Re-run the client path in Node: parse the embedded blob, index by slot.
+  const body = parseRequestBlob(e.requestBlob).json;
+  const bySlot = Object.fromEntries(e.segments.map((s) => [s.slot, contentForSlot(body, s.slot)]));
+  assert.deepEqual(bySlot['system#0'], { type: 'text', text: 'system prompt' });
+  assert.deepEqual(bySlot['tool:Bash'], { name: 'Bash' });
+  assert.deepEqual(bySlot['message#2'], { role: 'user', content: 'current turn' });
+  // The blob is the redacted one, so no header secret can surface in an expansion.
+  assert.ok(e.requestBlob.includes(REDACTED));
+  assert.ok(!JSON.stringify(bySlot).includes('sk-super-secret'), 'secret never surfaces in expanded content');
 });
 
 test('generateReport discovers the latest session, writes a report file, honours --session', () => {
