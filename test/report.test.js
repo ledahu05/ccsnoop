@@ -302,6 +302,22 @@ test('resolveRoots defaults to <cwd>/.ccsnoop and honours --root', () => {
   assert.deepEqual(resolveRoots({ cwd: '/repo', root: 'custom' }), [path.resolve('/repo', 'custom')]);
 });
 
+test('resolveRoots --all reads the routes registry under CCSNOOP_HOME, not ~/.ccsnoop', () => {
+  const home = mkTmpDir();
+  const routeDir = path.join(home, 'repo-a', '.ccsnoop');
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, 'routes.json'), JSON.stringify({ tok: routeDir }));
+  const prev = process.env.CCSNOOP_HOME;
+  process.env.CCSNOOP_HOME = home;
+  try {
+    const roots = resolveRoots({ cwd: '/repo', all: true });
+    assert.ok(roots.includes(routeDir), `expected ${routeDir} in ${roots.join(', ')}`);
+  } finally {
+    if (prev === undefined) delete process.env.CCSNOOP_HOME;
+    else process.env.CCSNOOP_HOME = prev;
+  }
+});
+
 test('listSessions finds session dirs with a manifest under <root>/sessions', () => {
   const root = mkTmpDir();
   const sdir = path.join(root, 'sessions', 'sess-x');

@@ -8,11 +8,11 @@
 // and the raw view.
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
 import { computeWaste } from './waste.js';
+import { defaultHome } from './daemon.js';
 
 /**
  * @typedef {object} Usage
@@ -389,13 +389,15 @@ export function resolveRoots({ cwd, root, all }) {
 }
 
 /**
- * Capture roots registered in `~/.ccsnoop/routes.json` (token → dir). Best-effort:
- * the registry is built by a later slice, so absence is not an error.
+ * Capture roots registered in the machine home's `routes.json` (token → dir).
+ * Honours `$CCSNOOP_HOME` (via {@link defaultHome}) so an isolated registry can be
+ * exercised without polluting the dev's real `~/.ccsnoop`. Best-effort: the registry
+ * is built by a later slice, so absence is not an error.
  * @returns {string[]}
  */
 function readRoutesRoots() {
   try {
-    const p = path.join(os.homedir(), '.ccsnoop', 'routes.json');
+    const p = path.join(defaultHome(), 'routes.json');
     const routes = JSON.parse(fs.readFileSync(p, 'utf8'));
     return Object.values(routes)
       .map((v) => (typeof v === 'string' ? v : v && typeof v === 'object' ? v.dir : null))
