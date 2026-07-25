@@ -82,6 +82,36 @@ test('undo on a non-git anchor removes route + created settings, touches no .git
   assert.ok(!fs.existsSync(path.join(plain, '.gitignore')), 'no .gitignore ever written');
 });
 
+test('non-git anchor: idempotent re-run preserves provenance so undo restores true pre-init state', () => {
+  const plain = mkPlain();
+  const home = mkHome();
+  // A settings.local.json that predates ccsnoop, with a user env key.
+  fs.mkdirSync(path.join(plain, '.claude'), { recursive: true });
+  fs.writeFileSync(
+    path.join(plain, '.claude', 'settings.local.json'),
+    JSON.stringify({ env: { FOO: 'bar' } }, null, 2) + '\n',
+  );
+
+  init({ cwd: plain, home });
+  init({ cwd: plain, home }); // idempotent re-run must not lose the original provenance
+
+  const token = deriveToken(path.join(plain, '.ccsnoop'));
+  const manifest = readRoutes(home)[token];
+  assert.equal(manifest.created_local_settings, false, 'settings pre-existed — init did not create it');
+  assert.deepEqual(
+    manifest.env_prev,
+    { ANTHROPIC_BASE_URL: null, ENABLE_TOOL_SEARCH: null },
+    'env_prev still snapshots the true pre-init state (both keys absent)',
+  );
+
+  init({ cwd: plain, home, undo: true });
+  assert.deepEqual(
+    readSettings(plain),
+    { env: { FOO: 'bar' } },
+    'undo restores the exact pre-init settings, leaving the pre-existing key untouched',
+  );
+});
+
 // ── settings.local.json env surgery ─────────────────────────────────────────
 
 test('writes ANTHROPIC_BASE_URL (port+token) and ENABLE_TOOL_SEARCH=true, preserving existing keys', () => {
