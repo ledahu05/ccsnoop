@@ -7,8 +7,8 @@ observable ? »* — partie de la map [#46](https://github.com/ledahu05/ccsnoop/
 **Verdict court : oui, et un run mono-tour suffit pour l'axe bloat.** La requête #1 est
 **byte-for-byte identique** entre deux runs du même prompt (plancher de bruit = **0 octet**,
 LCP de hash = 100 %), les 4 leviers y sont **tous** présents, et le bruit au tour 2 est de
-**168 octets** contre un signal attendu de ~19 K tokens ≈ **72 000 octets** — soit **~430×**
-(2,6 ordres de grandeur). **Un run par bras suffit.** Deux **blocages** sont ressortis en
+**168 octets** contre un signal attendu de ~19 K tokens ≈ **48 800 octets** — soit **~290×**
+(2,5 ordres de grandeur). **Un run par bras suffit.** Deux **blocages** sont ressortis en
 chemin (§6) : les blobs de réponse sont gzippés donc `readUsage()` renvoie `null` sur tout,
 et la granularité `Segment` ne sépare pas trois des quatre leviers.
 
@@ -148,7 +148,7 @@ séquence de hash que `classifySegments` utilise pour son LCP.
 | **état de connexion des serveurs MCP** | `currentTurn`/`history` | **−2 584** | oui | omniris : 83 lignes `mcp__gitlab__*` présentes dans un run, réduites à `gitlab` dans l'autre. **Vraie non-déterminisme run-à-run, et c'est exactement le bucket du levier L4.** |
 | édition de `CLAUDE.md` entre les runs | bloc `# claudeMd` | **+2 930** | oui | pas du bruit : contenu réellement modifié (34 min d'écart) |
 | réponse du modèle (thinking + `tool_use`) | `history` | **+168** | oui | non-déterminisme irréductible du modèle, tour ≥ 2 |
-| préflight `HEAD /<token>/api/hello` | — | **non capturé** | — | aucun exchange `HEAD` dans les 5 sessions ; le seul exchange hors-`tools[]` est la **sonde quota** POST |
+| préflight `HEAD /<token>/api/hello` | — | **non capturé** | — | aucun exchange `HEAD` dans les 5 sessions ; le seul exchange hors-`tools[]` est la **sonde quota** POST. Cohérent avec #46 : le préflight y était observé sous **runtime Bun**, alors que ces captures tournent sous Node (`X-Stainless-Runtime: node`, `v26.3.0`). Pas une contradiction, un autre runtime. |
 
 ### 3.1 Ce qui est cosmétique en octets mais pas pour le cache
 
@@ -180,23 +180,45 @@ idéalement par bloc, §6.2) : `slot → bytes`, appariés par nom de slot.
 |---|---|
 | Requête #1, plancher de bruit même-prompt (tous buckets) | **0** |
 | Requête #2, plancher de bruit même-prompt | **168** (`history/message#1`, 23 589 → 23 757) |
-| Taille de la requête #1 | 111 056 |
-| Signal attendu par `omniris_tuning.md` (~19 K tokens) | **≈ 72 000** (voir ratio ci-dessous) |
+| Taille de la requête #1 (haiku, temp repo) | 111 056 |
+| Signal attendu par `omniris_tuning.md` (~19 K tokens, mesuré sur opus) | **≈ 48 800** |
+| Non-déterminisme d'état MCP observé dans la paire omniris | **2 584** |
 
 Ratio octets↔tokens **dérivé de la capture elle-même** (jamais d'un tokenizer) :
-`Anatomy.total / (input + cache_read + cache_creation)` du `usage` capturé —
-**3,78–3,79 o/tok** sur la paire haiku (111 056 o / 29 377 tok), **2,57–2,61 o/tok** sur
-omniris/opus. Le ratio est **spécifique à la capture** (contenu + modèle) : il sert ici une
-seule fois, à mettre bruit et signal sur le même axe. À 3,79 o/tok, 19 K tokens ≈ 72 000 octets.
+`Anatomy.total / (input + cache_read + cache_creation)` du `usage` capturé.
+
+| Capture | ratio |
+|---|---|
+| paire haiku `645c6781` / `db1db459` | **3,78–3,79 o/tok** (111 056 o / 29 377 tok) |
+| omniris `309efa6b`, opus | **2,57–2,61 o/tok** (117 295 o / 45 646 tok) |
+
+Le ratio est **spécifique à la capture** (contenu + modèle) et varie de **47 %** entre les
+deux — donc chaque conversion doit utiliser le ratio de *sa* capture. Le signal des ~19 K
+tokens vient de la mesure omniris/opus : **19 000 × 2,57 ≈ 48 800 octets** (et non 72 000, qui
+serait le chiffre au ratio haiku — mélange illégitime).
 
 - Requête #1 : **bruit 0 octet** → rapport signal/bruit **infini**.
-- Requête #2 : 72 000 / 168 ≈ **430×**, soit **2,6 ordres de grandeur**.
+- Requête #2 : 48 800 / 168 ≈ **290×**, soit **2,5 ordres de grandeur**.
 
 **Réponse Q4 : un run par bras suffit.** Le seuil « 2 ordres de grandeur » de la fog
-« répétabilité statistique » est franchi même au tour 2. Si le banc veut une marge affichable,
-la règle défendable est : *un gain est réel s'il dépasse 1 000 octets par bucket* (≈ 6× le
-bruit tour-2 mesuré), sans répétition. À réévaluer si le banc passe en interactif ou fait
-appel à `Bash` (§5).
+« répétabilité statistique » est franchi même au tour 2, sans répétition.
+
+**Mais le seuil de gain ne peut pas être uniforme entre buckets** — §3 a mesuré une source de
+bruit de **2 584 octets** (état de connexion MCP) qui atterrit précisément dans le bucket
+d'injection, celui du levier L4. La paire neuve affiche 0 octet de bruit sur ce bucket
+seulement parce que le temp repo a une surface MCP triviale et stable. Règle proposée :
+
+| Bucket | bruit mesuré | seuil « gain réel » |
+|---|---|---|
+| `system` | 0 o | **> 1 000 o** |
+| `tools` (L1) | 0 o | **> 1 000 o** |
+| injections (`currentTurn` / `history` : L2, L3, L4) | 0 o (neuf) / 2 584 o (omniris) | **garde-fou d'abord** |
+
+Garde-fou retenu pour le bucket d'injection : **le banc compare le hash du bloc L4 entre les
+deux bras et refuse le verdict (abort / re-run) s'il a dérivé pour une raison autre que le
+tuning**. Avec ce garde-fou, le seuil de 1 000 octets tient partout ; sans lui, il faudrait le
+porter au-delà de 2 584 octets sur le bucket d'injection et le levier L4 (1 038 o mesuré) y
+deviendrait inobservable. À réévaluer si le banc passe en interactif ou appelle `Bash` (§5).
 
 ---
 
@@ -230,6 +252,19 @@ Pourquoi celui-là, chiffres en main :
   changé dans le cwd entre eux. La paire omniris diffère de 2 930 octets uniquement parce que
   `CLAUDE.md` a été édité entre les deux. Le banc doit donc figer son cwd (un temp repo
   committé, pas le repo de travail) et **ne pas** écrire dedans entre les bras.
+
+⚠ **Un temp repo nu rend L3 et L4 quasi inobservables.** Dans `/tmp/ccsnoop-b2`, L3 pèse
+**3 503 octets** (seulement le `CLAUDE.md` global + memory) contre **23 314 octets** dans
+omniris, et L4 **1 038 octets** contre ~2,6 Ko. Un banc construit littéralement sur le §5
+ci-dessus mesurerait donc bien L1 et L2, et presque rien sur L3/L4. Deux options, à trancher
+dans la map :
+
+- **fixture représentative** : le temp repo du banc embarque un `CLAUDE.md` projet *committé et
+  figé* (taille réaliste, ~5–20 Ko) et un `.mcp.json` avec au moins un serveur local, pour que
+  L3 et L4 aient de la matière à couper ;
+- ou **assumer** que ce prompt ne prouve que L1 et L2, et sortir L3/L4 du périmètre du banc.
+
+Rien dans les mesures ne tranche entre les deux : c'est un choix de portée, pas un fait.
 - **Mode `-p`, pas interactif** : c'est `-p` qui supprime le `session_id` du chemin scratchpad
   de `system#2` (§3), donc qui rend le préfixe strictement reproductible.
 
@@ -295,8 +330,10 @@ forme → map #46 ; sémantique du découpage → [#29](https://github.com/ledah
    (interactif seulement). Purement cosmétiques : ordre des clés, `session_id`, timestamps,
    ordre de `tools[]` (stable sur 4 sessions).
 4. **Bruit vs signal** — bruit **0 o** en requête #1, **168 o** en requête #2 ; signal ≈
-   **72 000 o** (19 K tok × 3,79 o/tok dérivé de la capture). **≈430×, 2,6 ordres de
-   grandeur → un run par bras suffit** ; seuil de gain réel proposé : > 1 000 o par bucket.
+   **48 800 o** (19 K tok × 2,57 o/tok, ratio dérivé de la capture omniris elle-même).
+   **≈290×, 2,5 ordres de grandeur → un run par bras suffit.** Seuil de gain réel : > 1 000 o
+   sur `system` et `tools`, et pour le bucket d'injection un **garde-fou de hash sur le bloc
+   L4** plutôt qu'un seuil — parce que l'état MCP y bouge de 2 584 o hors tuning (§4).
 5. **Prompt canonique** — `Read the file FIXED.txt and reply with only its first word.` sur un
    fichier committé, en `-p`, haiku : 2 POSTs, contenu conversationnel 0,12 %, `tool_result`
    déterministe. **Interdire les outils serait une erreur** (1 POST, aucun verdict cache) ;
@@ -310,6 +347,12 @@ node docs/research/probes/bench-run-comparability-probe.mjs \
   /tmp/ccsnoop-b2/.ccsnoop/sessions/db1db459-b039-47b1-ad73-aa7adf6f2338
 ```
 
+Le probe accepte **n'importe quel** répertoire de session (`sessions/<id>/` avec un
+`manifest.jsonl`) et diffère chaque paire consécutive passée en argument. ⚠ Les captures des
+runs neufs vivent sous `/tmp` — **éphémères, elles ne survivront pas à un reboot** ; les
+chiffres de ce document sont la trace durable. Elles n'ont pas été committées : la question
+« que garde-t-on d'une capture archivée et sous quelle redaction » est encore ouverte dans #46.
+
 Les runs neufs ont été faits dans un temp repo (`/tmp/ccsnoop-b2`) routé par
 `ccsnoop init`, puis `ccsnoop init --undo` ; le daemon de la machine et la route de
-l'utilisateur n'ont pas été touchés.
+l'utilisateur n'ont pas été touchés (`routes.json` revérifié identique après coup).
