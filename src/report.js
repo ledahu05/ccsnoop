@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import { computeWaste } from './waste.js';
 
@@ -74,7 +75,7 @@ export function parseRequestBlob(buf) {
  * @returns {Usage | null} null when no `usage` is present (e.g. a HEAD/error blob).
  */
 export function readUsage(buf) {
-  const text = typeof buf === 'string' ? buf : buf.toString('utf8');
+  const text = decodeBlob(buf);
   if (text.trim().length === 0) return null;
 
   // SSE path: collect every `data:` JSON line and fold usage across events.
@@ -106,6 +107,28 @@ export function readUsage(buf) {
     // Not JSON either — no accounting available.
   }
   return null;
+}
+
+/**
+ * Decode a captured response blob into UTF-8 text. Anthropic serves the SSE
+ * stream with `content-encoding: gzip`, so the blob on disk is raw gzip bytes;
+ * read as-is they carry no `message_start`, and `usage` reads null on every real
+ * exchange (issue #53). Detect the gzip magic (`1f 8b`) and inflate before
+ * treating the bytes as text; a plain-text blob (or a string) passes through.
+ *
+ * @param {Buffer | string} buf
+ * @returns {string}
+ */
+function decodeBlob(buf) {
+  if (typeof buf === 'string') return buf;
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    try {
+      return zlib.gunzipSync(buf).toString('utf8');
+    } catch {
+      // Truncated/corrupt gzip — fall back to the raw bytes (reads as null).
+    }
+  }
+  return buf.toString('utf8');
 }
 
 /**

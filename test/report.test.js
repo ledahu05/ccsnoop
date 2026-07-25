@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import {
   parseRequestBlob,
@@ -164,6 +165,31 @@ test('readUsage keeps message_start input/cache figures when the delta omits usa
   assert.equal(u.inputTokens, 100);
   assert.equal(u.cacheReadInputTokens, 40);
   assert.equal(u.stopReason, 'end_turn');
+});
+
+test('readUsage gunzips a gzip-encoded SSE blob (content-encoding: gzip)', () => {
+  // Anthropic serves the SSE stream gzipped; the captured blob is raw gzip
+  // bytes. readUsage must detect the `1f 8b` magic and inflate before parsing,
+  // or every real exchange reads usage=null (issue #53).
+  const sse = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":800,"cache_creation_input_tokens":50,"output_tokens":1}}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":345}}',
+    '',
+  ].join('\n');
+  const gz = zlib.gzipSync(Buffer.from(sse, 'utf8'));
+  assert.equal(gz[0], 0x1f);
+  assert.equal(gz[1], 0x8b);
+  const u = readUsage(gz);
+  assert.notEqual(u, null, 'gzipped blob must not read as null usage');
+  assert.equal(u.inputTokens, 1200);
+  assert.equal(u.cacheReadInputTokens, 800);
+  assert.equal(u.cacheCreationInputTokens, 50);
+  assert.equal(u.outputTokens, 345);
+  assert.equal(u.stopReason, 'end_turn');
+  assert.equal(u.streaming, true);
 });
 
 // ── computeAnatomy (byte-length buckets, never token counts) ──────────────────
@@ -485,6 +511,57 @@ test('loadSession attaches per-exchange waste + a session waste summary', () => 
   assert.ok(model.waste.reusedUncachedBytes >= 6000);
   // The parsed body is dropped from the embedded model.
   assert.equal(model.exchanges[0].requestJson, undefined);
+});
+
+test('loadSession reads usage through gzipped blobs so a cache-warm lineage is not cold (#53)', () => {
+  const root = mkTmpDir();
+  const id = 'sess-gz';
+  const dir = path.join(root, 'sessions', id);
+  fs.mkdirSync(dir, { recursive: true });
+  const bigSys = 'S'.repeat(6000);
+  const mkReq = (messages) =>
+    buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-x', system: bigSys, tools: [{ name: 'Bash' }], messages })),
+    });
+  const mkResp = (input, cacheRead) =>
+    zlib.gzipSync(
+      Buffer.from(
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":' +
+          input +
+          ',"cache_read_input_tokens":' +
+          cacheRead +
+          ',"cache_creation_input_tokens":0,"output_tokens":1}}}\n\n' +
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n',
+        'utf8'
+      )
+    );
+  fs.writeFileSync(path.join(dir, '0001.request.http'), mkReq([{ role: 'user', content: 'q1' }]));
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), mkResp(6100, 0));
+  // Second request re-sends the identical big system but the cache SERVED it.
+  fs.writeFileSync(
+    path.join(dir, '0002.request.http'),
+    mkReq([{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }])
+  );
+  fs.writeFileSync(path.join(dir, '0002.response.sse'), mkResp(200, 6000));
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) +
+      '\n' +
+      JSON.stringify({ turn: 2, thread_id: id, request_blob: '0002.request.http', response_blob: '0002.response.sse' }) +
+      '\n'
+  );
+
+  const model = loadSession(dir, id);
+  // Usage is read from the gzipped blob, not null.
+  assert.notEqual(model.exchanges[1].usage, null, 'usage read through gzip');
+  assert.equal(model.exchanges[1].usage.cacheReadInputTokens, 6000);
+  // Having read 6000 cache tokens, the lineage is NOT cold and the re-sent
+  // system is not counted as waste.
+  assert.equal(model.exchanges[1].waste.cold, false, 'cache-warm lineage must not read as cold');
+  assert.equal(model.exchanges[1].waste.reusedUncachedBytes, 0, 'cache-served prefix is not waste');
 });
 
 test('renderReport surfaces waste markers, tier coloring, and the headline metric', () => {
