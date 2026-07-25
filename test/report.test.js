@@ -18,6 +18,7 @@ import {
   renderReport,
 } from '../src/report.js';
 import { buildRequestBlob, REDACTED } from '../src/capture.js';
+import { segmentRequest } from '../src/waste.js';
 
 function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-report-'));
@@ -80,6 +81,24 @@ test('contentForSlot indexes system blocks, tools by name, and messages by index
 
 test('contentForSlot resolves a bare string system prompt via the "system" slot', () => {
   assert.equal(contentForSlot({ system: 'you are helpful' }, 'system'), 'you are helpful');
+});
+
+test('contentForSlot resolves every slot segmentRequest emits, incl. anonymous tools', () => {
+  // A tool without a string `name` is slotted positionally (`tool:#<i>`); the
+  // resolver must fall back to that index rather than a by-name lookup. Pairing
+  // the two public functions keeps the row-expand path honest end to end: no
+  // slot that segmentRequest emits may render as "(raw content unavailable)".
+  const body = {
+    system: [{ type: 'text', text: 'block zero' }],
+    tools: [{ description: 'anon first' }, { name: 'Bash' }, { schema: {} }],
+    messages: [{ role: 'user', content: 'hi' }, { role: 'user', content: 'now' }],
+  };
+  for (const seg of segmentRequest(body)) {
+    assert.notEqual(contentForSlot(body, seg.slot), undefined, `slot ${seg.slot} should resolve`);
+  }
+  // The anonymous entries specifically resolve to their original objects.
+  assert.deepEqual(contentForSlot(body, 'tool:#0'), { description: 'anon first' });
+  assert.deepEqual(contentForSlot(body, 'tool:#2'), { schema: {} });
 });
 
 test('contentForSlot returns undefined for missing/unknown slots and non-object bodies', () => {
