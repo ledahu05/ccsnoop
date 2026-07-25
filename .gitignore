@@ -2,3 +2,4 @@ node_modules/
 sessions/
 .ccsnoop/
 *.log
+bench/runs/

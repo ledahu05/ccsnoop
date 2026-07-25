@@ -40,10 +40,22 @@ function gitignoreLines(repo) {
 
 // ── anchoring ─────────────────────────────────────────────────────────────
 
-test('outside a git repo, init errors; inside, it anchors to the git top-level', () => {
+test('outside a git repo, init anchors to cwd (CC project dir); inside, to the git top-level', () => {
+  // Non-git cwd → anchor to cwd itself, no error, no gitignore.
   const plain = mkPlain();
+  const home = mkHome();
   assert.equal(gitTopLevel(plain), null);
-  assert.throws(() => init({ cwd: plain, home: mkHome() }), InitError);
+  const res0 = init({ cwd: plain, home });
+  assert.equal(res0.exitCode, 0);
+  assert.equal(res0.captureDir, path.join(plain, '.ccsnoop'));
+  const plainToken = deriveToken(path.join(plain, '.ccsnoop'));
+  assert.equal(
+    readSettings(plain).env.ANTHROPIC_BASE_URL,
+    `http://localhost:41377/${plainToken}`,
+  );
+  assert.equal(readSettings(plain).env.ENABLE_TOOL_SEARCH, 'true');
+  assert.deepEqual(gitignoreLines(plain), [], 'no .gitignore written for a non-git anchor');
+  assert.ok(readRoutes(home)[plainToken], 'route registered under the plain-dir token');
 
   const repo = mkRepo();
   const sub = path.join(repo, 'a', 'b');
@@ -52,6 +64,52 @@ test('outside a git repo, init errors; inside, it anchors to the git top-level',
   assert.equal(res.exitCode, 0);
   // Anchored to the top-level, not the cwd.
   assert.equal(res.captureDir, path.join(repo, '.ccsnoop'));
+});
+
+test('undo on a non-git anchor removes route + created settings, touches no .gitignore', () => {
+  const plain = mkPlain();
+  const home = mkHome();
+  init({ cwd: plain, home });
+  assert.equal(daemon.countRoutes(home), 1);
+
+  const res = init({ cwd: plain, home, undo: true });
+  assert.equal(res.exitCode, 0);
+  assert.equal(daemon.countRoutes(home), 0, 'route removed');
+  assert.ok(
+    !fs.existsSync(path.join(plain, '.claude', 'settings.local.json')),
+    'created settings removed',
+  );
+  assert.ok(!fs.existsSync(path.join(plain, '.gitignore')), 'no .gitignore ever written');
+});
+
+test('non-git anchor: idempotent re-run preserves provenance so undo restores true pre-init state', () => {
+  const plain = mkPlain();
+  const home = mkHome();
+  // A settings.local.json that predates ccsnoop, with a user env key.
+  fs.mkdirSync(path.join(plain, '.claude'), { recursive: true });
+  fs.writeFileSync(
+    path.join(plain, '.claude', 'settings.local.json'),
+    JSON.stringify({ env: { FOO: 'bar' } }, null, 2) + '\n',
+  );
+
+  init({ cwd: plain, home });
+  init({ cwd: plain, home }); // idempotent re-run must not lose the original provenance
+
+  const token = deriveToken(path.join(plain, '.ccsnoop'));
+  const manifest = readRoutes(home)[token];
+  assert.equal(manifest.created_local_settings, false, 'settings pre-existed — init did not create it');
+  assert.deepEqual(
+    manifest.env_prev,
+    { ANTHROPIC_BASE_URL: null, ENABLE_TOOL_SEARCH: null },
+    'env_prev still snapshots the true pre-init state (both keys absent)',
+  );
+
+  init({ cwd: plain, home, undo: true });
+  assert.deepEqual(
+    readSettings(plain),
+    { env: { FOO: 'bar' } },
+    'undo restores the exact pre-init settings, leaving the pre-existing key untouched',
+  );
 });
 
 // ── settings.local.json env surgery ─────────────────────────────────────────

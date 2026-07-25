@@ -8,10 +8,11 @@
 // and the raw view.
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import { computeWaste } from './waste.js';
+import { defaultHome } from './daemon.js';
 
 /**
  * @typedef {object} Usage
@@ -74,7 +75,7 @@ export function parseRequestBlob(buf) {
  * @returns {Usage | null} null when no `usage` is present (e.g. a HEAD/error blob).
  */
 export function readUsage(buf) {
-  const text = typeof buf === 'string' ? buf : buf.toString('utf8');
+  const text = decodeBlob(buf);
   if (text.trim().length === 0) return null;
 
   // SSE path: collect every `data:` JSON line and fold usage across events.
@@ -106,6 +107,28 @@ export function readUsage(buf) {
     // Not JSON either — no accounting available.
   }
   return null;
+}
+
+/**
+ * Decode a captured response blob into UTF-8 text. Anthropic serves the SSE
+ * stream with `content-encoding: gzip`, so the blob on disk is raw gzip bytes;
+ * read as-is they carry no `message_start`, and `usage` reads null on every real
+ * exchange (issue #53). Detect the gzip magic (`1f 8b`) and inflate before
+ * treating the bytes as text; a plain-text blob (or a string) passes through.
+ *
+ * @param {Buffer | string} buf
+ * @returns {string}
+ */
+function decodeBlob(buf) {
+  if (typeof buf === 'string') return buf;
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    try {
+      return zlib.gunzipSync(buf).toString('utf8');
+    } catch {
+      // Truncated/corrupt gzip — fall back to the raw bytes (reads as null).
+    }
+  }
+  return buf.toString('utf8');
 }
 
 /**
@@ -173,6 +196,40 @@ export function computeAnatomy(body) {
     history = messages.length > 1 ? bytes(messages.slice(0, -1)) : 0;
   }
   return { system, tools, history, currentTurn, total: system + tools + history + currentTurn };
+}
+
+/**
+ * Resolve a segment `slot` back to its raw value inside a parsed request body.
+ * The inverse of the slot naming in {@link module:waste~segmentRequest}:
+ * `system` → `body.system`, `system#<i>` → `body.system[i]`, `tool:<name>` →
+ * the `body.tools` entry with that name, `message#<i>` → `body.messages[i]`.
+ *
+ * Kept self-contained (no module-scope references) so its source can be shipped
+ * verbatim into the client renderer, which re-parses the embedded `requestBlob`
+ * to expand a row without any new payload (issue #28). Returns `undefined` when
+ * the slot has no match — the caller renders that as "unavailable".
+ *
+ * @param {any} body   Parsed request JSON (null-safe).
+ * @param {string} slot
+ * @returns {any}
+ */
+export function contentForSlot(body, slot) {
+  if (!body || typeof body !== 'object' || typeof slot !== 'string') return undefined;
+  if (slot === 'system') return body.system;
+  const sysM = slot.match(/^system#(\d+)$/);
+  if (sysM) return Array.isArray(body.system) ? body.system[Number(sysM[1])] : undefined;
+  if (slot.indexOf('tool:') === 0) {
+    const name = slot.slice(5);
+    if (!Array.isArray(body.tools)) return undefined;
+    const byName = body.tools.find((t) => t && t.name === name);
+    if (byName !== undefined) return byName;
+    // Anonymous tools are slotted as `tool:#<i>` — fall back to positional index.
+    const anon = name.match(/^#(\d+)$/);
+    return anon ? body.tools[Number(anon[1])] : undefined;
+  }
+  const msgM = slot.match(/^message#(\d+)$/);
+  if (msgM) return Array.isArray(body.messages) ? body.messages[Number(msgM[1])] : undefined;
+  return undefined;
 }
 
 /**
@@ -332,13 +389,15 @@ export function resolveRoots({ cwd, root, all }) {
 }
 
 /**
- * Capture roots registered in `~/.ccsnoop/routes.json` (token → dir). Best-effort:
- * the registry is built by a later slice, so absence is not an error.
+ * Capture roots registered in the machine home's `routes.json` (token → dir).
+ * Honours `$CCSNOOP_HOME` (via {@link defaultHome}) so an isolated registry can be
+ * exercised without polluting the dev's real `~/.ccsnoop`. Best-effort: the registry
+ * is built by a later slice, so absence is not an error.
  * @returns {string[]}
  */
 function readRoutesRoots() {
   try {
-    const p = path.join(os.homedir(), '.ccsnoop', 'routes.json');
+    const p = path.join(defaultHome(), 'routes.json');
     const routes = JSON.parse(fs.readFileSync(p, 'utf8'));
     return Object.values(routes)
       .map((v) => (typeof v === 'string' ? v : v && typeof v === 'object' ? v.dir : null))
@@ -471,10 +530,15 @@ pre.raw-blob{background:#0a0c11;border:1px solid var(--edge);border-radius:6px;p
 .wmark .bloat{color:var(--hist)}
 .summary .waste{color:var(--k-waste)}
 .seglist{margin:6px 0 0}
-.seg-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-left:3px solid var(--k-cached);background:#12151d;border-radius:0 4px 4px 0;margin-bottom:3px;font-size:12px}
+.seg-row-acc{margin-bottom:3px}
+.seg-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-left:3px solid var(--k-cached);background:#12151d;border-radius:0 4px 4px 0;font-size:12px;list-style:none;cursor:pointer}
+.seg-row::-webkit-details-marker{display:none}
+.seg-row:hover{background:#1a1e2a}
+.seg-row.reused-uncached:hover{background:#2c181e}
 .seg-row.new{border-left-color:var(--k-new)}
 .seg-row.reused-cached{border-left-color:var(--k-cached);opacity:.7}
 .seg-row.reused-uncached{border-left-color:var(--k-waste);background:#241419}
+.seg-raw{margin:0 0 0 3px;border-left:3px solid var(--edge);background:#0a0c11;padding:8px 10px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#cfd6e6}
 .seg-row .lab{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .seg-row .sb{color:var(--muted);font-variant-numeric:tabular-nums}
 .badge{font-size:10px;padding:1px 6px;border-radius:8px;border:1px solid var(--edge);white-space:nowrap}
@@ -506,6 +570,12 @@ const REPORT_JS = `
   function fmt(n){ return (n==null?0:n).toLocaleString(); }
   function bytes(n){ if(n==null) return '0 B'; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(2)+' MB'; }
   function el(tag,cls,txt){ var e=document.createElement(tag); if(cls)e.className=cls; if(txt!=null)e.textContent=txt; return e; }
+
+  // Slot → raw content, shared verbatim with the server (report.js contentForSlot).
+  var contentForSlot = ${contentForSlot.toString()};
+  // Extract the JSON body out of an already-redacted raw request blob. Rows expand
+  // by re-parsing this — no new payload is embedded (issue #28).
+  function bodyOf(blob){ if(!blob) return null; var i=blob.indexOf('\\r\\n\\r\\n'); var b=i>=0?blob.slice(i+4):blob; try{ return JSON.parse(b); }catch(_){ return null; } }
 
   document.getElementById('session-id').textContent = model.sessionId;
   var totalIn = ex.reduce(function(s,e){ return s + (e.usage?e.usage.inputTokens:0); },0);
@@ -595,6 +665,8 @@ const REPORT_JS = `
     // Segments carry their global order; group by bucket but keep the global index
     // so the cache-boundary overlay can be dropped at the right seam.
     var segs = e.segments || [];
+    // Row expansion reads raw content back from the embedded (redacted) blob.
+    var reqBody = bodyOf(e.requestBlob);
     var byBucket = {system:[],tools:[],history:[],currentTurn:[]};
     segs.forEach(function(sg,gi){ if(byBucket[sg.bucket]) byBucket[sg.bucket].push({s:sg,gi:gi}); });
     var boundary = ew.cacheBoundary||0;
@@ -626,7 +698,7 @@ const REPORT_JS = `
           if(r.gi===boundary && boundary>0 && boundary<segs.length){
             list.appendChild(el('div','cache-div','cache boundary — cached prefix ends'));
           }
-          list.appendChild(segRow(r.s));
+          list.appendChild(segRow(r.s, reqBody));
         });
         b.appendChild(list);
       }
@@ -642,18 +714,29 @@ const REPORT_JS = `
   }
   function chip(k,v){ var c=el('div','chip'); c.innerHTML='<span>'+k+'</span> <b></b>'; c.querySelector('b').textContent=v; return c; }
 
-  // One segment line: left border colored by kind, label, size, kind + waste badges.
+  // One segment row: a native <details> whose <summary> is the colored line
+  // (label, size, kind + waste badges) and whose body reveals the raw content of
+  // that slot, pulled from the redacted request blob (issue #28). Same accordion
+  // idiom as the section-level .acc — no modal, no new interactivity.
   var KIND_LABEL = {'new':'new','reused-cached':'cached','reused-uncached':'re-sent'};
-  function segRow(sg){
+  function segRow(sg, body){
     var kind = sg.kind||'new';
-    var row = el('div','seg-row '+kind);
+    var d = el('details','seg-row-acc '+kind);
+    var row = el('summary','seg-row '+kind);
     row.appendChild(el('span','lab', sg.label||sg.slot||''));
     row.appendChild(el('span','sb', bytes(sg.bytes||0)));
     row.appendChild(el('span','badge k-'+kind, KIND_LABEL[kind]||kind));
     if(sg.flagship) row.appendChild(el('span','badge flagship','flagship'));
     else if(sg.static) row.appendChild(el('span','badge static','static'));
     if(sg.bloated) row.appendChild(el('span','badge bloat','bloat '+bytes(sg.bloatBytes||0)));
-    return row;
+    d.appendChild(row);
+    var content = contentForSlot(body, sg.slot);
+    var pre = el('pre','seg-raw');
+    pre.textContent = content===undefined
+      ? '(raw content unavailable)'
+      : (typeof content==='string' ? content : JSON.stringify(content, null, 2));
+    d.appendChild(pre);
+    return d;
   }
 
   if(ex.length===0){ detail.appendChild(el('div','empty','No exchanges captured in this session.')); }

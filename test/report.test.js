@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 import {
   parseRequestBlob,
   readUsage,
   computeAnatomy,
   buildExchange,
+  contentForSlot,
   loadSession,
   listSessions,
   pickLatestSession,
@@ -17,6 +19,7 @@ import {
   renderReport,
 } from '../src/report.js';
 import { buildRequestBlob, REDACTED } from '../src/capture.js';
+import { segmentRequest } from '../src/waste.js';
 
 function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-report-'));
@@ -55,6 +58,58 @@ test('parseRequestBlob tolerates a non-JSON body', () => {
   const parsed = parseRequestBlob('HEAD / HTTP/1.1\r\nHost: x\r\n\r\n');
   assert.equal(parsed.method, 'HEAD');
   assert.equal(parsed.json, null);
+});
+
+// ── contentForSlot (row expand: slot → raw content from the request body) ─────
+
+test('contentForSlot indexes system blocks, tools by name, and messages by index', () => {
+  const body = {
+    system: [{ type: 'text', text: 'block zero' }, { type: 'text', text: 'block one' }],
+    tools: [{ name: 'Bash', description: 'run' }, { name: 'Read' }],
+    messages: [
+      { role: 'user', content: 'earlier' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'current' },
+    ],
+  };
+  assert.deepEqual(contentForSlot(body, 'system#0'), { type: 'text', text: 'block zero' });
+  assert.deepEqual(contentForSlot(body, 'system#1'), { type: 'text', text: 'block one' });
+  assert.deepEqual(contentForSlot(body, 'tool:Bash'), { name: 'Bash', description: 'run' });
+  assert.deepEqual(contentForSlot(body, 'tool:Read'), { name: 'Read' });
+  assert.deepEqual(contentForSlot(body, 'message#0'), { role: 'user', content: 'earlier' });
+  assert.deepEqual(contentForSlot(body, 'message#2'), { role: 'user', content: 'current' });
+});
+
+test('contentForSlot resolves a bare string system prompt via the "system" slot', () => {
+  assert.equal(contentForSlot({ system: 'you are helpful' }, 'system'), 'you are helpful');
+});
+
+test('contentForSlot resolves every slot segmentRequest emits, incl. anonymous tools', () => {
+  // A tool without a string `name` is slotted positionally (`tool:#<i>`); the
+  // resolver must fall back to that index rather than a by-name lookup. Pairing
+  // the two public functions keeps the row-expand path honest end to end: no
+  // slot that segmentRequest emits may render as "(raw content unavailable)".
+  const body = {
+    system: [{ type: 'text', text: 'block zero' }],
+    tools: [{ description: 'anon first' }, { name: 'Bash' }, { schema: {} }],
+    messages: [{ role: 'user', content: 'hi' }, { role: 'user', content: 'now' }],
+  };
+  for (const seg of segmentRequest(body)) {
+    assert.notEqual(contentForSlot(body, seg.slot), undefined, `slot ${seg.slot} should resolve`);
+  }
+  // The anonymous entries specifically resolve to their original objects.
+  assert.deepEqual(contentForSlot(body, 'tool:#0'), { description: 'anon first' });
+  assert.deepEqual(contentForSlot(body, 'tool:#2'), { schema: {} });
+});
+
+test('contentForSlot returns undefined for missing/unknown slots and non-object bodies', () => {
+  const body = { system: [{ text: 'a' }], tools: [{ name: 'Bash' }], messages: [{ role: 'user' }] };
+  assert.equal(contentForSlot(body, 'system#5'), undefined);
+  assert.equal(contentForSlot(body, 'tool:Nope'), undefined);
+  assert.equal(contentForSlot(body, 'message#9'), undefined);
+  assert.equal(contentForSlot(body, 'bogus'), undefined);
+  assert.equal(contentForSlot(null, 'system#0'), undefined);
+  assert.equal(contentForSlot(body, null), undefined);
 });
 
 // ── readUsage (SSE + JSON, no re-tokenization) ────────────────────────────────
@@ -110,6 +165,43 @@ test('readUsage keeps message_start input/cache figures when the delta omits usa
   assert.equal(u.inputTokens, 100);
   assert.equal(u.cacheReadInputTokens, 40);
   assert.equal(u.stopReason, 'end_turn');
+});
+
+test('readUsage gunzips a gzip-encoded SSE blob (content-encoding: gzip)', () => {
+  // Anthropic serves the SSE stream gzipped; the captured blob is raw gzip
+  // bytes. readUsage must detect the `1f 8b` magic and inflate before parsing,
+  // or every real exchange reads usage=null (issue #53).
+  const sse = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":800,"cache_creation_input_tokens":50,"output_tokens":1}}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":345}}',
+    '',
+  ].join('\n');
+  const gz = zlib.gzipSync(Buffer.from(sse, 'utf8'));
+  assert.equal(gz[0], 0x1f);
+  assert.equal(gz[1], 0x8b);
+  const u = readUsage(gz);
+  assert.notEqual(u, null, 'gzipped blob must not read as null usage');
+  assert.equal(u.inputTokens, 1200);
+  assert.equal(u.cacheReadInputTokens, 800);
+  assert.equal(u.cacheCreationInputTokens, 50);
+  assert.equal(u.outputTokens, 345);
+  assert.equal(u.stopReason, 'end_turn');
+  assert.equal(u.streaming, true);
+});
+
+test('readUsage falls back to null on a truncated/corrupt gzip blob without throwing', () => {
+  // An aborted stream can leave the gzip member incomplete: the `1f 8b` magic is
+  // present but inflation fails. readUsage must degrade to null (no accounting)
+  // rather than propagate the zlib error (issue #53).
+  const sse = 'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+  const gz = zlib.gzipSync(Buffer.from(sse, 'utf8'));
+  const truncated = gz.subarray(0, gz.length - 5);
+  assert.equal(truncated[0], 0x1f);
+  assert.equal(truncated[1], 0x8b);
+  assert.equal(readUsage(truncated), null);
 });
 
 // ── computeAnatomy (byte-length buckets, never token counts) ──────────────────
@@ -208,6 +300,22 @@ test('pickLatestSession returns the most recently written session', () => {
 test('resolveRoots defaults to <cwd>/.ccsnoop and honours --root', () => {
   assert.deepEqual(resolveRoots({ cwd: '/repo' }), [path.resolve('/repo', '.ccsnoop')]);
   assert.deepEqual(resolveRoots({ cwd: '/repo', root: 'custom' }), [path.resolve('/repo', 'custom')]);
+});
+
+test('resolveRoots --all reads the routes registry under CCSNOOP_HOME, not ~/.ccsnoop', () => {
+  const home = mkTmpDir();
+  const routeDir = path.join(home, 'repo-a', '.ccsnoop');
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, 'routes.json'), JSON.stringify({ tok: routeDir }));
+  const prev = process.env.CCSNOOP_HOME;
+  process.env.CCSNOOP_HOME = home;
+  try {
+    const roots = resolveRoots({ cwd: '/repo', all: true });
+    assert.ok(roots.includes(routeDir), `expected ${routeDir} in ${roots.join(', ')}`);
+  } finally {
+    if (prev === undefined) delete process.env.CCSNOOP_HOME;
+    else process.env.CCSNOOP_HOME = prev;
+  }
 });
 
 test('listSessions finds session dirs with a manifest under <root>/sessions', () => {
@@ -318,6 +426,35 @@ test('renderReport emits ONE self-contained HTML — no external assets, redacti
   assert.ok(!html.includes('sk-super-secret'), 'no secret leaked into the report');
 });
 
+test('renderReport ships the row-expand accordion wiring (issue #28)', () => {
+  const root = mkTmpDir();
+  const dir = writeFixtureSession(root, 'sess-expand');
+  const html = renderReport(loadSession(dir, 'sess-expand'));
+  // Nested <details> row accordion + raw pane + the shared slot resolver, all inline.
+  assert.ok(html.includes('seg-row-acc'), 'nested row accordion class present');
+  assert.ok(html.includes('seg-raw'), 'raw-content pane class present');
+  assert.ok(html.includes('function contentForSlot'), 'slot resolver shipped to the client');
+  assert.ok(html.includes('function segRow'), 'segRow builder present');
+  // The row is a <summary>, i.e. the click target for native expand.
+  assert.ok(/segRow[\s\S]*el\('summary'/.test(html), 'seg row is a summary (clickable)');
+});
+
+test('expanded row content is recoverable from the embedded redacted blob (issue #28)', () => {
+  const root = mkTmpDir();
+  const dir = writeFixtureSession(root, 'sess-recover');
+  const model = loadSession(dir, 'sess-recover');
+  const e = model.exchanges[0];
+  // Re-run the client path in Node: parse the embedded blob, index by slot.
+  const body = parseRequestBlob(e.requestBlob).json;
+  const bySlot = Object.fromEntries(e.segments.map((s) => [s.slot, contentForSlot(body, s.slot)]));
+  assert.deepEqual(bySlot['system#0'], { type: 'text', text: 'system prompt' });
+  assert.deepEqual(bySlot['tool:Bash'], { name: 'Bash' });
+  assert.deepEqual(bySlot['message#2'], { role: 'user', content: 'current turn' });
+  // The blob is the redacted one, so no header secret can surface in an expansion.
+  assert.ok(e.requestBlob.includes(REDACTED));
+  assert.ok(!JSON.stringify(bySlot).includes('sk-super-secret'), 'secret never surfaces in expanded content');
+});
+
 test('generateReport discovers the latest session, writes a report file, honours --session', () => {
   const root = mkTmpDir();
   writeFixtureSession(root, 'old');
@@ -402,6 +539,57 @@ test('loadSession attaches per-exchange waste + a session waste summary', () => 
   assert.ok(model.waste.reusedUncachedBytes >= 6000);
   // The parsed body is dropped from the embedded model.
   assert.equal(model.exchanges[0].requestJson, undefined);
+});
+
+test('loadSession reads usage through gzipped blobs so a cache-warm lineage is not cold (#53)', () => {
+  const root = mkTmpDir();
+  const id = 'sess-gz';
+  const dir = path.join(root, 'sessions', id);
+  fs.mkdirSync(dir, { recursive: true });
+  const bigSys = 'S'.repeat(6000);
+  const mkReq = (messages) =>
+    buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-x', system: bigSys, tools: [{ name: 'Bash' }], messages })),
+    });
+  const mkResp = (input, cacheRead) =>
+    zlib.gzipSync(
+      Buffer.from(
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":' +
+          input +
+          ',"cache_read_input_tokens":' +
+          cacheRead +
+          ',"cache_creation_input_tokens":0,"output_tokens":1}}}\n\n' +
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}\n\n',
+        'utf8'
+      )
+    );
+  fs.writeFileSync(path.join(dir, '0001.request.http'), mkReq([{ role: 'user', content: 'q1' }]));
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), mkResp(6100, 0));
+  // Second request re-sends the identical big system but the cache SERVED it.
+  fs.writeFileSync(
+    path.join(dir, '0002.request.http'),
+    mkReq([{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }])
+  );
+  fs.writeFileSync(path.join(dir, '0002.response.sse'), mkResp(200, 6000));
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) +
+      '\n' +
+      JSON.stringify({ turn: 2, thread_id: id, request_blob: '0002.request.http', response_blob: '0002.response.sse' }) +
+      '\n'
+  );
+
+  const model = loadSession(dir, id);
+  // Usage is read from the gzipped blob, not null.
+  assert.notEqual(model.exchanges[1].usage, null, 'usage read through gzip');
+  assert.equal(model.exchanges[1].usage.cacheReadInputTokens, 6000);
+  // Having read 6000 cache tokens, the lineage is NOT cold and the re-sent
+  // system is not counted as waste.
+  assert.equal(model.exchanges[1].waste.cold, false, 'cache-warm lineage must not read as cold');
+  assert.equal(model.exchanges[1].waste.reusedUncachedBytes, 0, 'cache-served prefix is not waste');
 });
 
 test('renderReport surfaces waste markers, tier coloring, and the headline metric', () => {
