@@ -40,10 +40,22 @@ function gitignoreLines(repo) {
 
 // ── anchoring ─────────────────────────────────────────────────────────────
 
-test('outside a git repo, init errors; inside, it anchors to the git top-level', () => {
+test('outside a git repo, init anchors to cwd (CC project dir); inside, to the git top-level', () => {
+  // Non-git cwd → anchor to cwd itself, no error, no gitignore.
   const plain = mkPlain();
+  const home = mkHome();
   assert.equal(gitTopLevel(plain), null);
-  assert.throws(() => init({ cwd: plain, home: mkHome() }), InitError);
+  const res0 = init({ cwd: plain, home });
+  assert.equal(res0.exitCode, 0);
+  assert.equal(res0.captureDir, path.join(plain, '.ccsnoop'));
+  const plainToken = deriveToken(path.join(plain, '.ccsnoop'));
+  assert.equal(
+    readSettings(plain).env.ANTHROPIC_BASE_URL,
+    `http://localhost:41377/${plainToken}`,
+  );
+  assert.equal(readSettings(plain).env.ENABLE_TOOL_SEARCH, 'true');
+  assert.deepEqual(gitignoreLines(plain), [], 'no .gitignore written for a non-git anchor');
+  assert.ok(readRoutes(home)[plainToken], 'route registered under the plain-dir token');
 
   const repo = mkRepo();
   const sub = path.join(repo, 'a', 'b');
@@ -52,6 +64,22 @@ test('outside a git repo, init errors; inside, it anchors to the git top-level',
   assert.equal(res.exitCode, 0);
   // Anchored to the top-level, not the cwd.
   assert.equal(res.captureDir, path.join(repo, '.ccsnoop'));
+});
+
+test('undo on a non-git anchor removes route + created settings, touches no .gitignore', () => {
+  const plain = mkPlain();
+  const home = mkHome();
+  init({ cwd: plain, home });
+  assert.equal(daemon.countRoutes(home), 1);
+
+  const res = init({ cwd: plain, home, undo: true });
+  assert.equal(res.exitCode, 0);
+  assert.equal(daemon.countRoutes(home), 0, 'route removed');
+  assert.ok(
+    !fs.existsSync(path.join(plain, '.claude', 'settings.local.json')),
+    'created settings removed',
+  );
+  assert.ok(!fs.existsSync(path.join(plain, '.gitignore')), 'no .gitignore ever written');
 });
 
 // ── settings.local.json env surgery ─────────────────────────────────────────

@@ -139,19 +139,23 @@ function removeGitignore(file, patterns) {
 }
 
 /**
- * Resolve the repo-relative paths init operates on. Throws if `cwd` is not in a
- * git work tree.
+ * Resolve the anchor-relative paths init operates on. When `cwd` is inside a git
+ * work tree the anchor is the git top-level; otherwise it falls back to `cwd`
+ * itself — Claude Code anchors its `settings.local.json` to the directory it was
+ * launched in, so that directory is the correct anchor even when it is not a git
+ * repo. `isGit` records which case we are in (the gitignore step is skipped when
+ * false — there is no repo to ignore for).
  * @param {string} cwd
  * @param {string} home
  */
 function resolvePaths(cwd, home) {
-  const repo = gitTopLevel(cwd);
-  if (!repo) {
-    throw new InitError('not inside a git repository — run `ccsnoop init` from within a repo');
-  }
+  const top = gitTopLevel(cwd);
+  const repo = top ?? path.resolve(cwd); // non-git: anchor to CC's project dir
+  const isGit = top != null;
   const captureDir = path.join(repo, '.ccsnoop');
   return {
     repo,
+    isGit,
     captureDir,
     token: deriveToken(captureDir),
     settings: path.join(repo, '.claude', 'settings.local.json'),
@@ -161,8 +165,10 @@ function resolvePaths(cwd, home) {
 }
 
 /**
- * `ccsnoop init` (spec §3.2). Anchors to the git top-level, writes the CC `env`
- * block, registers the route + manifest, and gitignores the capture dir. `undo:
+ * `ccsnoop init` (spec §3.2). Anchors to the git top-level — or, when `cwd` is
+ * not in a git work tree, to `cwd` itself (Claude Code's project dir) — writes
+ * the CC `env` block, registers the route + manifest, and gitignores the capture
+ * dir (skipped for a non-git anchor, which has no repo to ignore for). `undo:
  * true` reverts exactly what a prior init added. Idempotent: a re-run rewrites
  * only ccsnoop-shaped values and preserves the original manifest's provenance
  * flags so undo still restores the true pre-init state.
@@ -226,9 +232,14 @@ function applyInit(P, home, force) {
   writeJson(P.settings, settings);
 
   // ── gitignore the capture dir (+ settings iff we created it) ────────────────
-  const patterns = [CAPTURE_IGNORE];
-  if (createdLocalSettings) patterns.push(SETTINGS_IGNORE);
-  const added = ensureGitignore(P.gitignore, patterns);
+  // A non-git anchor has no repo to ignore for — skip the step entirely, leaving
+  // both manifest flags false so undo does no gitignore surgery either.
+  let added = {};
+  if (P.isGit) {
+    const patterns = [CAPTURE_IGNORE];
+    if (createdLocalSettings) patterns.push(SETTINGS_IGNORE);
+    added = ensureGitignore(P.gitignore, patterns);
+  }
   const addedGitignoreCcsnoop = prior ? !!prior.added_gitignore_ccsnoop : !!added[CAPTURE_IGNORE];
   const addedGitignoreSettings = prior
     ? !!prior.added_gitignore_settings
@@ -245,16 +256,21 @@ function applyInit(P, home, force) {
   };
   writeJson(P.routes, routes);
 
+  const lines = [
+    `ccsnoop init: capturing ${P.repo}`,
+    `  route ${P.token} → ${P.captureDir}/sessions/`,
+    `  ANTHROPIC_BASE_URL=${baseUrl}, ENABLE_TOOL_SEARCH=true → ${P.settings}`,
+    `  restart Claude Code for the new env to take effect`,
+  ];
+  if (!P.isGit) {
+    lines.push(`  anchored to ${P.repo} (not a git repo — settings written, nothing gitignored)`);
+  }
+
   return {
     exitCode: 0,
     token: P.token,
     captureDir: P.captureDir,
-    lines: [
-      `ccsnoop init: capturing ${P.repo}`,
-      `  route ${P.token} → ${P.captureDir}/sessions/`,
-      `  ANTHROPIC_BASE_URL=${baseUrl}, ENABLE_TOOL_SEARCH=true → ${P.settings}`,
-      `  restart Claude Code for the new env to take effect`,
-    ],
+    lines,
   };
 }
 
