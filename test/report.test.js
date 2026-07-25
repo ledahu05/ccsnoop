@@ -192,6 +192,18 @@ test('readUsage gunzips a gzip-encoded SSE blob (content-encoding: gzip)', () =>
   assert.equal(u.streaming, true);
 });
 
+test('readUsage falls back to null on a truncated/corrupt gzip blob without throwing', () => {
+  // An aborted stream can leave the gzip member incomplete: the `1f 8b` magic is
+  // present but inflation fails. readUsage must degrade to null (no accounting)
+  // rather than propagate the zlib error (issue #53).
+  const sse = 'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+  const gz = zlib.gzipSync(Buffer.from(sse, 'utf8'));
+  const truncated = gz.subarray(0, gz.length - 5);
+  assert.equal(truncated[0], 0x1f);
+  assert.equal(truncated[1], 0x8b);
+  assert.equal(readUsage(truncated), null);
+});
+
 // ── computeAnatomy (byte-length buckets, never token counts) ──────────────────
 
 test('computeAnatomy buckets system/tools/history/current-turn by JSON byte length', () => {
