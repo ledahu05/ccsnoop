@@ -49,6 +49,7 @@ import {
   assertKnobTook,
   parseDenyEntry,
   removalNames,
+  assertDenyTargetsObserved,
   sentinelPresent,
   assertSentinel,
   assertBundledSkillsNonEmpty,
@@ -754,6 +755,37 @@ test('removalNames: only removal-scoped deny entries name a removed tool', () =>
   assert.deepEqual(removalNames(perms), ['Workflow', 'Grep']);
   assert.deepEqual(removalNames({}), []);
   assert.deepEqual(removalNames({ deny: 'nope' }), []);
+});
+
+// AC#2 (issue #62, §3, §10.3) — arm-01's deny targets are grounded in observation.
+
+test('assertDenyTargetsObserved: every deny target must appear in the witness observed tools[]', () => {
+  const witnessTools = ['Bash', 'Read', 'Edit', 'Glob', 'Grep', 'Workflow'];
+  // Workflow IS observed — the calibrated arm-01 choice (37% of the tools bucket, B6).
+  assert.deepEqual(assertDenyTargetsObserved(['Workflow'], witnessTools, 'arm-01'), ['Workflow']);
+  // A target the witness never carried is a "list written in advance" — FATAL, named.
+  assert.throws(
+    () => assertDenyTargetsObserved(['Workflow', 'NeverSeen'], witnessTools, 'arm-01'),
+    /arm-01: permissions\.deny targets \[NeverSeen\] are not in the witness's observed tools/,
+  );
+  // No deny targets → nothing to ground.
+  assert.deepEqual(assertDenyTargetsObserved([], witnessTools, 'arm-02'), []);
+});
+
+test('assertLeverIntegrity: an L1 arm grounds its deny targets when the witness tools[] is supplied', () => {
+  const arm = { id: 'arm-01', lever: 'L1', label: 'L1 tools deny', settings: { permissions: { deny: ['Workflow'] } } };
+  const witnessView = view([['tool:Workflow', 21525], ['system', 100]]);
+  const armView = view([['system', 100]]); // Workflow removed
+  // Grounded: Workflow is in the witness's observed tools[] → passes.
+  const ok = assertLeverIntegrity({ arm, witnessView, armView, witnessTools: ['Read', 'Workflow'] });
+  assert.ok(ok.sentinels.some((s) => s.name === 'L1 tools deny'));
+  // Ungrounded: Workflow absent from the observed tools[] → FATAL (a list written in advance).
+  assert.throws(
+    () => assertLeverIntegrity({ arm, witnessView, armView, witnessTools: ['Read', 'Edit'] }),
+    /not in the witness's observed tools/,
+  );
+  // Backward compatible: with no witnessTools supplied, the grounding check is skipped.
+  assert.ok(assertLeverIntegrity({ arm, witnessView, armView }).sentinels);
 });
 
 // Guard 2 — "did the knob take on the RIGHT bytes?" (per-lever sentinels)
