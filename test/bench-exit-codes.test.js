@@ -50,7 +50,7 @@ import {
 } from '../scripts/bench/run.mjs';
 
 const FAKE_CLAUDE = path.resolve('test/fixtures/fake-claude.mjs');
-const RUN_MJS = fileURLToPath(new URL('../scripts/bench/run.mjs', import.meta.url));
+const BENCH_DIR = fileURLToPath(new URL('../scripts/bench/', import.meta.url));
 
 function mkTmp(tag) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `ccsnoop-exit-${tag}-`)));
@@ -391,7 +391,14 @@ test('§5/§9 non-goal: no gain threshold is coded in scripts/bench/', () => {
   // §9 names "gain thresholds / assertions on the number" as a non-goal: a gain
   // is an unpredictable net delta (Bash: 7 073 o, not 11 694 — B6), so a byte
   // threshold coded today breaks at the next CC build. Asserted by inspection so
-  // nobody reintroduces one and turns rule 2 red.
-  const src = fs.readFileSync(RUN_MJS, 'utf8');
-  assert.doesNotMatch(src, /threshold|seuil|min[_-]?gain|gain[_-]?(floor|min|max)|GAIN_/i);
+  // nobody reintroduces one and turns rule 2 red. Scans EVERY file under
+  // scripts/bench/, not just run.mjs, so the guard covers the whole dir the AC
+  // names — a threshold hidden in a future helper cannot slip past a green run.
+  const forbidden = /threshold|seuil|min[_-]?gain|gain[_-]?(floor|min|max)|GAIN_/i;
+  const files = fs.readdirSync(BENCH_DIR).filter((f) => f.endsWith('.mjs'));
+  assert.ok(files.length > 0, 'expected at least one source file under scripts/bench/ to inspect');
+  for (const f of files) {
+    const src = fs.readFileSync(path.join(BENCH_DIR, f), 'utf8');
+    assert.doesNotMatch(src, forbidden, `${f} codes a gain threshold (bench/SPEC.md §9 non-goal)`);
+  }
 });
