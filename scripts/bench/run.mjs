@@ -1194,6 +1194,30 @@ export function removalNames(permissions) {
 }
 
 /**
+ * AC#2 (issue #62, bench/SPEC.md §3, §10.3): an L1 arm's `permissions.deny`
+ * targets must be grounded in the witness's OBSERVED `tools[]`, never a list
+ * written in advance. Every removal-scoped name must appear in the witness's
+ * recorded pre-flight `tools[]`; a target the witness never carried would deny
+ * nothing (or ~29 o for an already-deferred name) and misreport L1. Fail-closed,
+ * naming the ungrounded targets.
+ * @param {string[]} denyTargets   removal-scoped names (see {@link removalNames}).
+ * @param {string[]} witnessTools  the witness's observed tools[] (arm.json preflight.tools).
+ * @param {string} [armId]
+ * @returns {string[]} `denyTargets` (for chaining).
+ * @throws {BenchError} when any target is absent from the observed tools[].
+ */
+export function assertDenyTargetsObserved(denyTargets, witnessTools, armId) {
+  const observed = new Set(witnessTools ?? []);
+  const unseen = (denyTargets ?? []).filter((name) => !observed.has(name));
+  if (unseen.length > 0) {
+    throw new BenchError(
+      `${armId ?? '(unknown arm)'}: permissions.deny targets [${unseen.join(', ')}] are not in the witness's observed tools[] — a deny target must come from observed data, not a list written in advance (bench/SPEC.md §3, §10.3)`,
+    );
+  }
+  return denyTargets ?? [];
+}
+
+/**
  * A lever's integrity sentinel (bench/SPEC.md §3). Two kinds:
  *  - `slot`:    a set of segment slot keys CC itself supplies (built-in tool names
  *               for L1); present iff EVERY slot is a turn-1 slot.
@@ -1332,12 +1356,20 @@ export function leverSentinels(arm, opts = {}) {
  * A no-op for the witness (lever null) — it IS the reference. Fatal on any guard
  * failure. Pure over the supplied views, so #64 fault-injects it token-free.
  * @param {{ arm:any, witnessView:any, armView:any, fixtureDir?:string,
- *           witnessSkills?:string[], armSkills?:string[], knob?:string }} opts
+ *           witnessSkills?:string[], armSkills?:string[], witnessTools?:string[],
+ *           knob?:string }} opts
  * @returns {{ skipped?: boolean, sentinels?: any[] }}
  */
 export function assertLeverIntegrity(opts) {
   const { arm, witnessView, armView } = opts;
   if (arm.lever == null) return { skipped: true };
+
+  // AC#2 (issue #62, §3, §10.3) — an L1 arm's deny targets must be grounded in the
+  // witness's observed tools[]. Only checked when the observed tools[] is supplied
+  // (the live wiring always passes it; pure unit tests may omit it).
+  if ('permissions' in (arm.settings ?? {}) && Array.isArray(opts.witnessTools)) {
+    assertDenyTargetsObserved(removalNames(arm.settings.permissions), opts.witnessTools, arm.id);
+  }
 
   // Guard 1 — the knob took (byte-identity vs the witness).
   assertKnobTook(witnessView, armView, opts.knob ?? knobOf(arm));
@@ -1396,7 +1428,37 @@ function runLeverGuards({ runDir, arm, manifest, model, fixtureDir }) {
     knob: knobOf(arm),
     witnessSkills: skillSlots(witnessView),
     armSkills: skillSlots(armView),
+    // AC#2: ground arm-01's deny targets in the witness's OWN recorded tools[].
+    witnessTools: 'permissions' in (arm.settings ?? {}) ? readWitnessTools(runDir, witness.id) : undefined,
   });
+}
+
+/**
+ * The witness's observed pre-flight `tools[]`, read from its kept `arm.json`
+ * (issue #62 AC#2, bench/SPEC.md §10.3). arm-01's deny targets are grounded in
+ * this, never a list written in advance. Fatal if the record or its
+ * `preflight.tools[]` is absent — the grounding cannot be verified without it.
+ * @param {string} runDir
+ * @param {string} witnessId
+ * @returns {string[]}
+ */
+function readWitnessTools(runDir, witnessId) {
+  const file = path.join(armDir(runDir, witnessId), 'arm.json');
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw new BenchError(
+      `cannot read the witness's arm.json at ${file} — it grounds arm-01's deny targets (bench/SPEC.md §10.3): ${/** @type {Error} */ (err).message}`,
+    );
+  }
+  const tools = record?.preflight?.tools;
+  if (!Array.isArray(tools)) {
+    throw new BenchError(
+      `witness arm.json at ${file} carries no preflight.tools[] — cannot ground arm-01's deny targets (bench/SPEC.md §10.3)`,
+    );
+  }
+  return tools;
 }
 
 // ── Step 21: arm.json and provenance.json ────────────────────────────────────
