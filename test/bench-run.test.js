@@ -54,6 +54,17 @@ import {
   assertBundledSkillsNonEmpty,
   leverSentinels,
   assertLeverIntegrity,
+  bucketDeltas,
+  substitutions,
+  sentinelDescriptor,
+  buildLeverEntry,
+  computeInteraction,
+  buildDiff,
+  renderDiffTable,
+  diffNotes,
+  readArmRecords,
+  readRunManifest,
+  cmdDiff,
 } from '../scripts/bench/run.mjs';
 
 /** The stand-in for the `claude` binary — every capture test is token-free. */
@@ -921,4 +932,284 @@ test('assertLeverIntegrity: arm-07 checks all four literal sentinels absent from
     () => assertLeverIntegrity({ arm, witnessView, armView: armWithAgent, witnessSkills: ['skill:tdd'], armSkills: [] }),
     /still present in the lever arm/,
   );
+});
+
+// ── `diff <run>`: canonical diff.json + derived table (bench/SPEC.md §6) ──────
+
+/** A synthetic per-arm record (the arm.json shape written by buildArmRecord).
+ * @param {any} o */
+function armRecord({ id, lever, label, seed = 'loaded', anatomy1, request1, segments1 = [], usage } = {}) {
+  const total = anatomy1.system + anatomy1.tools + anatomy1.history + anatomy1.currentTurn;
+  const rec = {
+    id,
+    lever: lever ?? null,
+    label: label ?? (lever == null ? 'temoin' : lever),
+    seed,
+    sessionId: `sess-${id}`,
+    turns: 2,
+    turn1: { anatomy: { ...anatomy1, total }, requestBytes: request1, segments: segments1 },
+    turn2: { anatomy: { system: 0, tools: 0, history: 0, currentTurn: 0, total: 0 }, requestBytes: request1 + 168, segments: [] },
+  };
+  if (usage) rec.usage = usage;
+  return rec;
+}
+
+/** usage with both turns, in the §6 (already-mapped) shape. */
+function usage2({ t1cc, t2cr, t2in = 8 }) {
+  return {
+    turn1: { inputTokens: 10, cacheRead: 0, cacheCreation: t1cc, outputTokens: 100 },
+    turn2: { inputTokens: t2in, cacheRead: t2cr, cacheCreation: 142, outputTokens: 50 },
+  };
+}
+
+/** A minimal manifest naming the witness (arm-00, lever null) + a lever arm. */
+function diffManifest(arms) {
+  return { schemaVersion: 1, prompt: 'x', model: 'm', turns: 2, cwd: 'bench/fixture', arms };
+}
+
+test('bucketDeltas: the NET delta vs the witness is 7 073 (reappearing Glob/Grep), never 11 694', () => {
+  // Witness carries Bash (11 694 o) deferred-suppressing Glob+Grep; deny Bash and
+  // both reappear, so the tools bucket nets to −7 073, not −11 694 = a bare sum.
+  const witness = armRecord({
+    id: 'arm-00',
+    lever: null,
+    anatomy1: { system: 100, tools: 40000, history: 0, currentTurn: 8000 },
+    request1: 50000,
+    segments1: [{ slot: 'tool:Bash', bucket: 'tools', bytes: 11694 }],
+  });
+  const arm = armRecord({
+    id: 'arm-01',
+    lever: 'L1',
+    anatomy1: { system: 103, tools: 40000 - 11694 + 981 + 3640, history: 0, currentTurn: 8000 },
+    request1: 50000 - 11694 + 981 + 3640,
+    segments1: [
+      { slot: 'tool:Glob', bucket: 'tools', bytes: 981 },
+      { slot: 'tool:Grep', bucket: 'tools', bytes: 3640 },
+    ],
+  });
+  const d = bucketDeltas(arm.turn1, witness.turn1);
+  assert.equal(d.readOn, 'turn1');
+  assert.equal(d.tools, -7073, 'net bucket delta — reappearing slots already folded in');
+  assert.notEqual(d.tools, -11694);
+  assert.equal(d.anatomyTotal, -7070); // tools −7073 + system +3
+  assert.equal(d.requestBytes, -7073);
+});
+
+test('substitutions: slots present in the arm and absent from the witness, with bytes', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200, segments1: [{ slot: 'tool:Bash', bucket: 'tools', bytes: 100 }] });
+  const arm = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 50, history: 0, currentTurn: 1 }, request1: 150, segments1: [{ slot: 'tool:Glob', bucket: 'tools', bytes: 30 }, { slot: 'tool:Grep', bucket: 'tools', bytes: 20 }] });
+  assert.deepEqual(substitutions(arm.turn1, witness.turn1), [
+    { slot: 'tool:Glob', bytes: 30 },
+    { slot: 'tool:Grep', bytes: 20 },
+  ]);
+});
+
+test('buildLeverEntry: steadyStateTokens reads turn 2 ONLY; transitionCost is a separate turn-1 line', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200, usage: usage2({ t1cc: 29367, t2cr: 29367 }) });
+  const arm = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 50, history: 0, currentTurn: 1 }, request1: 150, usage: usage2({ t1cc: 14592, t2cr: 14592 }) });
+  const entry = buildLeverEntry({ armRecord: arm, witnessRecord: witness, manifestArm: { settings: { permissions: { deny: ['Bash'] } } }, fixtureCounts: { mcpTools: 64, seedAgents: 8 }, cacheAvailable: true });
+  assert.deepEqual(entry.steadyStateTokens, { cacheRead: 14592, inputTokens: 8 }, 'the arm’s OWN turn-2 usage, not a diff');
+  assert.deepEqual(entry.transitionCostTokens, { cacheCreation: 14592 });
+  // No token field is a subtraction of the witness — tokens are per-arm (§4).
+  assert.equal('cacheRead' in entry.deltaBytes, false);
+});
+
+test('buildLeverEntry: declaredCount is 64 for L4 and 8 for L6, null otherwise', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200 });
+  const mk = (id, lever) => buildLeverEntry({ armRecord: armRecord({ id, lever, anatomy1: { system: 1, tools: 90, history: 0, currentTurn: 1 }, request1: 190 }), witnessRecord: witness, manifestArm: {}, fixtureCounts: { mcpTools: 64, seedAgents: 8 }, cacheAvailable: false });
+  assert.equal(mk('arm-04', 'L4').declaredCount, 64);
+  assert.equal(mk('arm-06', 'L6').declaredCount, 8);
+  assert.equal(mk('arm-01', 'L1').declaredCount, null);
+});
+
+test('sentinelDescriptor: L1/L5 are slot-set diffs, L2/L3/L4/L6 literals, `all` bundles them', () => {
+  assert.deepEqual(sentinelDescriptor({ settings: { permissions: { deny: ['Workflow'] } } }), { name: 'slot-set-diff', kind: 'slot', presentInWitness: true, absentInArm: true });
+  assert.equal(sentinelDescriptor({ settings: { disableBundledSkills: true } }).kind, 'slot');
+  assert.equal(sentinelDescriptor({ seed: 'bare' }).kind, 'literal');
+  const all = sentinelDescriptor({ seed: 'bare', settings: { hooks: { SessionStart: [] }, permissions: { deny: ['Workflow'] }, claudeMdExcludes: ['CLAUDE.md'], disabledMcpjsonServers: ['stub'], disableBundledSkills: true } });
+  assert.ok(Array.isArray(all) && all.length >= 4, 'the `all` arm records every sentinel it strips');
+});
+
+test('computeInteraction: Σ(single levers) − all, on request bytes; tokens only when cache is live', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 1000, usage: usage2({ t1cc: 1000, t2cr: 1000 }) });
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 960, usage: usage2({ t1cc: 960, t2cr: 960 }) });
+  const l2 = armRecord({ id: 'arm-02', lever: 'L2', anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 970, usage: usage2({ t1cc: 970, t2cr: 970 }) });
+  const all = armRecord({ id: 'arm-07', lever: 'all', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 950, usage: usage2({ t1cc: 950, t2cr: 950 }) });
+  const i = computeInteraction([witness, l1, l2, all], witness, { cacheAvailable: true });
+  // Σ levers = (−40) + (−30) = −70 ; all = −50 ; interaction = −70 − (−50) = −20.
+  assert.equal(i.sumOfLeversBytes, -70);
+  assert.equal(i.allArmBytes, -50);
+  assert.equal(i.interactionBytes, -20);
+  // token gain = witness.cacheRead − arm.cacheRead: (40)+(30) − (50) = 20.
+  assert.equal(i.interactionTokens, 20);
+  // Cache degraded ⇒ no token line, ever.
+  const degraded = computeInteraction([witness, l1, l2, all], witness, { cacheAvailable: false });
+  assert.equal('interactionTokens' in degraded, false);
+});
+
+test('computeInteraction: null when the `all` arm has not been captured', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 1000 });
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 960 });
+  assert.equal(computeInteraction([witness, l1], witness, { cacheAvailable: false }), null);
+});
+
+test('buildDiff: §6 shape — schemaVersion, provenance, degraded, arms[], levers[], interaction, notes[]', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 28256, tools: 57522, history: 0, currentTurn: 22919 }, request1: 111056, segments1: [{ slot: 'tool:Workflow', bucket: 'tools', bytes: 21525 }], usage: usage2({ t1cc: 29367, t2cr: 29367 }) });
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 28259, tools: 57522 - 35919, history: 0, currentTurn: 22919 }, request1: 111056 - 35916, segments1: [{ slot: 'tool:Glob', bucket: 'tools', bytes: 981 }], usage: usage2({ t1cc: 14592, t2cr: 14592 }) });
+  const all = armRecord({ id: 'arm-07', lever: 'all', anatomy1: { system: 28259, tools: 20000, history: 0, currentTurn: 15000 }, request1: 70000, usage: usage2({ t1cc: 12000, t2cr: 12000 }) });
+  const provenance = { claudeCodeVersion: '2.1.220', ccsnoopVersion: '0.1.0', model: 'm', toolSearch: true, port: 41377, timestamp: 't', fixtureCounts: { mcpTools: 64, seedAgents: 8 } };
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: { hooks: { SessionStart: [{}] } } },
+    { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Workflow'] } } },
+    { id: 'arm-07', lever: 'all', seed: 'bare', settings: { hooks: { SessionStart: [] }, permissions: { deny: ['Workflow'] }, claudeMdExcludes: ['CLAUDE.md'], disabledMcpjsonServers: ['stub'], disableBundledSkills: true } },
+  ]);
+  const diff = buildDiff({ run: '2026-07-26T10-00-00', manifest, provenance, arms: [witness, l1, all] });
+
+  assert.equal(diff.schemaVersion, 1);
+  assert.equal(diff.witness, 'arm-00');
+  assert.equal(diff.run, '2026-07-26T10-00-00');
+  assert.deepEqual(diff.degraded, []);
+  assert.equal(diff.provenance.claudeCodeVersion, '2.1.220');
+  assert.equal(diff.arms.length, 3);
+  assert.equal(diff.arms[0].preflight, undefined, 'capture-only provenance is stripped from arms[]');
+  assert.equal(diff.levers.length, 2, 'one per lever arm, not the witness');
+  const l1entry = diff.levers.find((l) => l.id === 'arm-01');
+  assert.equal(l1entry.deltaBytes.tools, -35919);
+  assert.deepEqual(l1entry.substitutions, [{ slot: 'tool:Glob', bytes: 981 }]);
+  assert.ok(diff.interaction);
+  assert.equal(diff.notes.length, 3);
+  // Both totals live on every arm and are never presented as one.
+  assert.ok(diff.arms[0].turn1.anatomy.total < diff.arms[0].turn1.requestBytes);
+});
+
+test('buildDiff: witness is designated by the MANIFEST (lever null), not by arm id or an argument', () => {
+  // The lone lever-null arm is arm-00 here; rename its label — witness is still arm-00.
+  const witness = armRecord({ id: 'arm-00', lever: null, label: 'baseline', anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200 });
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 160 });
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+    { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Workflow'] } } },
+  ]);
+  const diff = buildDiff({ run: 'r', manifest, provenance: {}, arms: [witness, l1] });
+  assert.equal(diff.witness, 'arm-00');
+});
+
+test('buildDiff: a null usage on ANY arm degrades the cache axis — usage is OMITTED, never zeroed', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200, usage: usage2({ t1cc: 100, t2cr: 100 }) });
+  // arm-01 captured no usage (blob unreadable) — its arm.json OMITS the key.
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 160 });
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+    { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Workflow'] } } },
+  ]);
+  const diff = buildDiff({ run: 'r', manifest, provenance: { fixtureCounts: { mcpTools: 64, seedAgents: 8 } }, arms: [witness, l1] });
+  assert.equal(diff.degraded.length, 1);
+  assert.equal(diff.degraded[0].axis, 'cache');
+  const l1entry = diff.levers.find((l) => l.id === 'arm-01');
+  assert.equal('steadyStateTokens' in l1entry, false, 'omitted, not zeroed');
+  assert.equal('transitionCostTokens' in l1entry, false);
+  // The witness arm still carries its own usage — degradation ≠ scrubbing captures.
+  assert.ok(diff.arms.find((a) => a.id === 'arm-00').usage);
+});
+
+test('renderDiffTable: degradation banner at the HEAD, both totals, declared count, notes, no ratio', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 100, tools: 40000, history: 0, currentTurn: 8000 }, request1: 50000, segments1: [{ slot: 'tool:Bash', bucket: 'tools', bytes: 11694 }], usage: usage2({ t1cc: 29367, t2cr: 29367 }) });
+  const l4 = armRecord({ id: 'arm-04', lever: 'L4', anatomy1: { system: 100, tools: 38000, history: 0, currentTurn: 8000 }, request1: 48000, usage: usage2({ t1cc: 20000, t2cr: 20000 }) });
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+    { id: 'arm-04', lever: 'L4', seed: 'loaded', settings: { disabledMcpjsonServers: ['stub'] } },
+  ]);
+  const diff = buildDiff({ run: 'r', manifest, provenance: { fixtureCounts: { mcpTools: 64, seedAgents: 8 }, timestamp: 't' }, arms: [witness, l4] });
+  // Inject a degradation to prove it renders at the head.
+  diff.degraded = [{ axis: 'cache', reason: 'usage null' }];
+  const table = renderDiffTable(diff);
+  const lines = table.split('\n');
+  const bannerIdx = lines.findIndex((l) => /DÉGRADÉ/.test(l));
+  const firstArmIdx = lines.findIndex((l) => /^\s+arm-00\s+/.test(l));
+  assert.ok(bannerIdx >= 0 && bannerIdx < firstArmIdx, 'banner precedes the arm rows (head, not footnote)');
+  assert.match(table, /anatomy \d+ \/ request \d+/, 'both totals, gap visible');
+  assert.match(table, /compte déclaré 64/, 'the declared count sits beside the L4 delta');
+  assert.match(table, /8 192 o d'entrée/, 'note 3 verbatim');
+  assert.match(table, /64 outils \/ 8 agents/, 'note 1 with the declared counts');
+  assert.ok(!/o\/tok|octet.?par.?token|bytes.?per.?token/i.test(table), 'no byte↔token ratio anywhere');
+});
+
+test('renderDiffTable: is derived from diff.json alone — editing the object re-renders the table', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200 });
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 160 });
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+    { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Workflow'] } } },
+  ]);
+  const diff = buildDiff({ run: 'r', manifest, provenance: {}, arms: [witness, l1] });
+  assert.match(renderDiffTable(diff), /Δrequest -40/);
+  // Hand-edit the model; the table follows, proving no recompute from captures.
+  diff.levers[0].deltaBytes.requestBytes = -99999;
+  assert.match(renderDiffTable(diff), /Δrequest -99999/);
+});
+
+test('diffNotes: exactly three, interpolating the fixture-declared counts', () => {
+  const notes = diffNotes({ mcpTools: 64, seedAgents: 8 });
+  assert.equal(notes.length, 3);
+  assert.equal(notes[0], 'L4/L6 sont dimensionnés en compte (64 outils / 8 agents), pas en octets.');
+  // Defaults to 64/8 when provenance lacks counts.
+  assert.match(diffNotes(undefined)[0], /64 outils \/ 8 agents/);
+});
+
+test('cmdDiff: reads the whole run dir off disk, writes diff.json, exits 0 (zero API)', () => {
+  const runDir = mkTmp('diff-run');
+  try {
+    const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 100, tools: 40000, history: 0, currentTurn: 8000 }, request1: 50000, segments1: [{ slot: 'tool:Bash', bucket: 'tools', bytes: 11694 }], usage: usage2({ t1cc: 29367, t2cr: 29367 }) });
+    const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 103, tools: 40000 - 11694 + 981 + 3640, history: 0, currentTurn: 8000 }, request1: 50000 - 7073, segments1: [{ slot: 'tool:Glob', bucket: 'tools', bytes: 981 }, { slot: 'tool:Grep', bucket: 'tools', bytes: 3640 }], usage: usage2({ t1cc: 14592, t2cr: 14592 }) });
+    for (const rec of [witness, l1]) {
+      fs.mkdirSync(path.join(runDir, rec.id), { recursive: true });
+      fs.writeFileSync(path.join(runDir, rec.id, 'arm.json'), JSON.stringify(rec, null, 2));
+    }
+    fs.writeFileSync(path.join(runDir, 'provenance.json'), JSON.stringify({ claudeCodeVersion: '2.1.220', ccsnoopVersion: '0.1.0', model: 'm', toolSearch: true, port: 1, timestamp: 't', fixtureCounts: { mcpTools: 64, seedAgents: 8 } }));
+    fs.writeFileSync(path.join(runDir, 'manifest.json'), JSON.stringify(diffManifest([
+      { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+      { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Bash'] } } },
+    ])));
+
+    const r = cmdDiff(runDir);
+    assert.equal(fs.existsSync(r.diffPath), true, 'diff.json written to the run dir');
+    const onDisk = JSON.parse(fs.readFileSync(r.diffPath, 'utf8'));
+    assert.equal(onDisk.witness, 'arm-00');
+    assert.equal(onDisk.levers[0].deltaBytes.tools, -7073, 'the net delta, read off disk');
+    assert.deepEqual(onDisk.levers[0].substitutions.map((s) => s.slot), ['tool:Glob', 'tool:Grep']);
+    assert.match(r.table, /arm-01/);
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test('cmdDiff: prefers the run manifest snapshot, falls back to the committed manifest', () => {
+  const runDir = mkTmp('diff-manifest');
+  try {
+    const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200 });
+    fs.mkdirSync(path.join(runDir, 'arm-00'), { recursive: true });
+    fs.writeFileSync(path.join(runDir, 'arm-00', 'arm.json'), JSON.stringify(witness));
+    fs.writeFileSync(path.join(runDir, 'provenance.json'), JSON.stringify({}));
+    // No snapshot on disk ⇒ falls back to the committed manifest (arm-00 witness).
+    assert.equal(readRunManifest(runDir).arms.find((a) => a.lever == null).id, 'arm-00');
+    // With a snapshot, that snapshot wins.
+    fs.writeFileSync(path.join(runDir, 'manifest.json'), JSON.stringify(diffManifest([{ id: 'arm-00', lever: null, seed: 'loaded', settings: {} }])));
+    assert.equal(readRunManifest(runDir).arms.length, 1);
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test('readArmRecords: loads every arm.json under the run, ignores non-arm dirs', () => {
+  const runDir = mkTmp('diff-scan');
+  try {
+    fs.mkdirSync(path.join(runDir, 'arm-00'), { recursive: true });
+    fs.writeFileSync(path.join(runDir, 'arm-00', 'arm.json'), JSON.stringify({ id: 'arm-00' }));
+    fs.mkdirSync(path.join(runDir, 'ccsnoop-home'), { recursive: true }); // not an arm
+    fs.mkdirSync(path.join(runDir, 'arm-05'), { recursive: true }); // no arm.json yet
+    const arms = readArmRecords(runDir);
+    assert.deepEqual(arms.map((a) => a.id), ['arm-00']);
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
 });

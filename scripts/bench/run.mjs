@@ -547,6 +547,9 @@ export async function cmdArm(id, opts = {}) {
     runDir = path.join(root, runStamp());
     fs.mkdirSync(runDir, { recursive: true });
     fs.mkdirSync(path.join(runDir, 'ccsnoop-home'), { recursive: true });
+    // Snapshot the manifest used, so `diff <run>` (and an archived run) can name
+    // the witness offline without the committed manifest (bench/SPEC.md §6).
+    fs.writeFileSync(path.join(runDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
     armTrap(runDir);
 
     const cwd = path.join(runDir, 'cwd');
@@ -1576,6 +1579,361 @@ function gitInit(cwd) {
   }
 }
 
+// ── `diff <run>`: canonical diff.json + derived table (bench/SPEC.md §6) ──────
+//
+// Zero cost: re-reads the run dir off disk (arm.json per arm + provenance.json),
+// writes diff.json, prints the table, and calls NO API. One source, two
+// readings — the dev reads the table, an agent asserts on the JSON.
+
+/** The three mandatory reading notes (bench/SPEC.md §3, §6) — rendered verbatim
+ * in the table so a future reader can't mistake a count-lever for a byte-lever.
+ * Note 1 interpolates the declared counts (64/8 in the frozen fixture), which
+ * keeps it honest rather than hard-coding a number the fixture could move. */
+export function diffNotes(fixtureCounts) {
+  const mcp = fixtureCounts?.mcpTools ?? 64;
+  const agents = fixtureCounts?.seedAgents ?? 8;
+  return [
+    `L4/L6 sont dimensionnés en compte (${mcp} outils / ${agents} agents), pas en octets.`,
+    'Les agent-types bundled sont un plancher constant : le delta L6 ne mesure que les agents ajoutés.',
+    "8 192 o d'entrée ne donnent pas des lignes de base égales sur le fil (encadrements d'injection).",
+  ];
+}
+
+/**
+ * A lever's NET byte delta vs the witness, per bucket, read on turn 1 — the turn
+ * where every subtractive bucket is defined (bench/SPEC.md §4: in `-p` turn 1 the
+ * lone `message#0` is classed `currentTurn`, so L2–L6 read there). Net by
+ * construction: it subtracts the arm's `anatomy`/`requestBytes` totals from the
+ * witness's, so a slot that REAPPEARS under the knob (deny `Bash` ⇒ `Glob`+`Grep`
+ * come back) is already folded in — the number is 7 073, never a sum of 11 694.
+ * @param {any} armTurn1     the lever arm's `turn1` ({anatomy, requestBytes}).
+ * @param {any} witnessTurn1 the witness's `turn1`.
+ */
+export function bucketDeltas(armTurn1, witnessTurn1) {
+  const wa = witnessTurn1.anatomy;
+  const aa = armTurn1.anatomy;
+  return {
+    readOn: 'turn1', // the turn on which each subtractive bucket is defined
+    system: aa.system - wa.system,
+    tools: aa.tools - wa.tools,
+    history: aa.history - wa.history,
+    currentTurn: aa.currentTurn - wa.currentTurn,
+    anatomyTotal: aa.total - wa.total,
+    requestBytes: armTurn1.requestBytes - witnessTurn1.requestBytes,
+  };
+}
+
+/**
+ * Slots present in the lever arm's turn-1 request and ABSENT from the witness's
+ * (bench/SPEC.md §4) — what "reappears" once the knob removes a suppressor. Listed
+ * under the lever with their bytes; a byte field, never a token field.
+ * @param {any} armTurn1
+ * @param {any} witnessTurn1
+ * @returns {{ slot: string, bytes: number }[]}
+ */
+export function substitutions(armTurn1, witnessTurn1) {
+  const witnessSlots = new Set((witnessTurn1?.segments ?? []).map((/** @type {any} */ s) => s.slot));
+  return (armTurn1?.segments ?? [])
+    .filter((/** @type {any} */ s) => !witnessSlots.has(s.slot))
+    .map((/** @type {any} */ s) => ({ slot: s.slot, bytes: s.bytes }));
+}
+
+/** `declaredCount` (bench/SPEC.md §6): L4 is sized in MCP-tool count, L6 in
+ * seed-agent count — printed beside the delta so nobody reads "MCP is a small
+ * lever" when they are reading "the fixture declared 64 tools". Null otherwise. */
+function declaredCountFor(lever, fixtureCounts) {
+  if (lever === 'L4') return fixtureCounts?.mcpTools ?? null;
+  if (lever === 'L6') return fixtureCounts?.seedAgents ?? null;
+  return null;
+}
+
+/**
+ * The integrity-sentinel descriptor recorded for a lever (bench/SPEC.md §4.2). The
+ * arm.json's very existence means step 19's guards passed at capture time, so both
+ * claims hold — `presentInWitness` AND `absentInArm`. Kinds only (no fixture text):
+ * L1/L5 are CC-supplied slot-set diffs, L2/L3/L4/L6 are literal markers.
+ * @param {any} manifestArm  the manifest entry (carries `settings`/`seed`).
+ * @returns {any} a single descriptor, or an array when a lever bundles several (`all`).
+ */
+export function sentinelDescriptor(manifestArm) {
+  const s = manifestArm?.settings ?? {};
+  /** @type {{name:string, kind:'slot'|'literal'}[]} */
+  const kinds = [];
+  if ('permissions' in s) kinds.push({ name: 'slot-set-diff', kind: 'slot' });
+  if (Array.isArray(s.hooks?.SessionStart) && s.hooks.SessionStart.length === 0) {
+    kinds.push({ name: 'L2 persona literal', kind: 'literal' });
+  }
+  if ('claudeMdExcludes' in s) kinds.push({ name: 'L3 CLAUDE.md literal', kind: 'literal' });
+  if ('disabledMcpjsonServers' in s) kinds.push({ name: 'L4 MCP stub literal', kind: 'literal' });
+  if (s.disableBundledSkills) kinds.push({ name: 'slot-set-diff', kind: 'slot' });
+  if (manifestArm?.seed === 'bare') kinds.push({ name: 'L6 seed-agent literal', kind: 'literal' });
+  const withClaims = kinds.map((k) => ({ ...k, presentInWitness: true, absentInArm: true }));
+  if (withClaims.length === 0) return null;
+  return withClaims.length === 1 ? withClaims[0] : withClaims;
+}
+
+/**
+ * One lever object for `diff.json` (bench/SPEC.md §6): net byte delta vs the
+ * witness, its substitutions, and — only when the cache axis is live — the turn-2
+ * steady-state verdict and the turn-1 transition cost as a SEPARATE line, never
+ * subtracted from the gain. Tokens are the arm's own captured `usage`, never a
+ * diff (§4 unit rule).
+ * @param {{ armRecord:any, witnessRecord:any, manifestArm:any, fixtureCounts:any,
+ *           cacheAvailable:boolean }} opts
+ */
+export function buildLeverEntry({ armRecord, witnessRecord, manifestArm, fixtureCounts, cacheAvailable }) {
+  /** @type {any} */
+  const entry = {
+    id: armRecord.id,
+    lever: armRecord.lever,
+    label: armRecord.label,
+    declaredCount: declaredCountFor(armRecord.lever, fixtureCounts),
+    deltaBytes: bucketDeltas(armRecord.turn1, witnessRecord.turn1),
+    substitutions: substitutions(armRecord.turn1, witnessRecord.turn1),
+  };
+  if (cacheAvailable && armRecord.usage?.turn2) {
+    entry.steadyStateTokens = {
+      cacheRead: armRecord.usage.turn2.cacheRead,
+      inputTokens: armRecord.usage.turn2.inputTokens,
+    };
+  }
+  if (cacheAvailable && armRecord.usage?.turn1) {
+    entry.transitionCostTokens = { cacheCreation: armRecord.usage.turn1.cacheCreation };
+  }
+  const sentinel = sentinelDescriptor(manifestArm);
+  if (sentinel) entry.sentinel = sentinel;
+  return entry;
+}
+
+/**
+ * The run-global `interaction` line (bench/SPEC.md §4/§6): Σ(single levers) − the
+ * `all` arm, on turn-1 request bytes — the levers' deltas are NOT additive, so the
+ * residue is reported, never absorbed in silence. `interactionTokens` appears ONLY
+ * when the cache axis is available. Null when the `all` arm has not been captured.
+ * @returns {any|null}
+ */
+export function computeInteraction(arms, witnessRecord, { cacheAvailable }) {
+  const allArm = arms.find((a) => a.lever === 'all');
+  if (!allArm || !witnessRecord?.turn1 || !allArm.turn1) return null;
+  const singles = arms.filter((a) => a.lever != null && a.lever !== 'all' && a.turn1);
+  const deltaReq = (/** @type {any} */ a) => a.turn1.requestBytes - witnessRecord.turn1.requestBytes;
+  const sumOfLeversBytes = singles.reduce((s, a) => s + deltaReq(a), 0);
+  const allArmBytes = deltaReq(allArm);
+  /** @type {any} */
+  const out = {
+    readOn: 'turn1',
+    sumOfLeversBytes,
+    allArmBytes,
+    interactionBytes: sumOfLeversBytes - allArmBytes,
+  };
+  // Token interaction: the turn-2 cacheRead the witness reads that each lever
+  // saves (witness − arm). Only meaningful when every arm carries usage.
+  if (cacheAvailable && witnessRecord.usage?.turn2 && allArm.usage?.turn2) {
+    const gain = (/** @type {any} */ a) => witnessRecord.usage.turn2.cacheRead - a.usage.turn2.cacheRead;
+    const sumGain = singles.reduce((s, a) => s + gain(a), 0);
+    out.interactionTokens = sumGain - gain(allArm);
+  }
+  return out;
+}
+
+/** Strip capture-only provenance (`preflight`) so `arms[]` is the pure model. */
+function normalizeArmForDiff(armRecord) {
+  const { preflight, ...rest } = armRecord;
+  return rest;
+}
+
+/**
+ * Assemble the canonical `diff.json` object (bench/SPEC.md §6) from the loaded run:
+ * the witness is designated by the MANIFEST (`arm-00`), never by an argument. The
+ * cache axis is degraded — and `usage`-derived fields omitted, never zeroed — if
+ * ANY arm lacks a readable two-turn `usage`.
+ * @param {{ run:string, manifest:any, provenance:any, arms:any[] }} opts
+ */
+export function buildDiff({ run, manifest, provenance, arms }) {
+  const witnessArm = manifest.arms.find((/** @type {any} */ a) => a.lever == null);
+  if (!witnessArm) throw new BenchError('manifest declares no witness (an arm with lever null) — cannot diff');
+  const witnessRecord = arms.find((a) => a.id === witnessArm.id);
+  if (!witnessRecord) {
+    throw new BenchError(`witness arm ${witnessArm.id} has no arm.json in the run — capture it before diff (bench/SPEC.md §6)`);
+  }
+
+  const cacheAvailable = arms.every((a) => a.usage?.turn1 && a.usage?.turn2);
+  const degraded = cacheAvailable
+    ? []
+    : [{ axis: 'cache', reason: 'usage indisponible sur un bras — axe cache dégradé (bench/SPEC.md §5)' }];
+
+  const fixtureCounts = provenance?.fixtureCounts;
+  const manifestById = new Map(manifest.arms.map((/** @type {any} */ a) => [a.id, a]));
+  const levers = arms
+    .filter((a) => a.lever != null)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((armRecord) =>
+      buildLeverEntry({
+        armRecord,
+        witnessRecord,
+        manifestArm: manifestById.get(armRecord.id) ?? {},
+        fixtureCounts,
+        cacheAvailable,
+      }),
+    );
+
+  const interaction = computeInteraction(arms, witnessRecord, { cacheAvailable });
+
+  /** @type {any} */
+  const diff = {
+    schemaVersion: 1,
+    run,
+    witness: witnessArm.id,
+    provenance,
+    degraded,
+    arms: arms
+      .slice()
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map(normalizeArmForDiff),
+    levers,
+  };
+  if (interaction) diff.interaction = interaction;
+  diff.notes = diffNotes(fixtureCounts);
+  return diff;
+}
+
+// ── the derived terminal table (bench/SPEC.md §6) ────────────────────────────
+
+/** Signed integer, `+N`/`-N`/`0`. */
+function signed(n) {
+  return n > 0 ? `+${n}` : String(n);
+}
+
+/**
+ * Render `diff.json` as the terminal table (bench/SPEC.md §6). Derived from the
+ * SAME object, never recalculated from captures — editing `diff.json` and
+ * re-rendering changes the table. Constraints enforced: degradation banner at the
+ * HEAD (not a footnote), BOTH totals with the gap visible, the declared count
+ * beside L4/L6, substitutions under each lever, the two global lines, the three
+ * notes.
+ * @param {any} diff
+ * @returns {string}
+ */
+export function renderDiffTable(diff) {
+  const L = [];
+  L.push(`bench diff — run ${diff.run}  (witness ${diff.witness})`);
+  const p = diff.provenance ?? {};
+  L.push(
+    `provenance: CC ${p.claudeCodeVersion ?? '?'} · ccsnoop ${p.ccsnoopVersion ?? '?'} · ${p.model ?? '?'} · ` +
+      `toolSearch ${p.toolSearch ?? '?'} · port ${p.port ?? '?'} · ${p.timestamp ?? '?'}`,
+  );
+
+  // Degradation banner AT THE HEAD, not a footnote (bench/SPEC.md §6).
+  if (Array.isArray(diff.degraded) && diff.degraded.length) {
+    L.push('');
+    for (const d of diff.degraded) L.push(`⚠ DÉGRADÉ [${d.axis}] — ${d.reason}`);
+  }
+
+  // Per-arm bytes: BOTH totals, gap visible (anatomyTotal < requestBytes always).
+  L.push('');
+  L.push('bras (octets sur le fil, tour 1 — anatomyTotal / requestBytes, écart visible):');
+  for (const a of diff.arms) {
+    const t1 = a.turn1;
+    if (!t1) continue;
+    const gap = t1.requestBytes - t1.anatomy.total;
+    const lev = a.lever == null ? 'témoin' : a.lever;
+    L.push(`  ${a.id}  ${lev.padEnd(6)}  anatomy ${t1.anatomy.total} / request ${t1.requestBytes}  (écart ${gap})`);
+  }
+
+  // One row per lever; substitutions beneath; declared count beside the delta.
+  L.push('');
+  L.push('leviers (delta net vs témoin, readOn turn1):');
+  for (const lv of diff.levers) {
+    const d = lv.deltaBytes;
+    const count = lv.declaredCount != null ? `  [compte déclaré ${lv.declaredCount}]` : '';
+    L.push(
+      `  ${lv.lever}  ${lv.label}${count}\n` +
+        `      Δanatomy ${signed(d.anatomyTotal)}  Δrequest ${signed(d.requestBytes)}  ` +
+        `[system ${signed(d.system)} tools ${signed(d.tools)} history ${signed(d.history)} currentTurn ${signed(d.currentTurn)}]`,
+    );
+    for (const sub of lv.substitutions ?? []) {
+      L.push(`        substitution: ${sub.slot}  ${sub.bytes} o`);
+    }
+    if (lv.steadyStateTokens) {
+      L.push(
+        `        régime stationnaire (tour 2): cacheRead ${lv.steadyStateTokens.cacheRead}  inputTokens ${lv.steadyStateTokens.inputTokens}`,
+      );
+    }
+    if (lv.transitionCostTokens) {
+      L.push(`        coût de transition (tour 1): cacheCreation ${lv.transitionCostTokens.cacheCreation}  [ligne à part, jamais soustraite]`);
+    }
+  }
+
+  // Two global lines: interaction, and per-arm transition cost.
+  L.push('');
+  L.push('global:');
+  if (diff.interaction) {
+    const i = diff.interaction;
+    const tok = 'interactionTokens' in i ? `  interactionTokens ${signed(i.interactionTokens)}` : '';
+    L.push(
+      `  interaction (Σleviers − all): sumOfLevers ${signed(i.sumOfLeversBytes)}  all ${signed(i.allArmBytes)}  ` +
+        `interaction ${signed(i.interactionBytes)}${tok}`,
+    );
+  }
+  L.push('  coût de transition par bras (tour 1 cacheCreation):');
+  for (const a of diff.arms) {
+    if (a.usage?.turn1) L.push(`    ${a.id}  cacheCreation ${a.usage.turn1.cacheCreation}`);
+  }
+
+  // The three mandatory notes, rendered.
+  L.push('');
+  L.push('notes:');
+  (diff.notes ?? []).forEach((n, i) => L.push(`  ${i + 1}. ${n}`));
+  return L.join('\n');
+}
+
+// ── loading a run off disk (zero cost) ───────────────────────────────────────
+
+/** Load every `<run>/<arm-id>/arm.json` present, sorted by id. */
+export function readArmRecords(runDir) {
+  /** @type {any[]} */
+  const arms = [];
+  const entries = fs.existsSync(runDir) ? fs.readdirSync(runDir) : [];
+  for (const id of entries.filter((e) => ARM_ID_RE.test(e)).sort()) {
+    const p = path.join(runDir, id, 'arm.json');
+    if (fs.existsSync(p)) arms.push(JSON.parse(fs.readFileSync(p, 'utf8')));
+  }
+  return arms;
+}
+
+/** The manifest to diff against: the run's own snapshot if present (an archived
+ * run must diff offline), else the committed manifest. Not re-validated here —
+ * `diff` is a zero-cost read, and pre-flight already ran at capture time. */
+export function readRunManifest(runDir, opts = {}) {
+  const snapshot = path.join(runDir, 'manifest.json');
+  if (fs.existsSync(snapshot)) return JSON.parse(fs.readFileSync(snapshot, 'utf8'));
+  return JSON.parse(fs.readFileSync(opts.manifestPath ?? MANIFEST_PATH, 'utf8'));
+}
+
+/**
+ * `diff <run>` (bench/SPEC.md §1, §6): re-read the whole run dir, write
+ * `<run>/diff.json`, and return the object + rendered table. ZERO cost — no API,
+ * no capture. Exit is always 0 (§5: the bench never exits on the number; a
+ * degraded run and a nil/negative gain are both valid measurements).
+ * @param {string} runDir
+ * @param {{ manifestPath?: string }} [opts]
+ */
+export function cmdDiff(runDir, opts = {}) {
+  const provenancePath = path.join(runDir, 'provenance.json');
+  if (!fs.existsSync(provenancePath)) {
+    throw new BenchError(`no provenance.json in ${runDir} — run at least one arm before diff (bench/SPEC.md §6)`);
+  }
+  const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+  const manifest = readRunManifest(runDir, opts);
+  const arms = readArmRecords(runDir);
+  if (arms.length === 0) throw new BenchError(`no arm.json found under ${runDir} (bench/SPEC.md §6)`);
+
+  const diff = buildDiff({ run: path.basename(runDir), manifest, provenance, arms });
+  const diffPath = path.join(runDir, 'diff.json');
+  fs.writeFileSync(diffPath, JSON.stringify(diff, null, 2) + '\n');
+  return { diff, diffPath, table: renderDiffTable(diff) };
+}
+
 // ── CLI dispatch (thin) ──────────────────────────────────────────────────────
 
 async function main(argv) {
@@ -1615,6 +1973,20 @@ async function main(argv) {
     return;
   }
 
+  if (sub === 'diff') {
+    const runDir = argv[1];
+    if (!runDir) throw new BenchError('usage: run.mjs diff <run>');
+    const flag = (name) => {
+      const i = argv.indexOf(name);
+      return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+    };
+    const r = cmdDiff(path.resolve(runDir), { manifestPath: flag('--manifest') });
+    console.log(r.table);
+    console.log('');
+    console.log(`diff.json: ${r.diffPath}`);
+    return;
+  }
+
   if (sub === 'teardown') {
     const runDir = argv[1];
     if (!runDir) throw new BenchError('usage: run.mjs teardown <run>');
@@ -1623,7 +1995,7 @@ async function main(argv) {
     return;
   }
 
-  throw new BenchError(`unknown subcommand '${sub ?? ''}' (expected: arm | teardown)`);
+  throw new BenchError(`unknown subcommand '${sub ?? ''}' (expected: arm | diff | teardown)`);
 }
 
 // Run only when invoked directly, not when imported by tests.
