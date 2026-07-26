@@ -28,6 +28,7 @@ import {
   benchRoot,
   sweepOrphans,
   teardown,
+  cmdArm,
 } from '../scripts/bench/run.mjs';
 
 function mkTmp(tag) {
@@ -297,4 +298,40 @@ test('orphan sweep: stops a daemon left behind under the bench root and removes 
 
 test('benchRoot is under the OS tmp dir', () => {
   assert.equal(benchRoot(), path.join(os.tmpdir(), 'ccsnoop-bench'));
+});
+
+// ── `arm <id>`: run-scoped orchestration (steps 1–7) ─────────────────────────
+
+test('cmdArm: rejects an unknown arm id before standing up any infra', async () => {
+  const root = mkTmp('arm-badid');
+  try {
+    // arm-99 matches /^arm-\d\d$/ (so pre-flight of the committed manifest passes)
+    // but is not a declared arm — cmdArm must fail before creating a run dir.
+    await assert.rejects(() => cmdArm('arm-99', { root }), /no arm 'arm-99'/);
+    assert.deepEqual(fs.readdirSync(root), [], 'no run dir created on a bad id');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cmdArm: a fresh run stands up a reachable daemon; a second arm reuses it', async () => {
+  const root = mkTmp('arm-run');
+  try {
+    // Step 1–7 on a fresh root: materialize, port dance, route + reachability.
+    const first = await cmdArm('arm-00', { root });
+    assert.equal(first.reused, false, 'first arm builds the run');
+    assert.match(first.baseUrl, /^http:\/\/localhost:\d+\/[0-9a-f]{8}$/);
+    assert.equal(fs.existsSync(path.join(first.runDir, 'cwd', 'CLAUDE.md')), true);
+
+    // A second arm against the same root reuses the healthy run — same dir, same
+    // base URL, no fresh port dance (bench/SPEC.md §2: infra is run-scoped).
+    const second = await cmdArm('arm-01', { root });
+    assert.equal(second.reused, true, 'second arm reuses the healthy run');
+    assert.equal(second.runDir, first.runDir);
+    assert.equal(second.baseUrl, first.baseUrl);
+  } finally {
+    // Tear down whatever run(s) landed under the custom root.
+    await sweepOrphans(root);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
