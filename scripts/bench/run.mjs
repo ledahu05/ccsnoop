@@ -456,7 +456,7 @@ export async function teardown(runDir) {
   try {
     for (const entry of fs.readdirSync(runDir)) {
       if (/^arm-/.test(entry)) {
-        fs.rmSync(path.join(runDir, entry, '.claude', '.credentials.json'), { force: true });
+        scrubCredentials(path.join(runDir, entry, '.claude'));
       }
     }
   } catch {
@@ -791,10 +791,18 @@ export function copyCredentials(configDir, src = credentialsSource()) {
  * Step 20 (bench/SPEC.md §2): remove the copied secret. Synchronous and
  * idempotent — it runs from a `finally`, from a `process.on('exit')` handler
  * (where nothing async would ever complete), and again from {@link teardown}.
+ *
+ * `.claude.json` goes too: CC writes it into the config dir at startup and it
+ * carries `oauthAccount` (the dev's email and account UUIDs). It holds no
+ * token, but §6 keeps runs deliberately under `bench/runs/`, so leaving account
+ * identity in a kept run is a leak the bench creates and must clean up.
+ *
  * @param {string} configDir
  */
 export function scrubCredentials(configDir) {
-  fs.rmSync(path.join(configDir, '.credentials.json'), { force: true });
+  for (const name of ['.credentials.json', '.claude.json']) {
+    fs.rmSync(path.join(configDir, name), { force: true });
+  }
 }
 
 /**

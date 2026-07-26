@@ -390,8 +390,14 @@ test('credentials: copied 0600, scrubbed idempotently, fatal when the source is 
     assert.equal(fs.readFileSync(dest, 'utf8'), fs.readFileSync(src, 'utf8'));
     assert.equal(fs.statSync(dest).mode & 0o777, 0o600, 'the secret is 0600');
 
+    // CC drops `.claude.json` (oauthAccount: email + account UUIDs) alongside
+    // the secret; a kept run under bench/runs/ must carry neither.
+    const identity = path.join(configDir, '.claude.json');
+    fs.writeFileSync(identity, '{"oauthAccount":{"emailAddress":"dev@example.com"}}');
+
     scrubCredentials(configDir);
     assert.equal(fs.existsSync(dest), false);
+    assert.equal(fs.existsSync(identity), false, 'account identity goes too');
     scrubCredentials(configDir); // idempotent — it runs from three places
 
     assert.throws(
