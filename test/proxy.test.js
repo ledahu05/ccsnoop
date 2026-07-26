@@ -124,6 +124,38 @@ test('tees an SSE exchange to disk: redacted request blob + verbatim response + 
   }
 });
 
+test('pins accept-encoding: gzip on the forwarded request (issue #45)', async () => {
+  const sessionsDir = mkTmpDir();
+
+  // Capture whatever accept-encoding the upstream actually receives.
+  let seenAcceptEncoding;
+  const upstream = http.createServer((req, res) => {
+    seenAcceptEncoding = req.headers['accept-encoding'];
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer({ sessionsDir, upstreamHost: '127.0.0.1', upstreamPort, requestFn: http.request });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // Client advertises br/zstd — encodings decodeBlob can't inflate. The proxy
+    // must pin gzip so the captured body stays decodable at report time.
+    await driveRequest(proxyPort, {
+      path: '/v1/messages',
+      headers: {
+        'content-type': 'application/json',
+        'accept-encoding': 'gzip, deflate, br, zstd',
+        metadata: JSON.stringify({ user_id: JSON.stringify({ session_id: 'sess-enc' }) }),
+      },
+      body: JSON.stringify({ model: 'claude-x' }),
+    });
+    assert.equal(seenAcceptEncoding, 'gzip', 'upstream must only ever be offered gzip');
+  } finally {
+    await closeAll(proxy, upstream);
+  }
+});
+
 test('sub-agent exchange folds into the parent dir, keeps its own thread_id', async () => {
   const sessionsDir = mkTmpDir();
   const upstream = http.createServer((req, res) => {

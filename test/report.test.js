@@ -204,6 +204,33 @@ test('readUsage falls back to null on a truncated/corrupt gzip blob without thro
   assert.equal(readUsage(truncated), null);
 });
 
+test('readUsage keeps the cache_creation tier breakdown (5m/1h multipliers, issue #45)', () => {
+  // The thread carries `cache_creation.ephemeral_{5m,1h}_input_tokens` — the only
+  // data that attributes a write to the right multiplier (×1.25 vs ×2). It lives
+  // on disk and must survive normalization, not be flattened away.
+  const sse =
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":21394,' +
+    '"cache_creation_input_tokens":24250,"cache_creation":{"ephemeral_5m_input_tokens":0,' +
+    '"ephemeral_1h_input_tokens":24250},"output_tokens":2}}}\n\n' +
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":103}}\n\n';
+  const u = readUsage(sse);
+  assert.equal(u.cacheCreationInputTokens, 24250, 'flat field stays the source of truth');
+  assert.equal(u.cacheCreation5mInputTokens, 0);
+  assert.equal(u.cacheCreation1hInputTokens, 24250);
+});
+
+test('readUsage defaults the cache_creation tiers to 0 when the block is absent (no crash)', () => {
+  const body = JSON.stringify({
+    type: 'message',
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 10, output_tokens: 20, cache_creation_input_tokens: 7 },
+  });
+  const u = readUsage(body);
+  assert.equal(u.cacheCreationInputTokens, 7);
+  assert.equal(u.cacheCreation5mInputTokens, 0);
+  assert.equal(u.cacheCreation1hInputTokens, 0);
+});
+
 // ── computeAnatomy (byte-length buckets, never token counts) ──────────────────
 
 test('computeAnatomy buckets system/tools/history/current-turn by JSON byte length', () => {

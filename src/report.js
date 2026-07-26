@@ -20,6 +20,8 @@ import { defaultHome } from './daemon.js';
  * @property {number} outputTokens
  * @property {number} cacheReadInputTokens
  * @property {number} cacheCreationInputTokens
+ * @property {number} cacheCreation5mInputTokens  Writes billed at the ×1.25 (5m TTL) tier.
+ * @property {number} cacheCreation1hInputTokens  Writes billed at the ×2 (1h TTL) tier.
  * @property {string | null} stopReason
  * @property {boolean} streaming
  */
@@ -162,11 +164,17 @@ function parseSseEvents(text) {
  */
 function normalizeUsage(u, stopReason, streaming) {
   const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  // The flat `cache_creation_input_tokens` stays the source of truth for the total;
+  // the per-tier split (5m ×1.25 / 1h ×2, issue #45) comes in addition and is
+  // absent on older/error payloads — default both to 0, never derive the total.
+  const tiers = u.cache_creation || {};
   return {
     inputTokens: n(u.input_tokens),
     outputTokens: n(u.output_tokens),
     cacheReadInputTokens: n(u.cache_read_input_tokens),
     cacheCreationInputTokens: n(u.cache_creation_input_tokens),
+    cacheCreation5mInputTokens: n(tiers.ephemeral_5m_input_tokens),
+    cacheCreation1hInputTokens: n(tiers.ephemeral_1h_input_tokens),
     stopReason,
     streaming,
   };
@@ -653,6 +661,9 @@ const REPORT_JS = `
       usage.appendChild(chip('Output', fmt(u.outputTokens)+' tok'));
       usage.appendChild(chip('Cache read', fmt(u.cacheReadInputTokens)+' tok'));
       usage.appendChild(chip('Cache write', fmt(u.cacheCreationInputTokens)+' tok'));
+      // Per-tier write split (issue #45): only shown when non-zero — no '0 tok' chip on every exchange.
+      if(u.cacheCreation5mInputTokens) usage.appendChild(chip('Cache write 5m', fmt(u.cacheCreation5mInputTokens)+' tok'));
+      if(u.cacheCreation1hInputTokens) usage.appendChild(chip('Cache write 1h', fmt(u.cacheCreation1hInputTokens)+' tok'));
       if(u.stopReason) usage.appendChild(chip('Stop', u.stopReason));
     } else {
       usage.appendChild(chip('Usage','none captured'));
