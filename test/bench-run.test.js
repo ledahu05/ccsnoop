@@ -839,6 +839,21 @@ test('assertLeverIntegrity: a clean L2 arm passes both guards', () => {
   assert.deepEqual(r.sentinels, [{ name: 'L2 hooks', presentInWitness: true, absentInArm: true }]);
 });
 
+test('assertLeverIntegrity: a clean L1 arm passes Guard 2 by the SLOT sentinel (not a literal)', () => {
+  // The only orchestrator path where Guard 2 rides a slot-kind sentinel: L1 removes
+  // the whole `tool:Workflow` slot, so it must be PRESENT in the witness's slot set
+  // and ABSENT from the arm's — never a substring of the request text.
+  const arm = { id: 'arm-01', lever: 'L1', label: 'L1 tools deny', settings: { permissions: { deny: ['Workflow'] } } };
+  const witnessView = view([['tool:Workflow', 21525], ['system', 100]]);
+  const armView = view([['system', 100]]); // Workflow removed → Guard 1 ok, slot gone
+  const r = assertLeverIntegrity({ arm, witnessView, armView });
+  assert.deepEqual(r.sentinels, [{ name: 'L1 tools deny', presentInWitness: true, absentInArm: true }]);
+
+  // The knob moved bytes (Guard 1 green) but left tool:Workflow behind → Guard 2 FATAL.
+  const armKept = view([['tool:Workflow', 999], ['system', 100]]);
+  assert.throws(() => assertLeverIntegrity({ arm, witnessView, armView: armKept }), /still present in the lever arm/);
+});
+
 test('assertLeverIntegrity: a knob that did not take is FATAL at Guard 1', () => {
   const arm = { id: 'arm-03', lever: 'L3', label: 'L3', settings: { claudeMdExcludes: ['CLAUDE.md'] } };
   const same = view([['message#0', 8500]], `body ${CLAUDEMD_SENTINEL}`);

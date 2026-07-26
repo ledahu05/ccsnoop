@@ -1211,7 +1211,8 @@ export function removalNames(permissions) {
 export function sentinelPresent(sentinel, view) {
   if (sentinel.kind === 'slot') {
     const set = new Set((view?.slots ?? []).map((/** @type {any} */ s) => s.slot));
-    return (sentinel.slots ?? []).length > 0 && (sentinel.slots ?? []).every((slot) => set.has(slot));
+    const slots = sentinel.slots ?? [];
+    return slots.length > 0 && slots.every((slot) => set.has(slot));
   }
   if (sentinel.kind === 'literal') {
     return String(view?.text ?? '').includes(String(sentinel.text));
