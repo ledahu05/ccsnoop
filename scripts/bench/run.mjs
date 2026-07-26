@@ -676,8 +676,10 @@ export async function runArmCapture(opts) {
     assertGzipObserved(captureDir);
     assertCaptureOrder(readCaptureManifest(captureDir));
 
-    // Step 19 — lever integrity guards: a no-op for the witness, which IS the
-    // reference. Wired for the lever arms by #61.
+    // Step 19 — lever integrity guards (fatal). A no-op for the witness, which IS
+    // the reference; each lever arm is checked byte-identity + sentinels against
+    // the witness's own kept capture (bench/SPEC.md §4, §5).
+    runLeverGuards({ runDir, arm, manifest, model, fixtureDir: opts.fixtureDir ?? FIXTURE_DIR });
 
     // Step 21 — the artifacts.
     const record = buildArmRecord({ arm, sessionId, model, preflight });
@@ -1101,6 +1103,296 @@ export function assertCaptureOrder(lines) {
     throw new BenchError(`first captured turn is ${lines[0].turn}, expected 1`);
   }
   return true;
+}
+
+// ── Step 19: lever integrity guards (bench/SPEC.md §4, §5) ───────────────────
+
+/** Unique markers the fixture writes into hook-persona.txt / CLAUDE.md (§3). */
+const PERSONA_SENTINEL_RE = /CCSNOOP-BENCH-SENTINEL-PERSONA-[0-9a-f]+/;
+const CLAUDEMD_SENTINEL_RE = /CCSNOOP-BENCH-SENTINEL-CLAUDEMD-[0-9a-f]+/;
+
+/**
+ * A turn-1 "view" of a captured arm: its segment slot set (keys + bytes) and the
+ * raw request text. The guards compare arms STRUCTURALLY — by slot-set membership,
+ * never by hashing the request (B2: `tool_use_id`, `session_id` and the CC build
+ * each move a request hash at Δ0 bytes, so a hash reports differences that do not
+ * exist). The raw text carries the literal sentinels of §4.2.
+ * @param {any} model  a {@link loadSession} result (or a synthetic stand-in).
+ * @returns {{ slots: {slot:string,bucket:string,bytes:number}[], text: string }}
+ */
+export function turn1View(model) {
+  const ex = model?.exchanges?.[0];
+  return {
+    slots: (ex?.segments ?? []).map((/** @type {any} */ s) => ({ slot: s.slot, bucket: s.bucket, bytes: s.bytes })),
+    text: typeof ex?.requestBlob === 'string' ? ex.requestBlob : '',
+  };
+}
+
+/** slot → bytes map for a view (the stable comparison unit: set membership + bytes). */
+function slotBytesOf(view) {
+  /** @type {Map<string, number>} */
+  const m = new Map();
+  for (const s of view?.slots ?? []) m.set(s.slot, s.bytes);
+  return m;
+}
+
+/** True iff two slot→bytes maps carry the same keys with the same bytes. */
+function slotSetsIdentical(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [slot, bytes] of a) {
+    if (b.get(slot) !== bytes) return false;
+  }
+  return true;
+}
+
+/**
+ * Guard 1 — "did the knob take?" (bench/SPEC.md §4.1, §5 step 19). If the lever
+ * arm's turn-1 slot set (keys AND bytes) is identical to the witness's, the knob
+ * was silently ignored (B1: a malformed settings file is dropped under `-p`) — an
+ * INTEGRITY failure, NOT a nil lever. Compared by slot-set membership, so a
+ * differing `tool_use_id` / `session_id` (which moves the raw bytes at Δ0) never
+ * masks a knob that never took.
+ * @param {any} witnessView
+ * @param {any} armView
+ * @param {string} [knob]
+ * @throws {BenchError} naming the knob, when the arm is byte-identical to the witness.
+ */
+export function assertKnobTook(witnessView, armView, knob) {
+  if (slotSetsIdentical(slotBytesOf(witnessView), slotBytesOf(armView))) {
+    throw new BenchError(
+      `knob '${knob ?? '(unknown)'}' never took — the arm's turn-1 request is byte-identical to the witness (bench/SPEC.md §5, step 19)`,
+    );
+  }
+  return true;
+}
+
+/**
+ * Classify a `permissions.deny` entry's scope (bench/SPEC.md §3, B6). A bare name
+ * (`Workflow`), an empty scope (`Bash()`) and a `*` scope (`Bash(*)`) all remove
+ * the WHOLE tool; only a non-empty, non-`*` scope (`Bash(git:*)`) is a partial
+ * rule that leaves the tool present. Discriminates on scope CONTENT, never on the
+ * mere presence of a parenthesis.
+ * @param {string} entry
+ * @returns {{ name: string, removal: boolean }}
+ */
+export function parseDenyEntry(entry) {
+  const s = String(entry).trim();
+  const m = /^([^(]+)\((.*)\)\s*$/.exec(s);
+  if (!m) return { name: s, removal: true };
+  const scope = m[2].trim();
+  return { name: m[1].trim(), removal: scope === '' || scope === '*' };
+}
+
+/** The tool names a `permissions.deny` list fully removes (bench/SPEC.md §3). */
+export function removalNames(permissions) {
+  const deny = permissions?.deny;
+  if (!Array.isArray(deny)) return [];
+  return deny.map(parseDenyEntry).filter((d) => d.removal).map((d) => d.name);
+}
+
+/**
+ * A lever's integrity sentinel (bench/SPEC.md §3). Two kinds:
+ *  - `slot`:    a set of segment slot keys CC itself supplies (built-in tool names
+ *               for L1); present iff EVERY slot is a turn-1 slot.
+ *  - `literal`: a substring of the raw turn-1 request text (the fixture-written
+ *               markers for L2/L3, a stub tool name for L4, a seed agent name for L6).
+ * The integrity claim is identical for both: PRESENT in the witness, ABSENT in the
+ * lever arm.
+ * @typedef {{ name: string, kind: 'slot'|'literal', slots?: string[], text?: string }} Sentinel
+ */
+
+/**
+ * Whether a sentinel is present in a view (bench/SPEC.md §4.2). A slot sentinel is
+ * set membership (never a hash); a literal sentinel is a substring of the request.
+ * @param {Sentinel} sentinel
+ * @param {any} view
+ * @returns {boolean}
+ */
+export function sentinelPresent(sentinel, view) {
+  if (sentinel.kind === 'slot') {
+    const set = new Set((view?.slots ?? []).map((/** @type {any} */ s) => s.slot));
+    return (sentinel.slots ?? []).length > 0 && (sentinel.slots ?? []).every((slot) => set.has(slot));
+  }
+  if (sentinel.kind === 'literal') {
+    return String(view?.text ?? '').includes(String(sentinel.text));
+  }
+  throw new BenchError(`unknown sentinel kind '${/** @type {any} */ (sentinel).kind}'`);
+}
+
+/**
+ * Guard 2 — "did the knob take on the RIGHT bytes?" (bench/SPEC.md §4.2, §5 step
+ * 19). The sentinel must be PRESENT in the witness's turn-1 request and ABSENT in
+ * the lever arm's. Catches a knob that moved the wrong bytes — e.g. a failing
+ * `cat ./hook-persona.txt` injects an error string: the arm differs from the
+ * witness (Guard 1 green), yet L2 would weigh an error message as "the hooks lever".
+ * @param {Sentinel} sentinel
+ * @param {any} witnessView
+ * @param {any} armView
+ * @throws {BenchError} when the sentinel is absent from the witness or present in the arm.
+ */
+export function assertSentinel(sentinel, witnessView, armView) {
+  if (!sentinelPresent(sentinel, witnessView)) {
+    throw new BenchError(
+      `sentinel '${sentinel.name}' absent from the witness — the reference is broken (bench/SPEC.md §5, step 19)`,
+    );
+  }
+  if (sentinelPresent(sentinel, armView)) {
+    throw new BenchError(
+      `sentinel '${sentinel.name}' still present in the lever arm — the knob did not remove it (bench/SPEC.md §5, step 19)`,
+    );
+  }
+  return { name: sentinel.name, presentInWitness: true, absentInArm: true };
+}
+
+/**
+ * The witness's bundled-skills listing must be non-empty (bench/SPEC.md §3, §5
+ * step 19). Bundled skills come from the binary and do NOT collapse under an
+ * isolated config dir — that is what makes L5 measurable without freezing anything.
+ * An empty witness listing would make arm-05 an empty arm reporting "skills cost
+ * nothing".
+ * @param {ArrayLike<any>|undefined} listing  the witness's bundled-skill names/slots.
+ * @throws {BenchError} when the listing is empty.
+ */
+export function assertBundledSkillsNonEmpty(listing) {
+  const n = listing?.length ?? 0;
+  if (n === 0) {
+    throw new BenchError(
+      'witness bundled-skills listing is empty — L5 would be an empty arm reporting "skills cost nothing" (bench/SPEC.md §5, step 19)',
+    );
+  }
+  return n;
+}
+
+/** Read a fixture sentinel marker (fatal if the frozen fixture lost it). */
+function readFixtureSentinel(fixtureDir, file, re) {
+  const text = fs.readFileSync(path.join(fixtureDir, file), 'utf8');
+  const m = re.exec(text);
+  if (!m) throw new BenchError(`no sentinel matching ${re} in ${path.join(fixtureDir, file)}`);
+  return m[0];
+}
+
+/** An agent name from the `loaded` seed — present in the witness's agent-types
+ * listing, absent once an arm seeds `bare` (bench/SPEC.md §3). */
+function seedAgentSentinel(fixtureDir) {
+  const dir = path.join(fixtureDir, 'seeds', 'loaded', 'agents');
+  const names = fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith('.md'))
+    .map((f) => f.replace(/\.md$/, ''))
+    .sort();
+  if (names.length === 0) throw new BenchError(`no seed agents in ${dir}`);
+  return names[0];
+}
+
+/**
+ * The integrity sentinels for a lever arm (bench/SPEC.md §3 table). The witness
+ * (lever null) has none — it IS the reference — and so does a pure L5 arm, whose
+ * slot-set diff is handled by {@link assertBundledSkillsNonEmpty} in the
+ * orchestrator (skill slot names are supplied by CC and confirmed on the wire).
+ *
+ * L1 slots are derived from the arm's OWN `permissions.deny` (removal-scoped names
+ * → `tool:<name>`), never from a list written in advance (§10.3). L4's stub tool
+ * name and L6's seed agent name are literals; their exact on-wire spelling is
+ * confirmed by the first paying run (#62, §10.4) — fail-closed until then.
+ * @param {any} arm
+ * @param {{ fixtureDir?: string }} [opts]
+ * @returns {Sentinel[]}
+ */
+export function leverSentinels(arm, opts = {}) {
+  const fixtureDir = opts.fixtureDir ?? FIXTURE_DIR;
+  const s = arm.settings ?? {};
+  /** @type {Sentinel[]} */
+  const out = [];
+  if ('permissions' in s) {
+    out.push({ name: 'L1 tools deny', kind: 'slot', slots: removalNames(s.permissions).map((n) => `tool:${n}`) });
+  }
+  if (Array.isArray(s.hooks?.SessionStart) && s.hooks.SessionStart.length === 0) {
+    out.push({ name: 'L2 hooks', kind: 'literal', text: readFixtureSentinel(fixtureDir, 'hook-persona.txt', PERSONA_SENTINEL_RE) });
+  }
+  if ('claudeMdExcludes' in s) {
+    out.push({ name: 'L3 CLAUDE.md', kind: 'literal', text: readFixtureSentinel(fixtureDir, 'CLAUDE.md', CLAUDEMD_SENTINEL_RE) });
+  }
+  if ('disabledMcpjsonServers' in s) {
+    // A single stub tool name (t00…t63). Its on-wire spelling (bare `t00` vs
+    // `mcp__stub__t00`) is pinned by #62's first paying run (§10.4).
+    out.push({ name: 'L4 MCP', kind: 'literal', text: 't00' });
+  }
+  if (arm.seed === 'bare') {
+    out.push({ name: 'L6 agents', kind: 'literal', text: seedAgentSentinel(fixtureDir) });
+  }
+  return out;
+}
+
+/**
+ * Step 19 (bench/SPEC.md §4, §5): run both lever integrity guards for a lever arm.
+ * A no-op for the witness (lever null) — it IS the reference. Fatal on any guard
+ * failure. Pure over the supplied views, so #64 fault-injects it token-free.
+ * @param {{ arm:any, witnessView:any, armView:any, fixtureDir?:string,
+ *           witnessSkills?:string[], armSkills?:string[], knob?:string }} opts
+ * @returns {{ skipped?: boolean, sentinels?: any[] }}
+ */
+export function assertLeverIntegrity(opts) {
+  const { arm, witnessView, armView } = opts;
+  if (arm.lever == null) return { skipped: true };
+
+  // Guard 1 — the knob took (byte-identity vs the witness).
+  assertKnobTook(witnessView, armView, opts.knob ?? knobOf(arm));
+
+  // Guard 2 — the knob took on the right bytes (per-lever sentinels).
+  const results = leverSentinels(arm, { fixtureDir: opts.fixtureDir }).map((sen) =>
+    assertSentinel(sen, witnessView, armView),
+  );
+
+  // L5 — the bundled-skills slot-set diff: the witness listing must be non-empty
+  // (else L5 is an empty arm), and the arm must strip every skill the witness had.
+  if (arm.settings?.disableBundledSkills) {
+    const witnessSkills = opts.witnessSkills ?? [];
+    assertBundledSkillsNonEmpty(witnessSkills);
+    const armSkills = new Set(opts.armSkills ?? []);
+    const stillPresent = witnessSkills.filter((s) => armSkills.has(s));
+    if (stillPresent.length > 0) {
+      throw new BenchError(
+        `L5 bundled skills still present in the arm (${stillPresent.length}) — disableBundledSkills did not take (bench/SPEC.md §5, step 19)`,
+      );
+    }
+    results.push({ name: 'L5 skills', presentInWitness: true, absentInArm: true });
+  }
+  return { sentinels: results };
+}
+
+/** Best-effort bundled-skill slot keys in a view. The exact prefix CC uses is
+ * confirmed on the wire by #62 (§10.4); a `skill:` / `Skill(` slot is a skill. */
+function skillSlots(view) {
+  return (view.slots ?? []).map((/** @type {any} */ s) => s.slot).filter((slot) => /skill/i.test(slot));
+}
+
+/**
+ * Live step-19 wiring: build the witness and arm turn-1 views (the witness from its
+ * own KEPT capture under `<run>/<witnessId>/capture`) and run {@link assertLeverIntegrity}.
+ * The witness (lever null) short-circuits. Fatal if the witness has not run yet.
+ * @param {{ runDir:string, arm:any, manifest:any, model:any, fixtureDir:string }} opts
+ */
+function runLeverGuards({ runDir, arm, manifest, model, fixtureDir }) {
+  if (arm.lever == null) return { skipped: true };
+  const witness = manifest.arms.find((/** @type {any} */ a) => a.lever == null);
+  if (!witness) throw new BenchError('manifest declares no witness (an arm with lever null) — cannot run lever guards');
+  const witnessCapture = path.join(armDir(runDir, witness.id), 'capture');
+  if (!fs.existsSync(witnessCapture)) {
+    throw new BenchError(
+      `witness capture absent at ${witnessCapture} — run the witness (${witness.id}) before any lever arm (bench/SPEC.md §5, step 19)`,
+    );
+  }
+  const witnessView = turn1View(loadSession(witnessCapture));
+  const armView = turn1View(model);
+  return assertLeverIntegrity({
+    arm,
+    witnessView,
+    armView,
+    fixtureDir,
+    knob: knobOf(arm),
+    witnessSkills: skillSlots(witnessView),
+    armSkills: skillSlots(armView),
+  });
 }
 
 // ── Step 21: arm.json and provenance.json ────────────────────────────────────

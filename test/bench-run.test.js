@@ -45,6 +45,15 @@ import {
   buildProvenance,
   listingSizes,
   claudeVersion,
+  turn1View,
+  assertKnobTook,
+  parseDenyEntry,
+  removalNames,
+  sentinelPresent,
+  assertSentinel,
+  assertBundledSkillsNonEmpty,
+  leverSentinels,
+  assertLeverIntegrity,
 } from '../scripts/bench/run.mjs';
 
 /** The stand-in for the `claude` binary — every capture test is token-free. */
@@ -657,4 +666,244 @@ test('cmdArm: an arm that captures nothing is FATAL, and still scrubs the secret
     await sweepOrphans(root);
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ── Step 19: lever integrity guards (bench/SPEC.md §4, §5) ───────────────────
+
+/** A synthetic turn-1 view: segment slots (keys + bytes) and raw request text. */
+function view(slots, text = '') {
+  return { slots: slots.map(([slot, bytes, bucket]) => ({ slot, bytes, bucket: bucket ?? 'tools' })), text };
+}
+
+const PERSONA_SENTINEL = 'CCSNOOP-BENCH-SENTINEL-PERSONA-8b17e6d0';
+const CLAUDEMD_SENTINEL = 'CCSNOOP-BENCH-SENTINEL-CLAUDEMD-4f3a9c21';
+
+/** A sentinel literal, cast past checkJs's string-widening of `kind`. @returns {any} */
+function sen(o) {
+  return o;
+}
+
+test('turn1View: reads segments (slot/bucket/bytes) and the raw request text', () => {
+  const model = {
+    exchanges: [
+      {
+        segments: [{ slot: 'tool:Read', bucket: 'tools', bytes: 20, hash: 'h' }],
+        requestBlob: '{"model":"m"}',
+      },
+      { segments: [], requestBlob: 'turn2' },
+    ],
+  };
+  const v = turn1View(model);
+  assert.deepEqual(v.slots, [{ slot: 'tool:Read', bucket: 'tools', bytes: 20 }]);
+  assert.equal(v.text, '{"model":"m"}');
+  // An empty model degrades to an empty view, never throws.
+  assert.deepEqual(turn1View({}), { slots: [], text: '' });
+});
+
+// Guard 1 — "did the knob take?"
+
+test('assertKnobTook: a lever arm byte-identical to the witness is FATAL, naming the knob', () => {
+  const witness = view([['tool:Workflow', 21525], ['system', 100]]);
+  const same = view([['tool:Workflow', 21525], ['system', 100]]);
+  assert.throws(() => assertKnobTook(witness, same, 'permissions.deny'), /knob 'permissions.deny' never took/);
+  assert.throws(() => assertKnobTook(witness, same, 'permissions.deny'), /byte-identical to the witness/);
+});
+
+test('assertKnobTook: a knob that moved bytes (a removed slot) passes', () => {
+  const witness = view([['tool:Workflow', 21525], ['system', 100]]);
+  const arm = view([['system', 100]]); // Workflow removed
+  assert.equal(assertKnobTook(witness, arm, 'permissions.deny'), true);
+});
+
+test('assertKnobTook: SET membership, not hash — identical slots under a differing session_id are still caught', () => {
+  // The raw text differs (a different session_id / tool_use_id moves the bytes at
+  // Δ0), yet the slot set + bytes are identical: a hash comparison would call these
+  // "different" and let a knob that never took slip through. Set membership catches it.
+  const witness = view([['tool:Workflow', 21525]], 'session_id=aaaa tool_use_id=1111');
+  const arm = view([['tool:Workflow', 21525]], 'session_id=bbbb tool_use_id=2222');
+  assert.throws(() => assertKnobTook(witness, arm, 'permissions.deny'), /never took/);
+});
+
+test('assertKnobTook: a slot present in both but with differing bytes is NOT identical (knob took)', () => {
+  const witness = view([['system#2', 500]]);
+  const arm = view([['system#2', 545]]); // B6: system#2 churns bytes per arm
+  assert.equal(assertKnobTook(witness, arm, 'x'), true);
+});
+
+test('assertKnobTook: a knob that took but nets to ~0 bytes (substitution) still exits 0', () => {
+  // Denying Bash removes tool:Bash but brings Glob+Grep back — a nil/negative NET
+  // delta, yet the SLOT SET differs, so it is a real measurement (§4), not Guard 1.
+  const witness = view([['tool:Bash', 4600]]);
+  const arm = view([['tool:Glob', 981], ['tool:Grep', 3640]]); // ~= same total, different slots
+  assert.equal(assertKnobTook(witness, arm, 'permissions.deny'), true);
+});
+
+// Scope classification — Tool(*) and an empty scope behave as a bare name (§3, B6)
+
+test('parseDenyEntry: bare name, empty scope and * scope all mean whole-tool removal', () => {
+  assert.deepEqual(parseDenyEntry('Workflow'), { name: 'Workflow', removal: true });
+  assert.deepEqual(parseDenyEntry('Bash(*)'), { name: 'Bash', removal: true });
+  assert.deepEqual(parseDenyEntry('Bash()'), { name: 'Bash', removal: true });
+  // Discriminates on scope CONTENT, not the presence of a parenthesis.
+  assert.deepEqual(parseDenyEntry('Bash(git:*)'), { name: 'Bash', removal: false });
+  assert.deepEqual(parseDenyEntry('Read(./secret)'), { name: 'Read', removal: false });
+});
+
+test('removalNames: only removal-scoped deny entries name a removed tool', () => {
+  const perms = { deny: ['Workflow', 'Bash(git:*)', 'Grep(*)'] };
+  assert.deepEqual(removalNames(perms), ['Workflow', 'Grep']);
+  assert.deepEqual(removalNames({}), []);
+  assert.deepEqual(removalNames({ deny: 'nope' }), []);
+});
+
+// Guard 2 — "did the knob take on the RIGHT bytes?" (per-lever sentinels)
+
+test('sentinelPresent: slot kind is set membership; literal kind is a substring of the request text', () => {
+  const v = view([['tool:Workflow', 10]], `body ${PERSONA_SENTINEL} more`);
+  assert.equal(sentinelPresent(sen({ name: 'L1', kind: 'slot', slots: ['tool:Workflow'] }), v), true);
+  assert.equal(sentinelPresent(sen({ name: 'L1', kind: 'slot', slots: ['tool:Absent'] }), v), false);
+  assert.equal(sentinelPresent(sen({ name: 'L2', kind: 'literal', text: PERSONA_SENTINEL }), v), true);
+  assert.equal(sentinelPresent(sen({ name: 'L2', kind: 'literal', text: 'not-here' }), v), false);
+  // An empty slot set is never "present".
+  assert.equal(sentinelPresent(sen({ name: 'x', kind: 'slot', slots: [] }), v), false);
+});
+
+test('assertSentinel: present-in-witness AND absent-in-arm passes; either violation is FATAL', () => {
+  const witness = view([['tool:Workflow', 10]], `has ${PERSONA_SENTINEL}`);
+  const arm = view([['system', 5]], 'no sentinel here');
+  const s = sen({ name: 'L2 hooks', kind: 'literal', text: PERSONA_SENTINEL });
+  assert.deepEqual(assertSentinel(s, witness, arm), {
+    name: 'L2 hooks',
+    presentInWitness: true,
+    absentInArm: true,
+  });
+  // Present in the arm → the knob did not remove it.
+  assert.throws(() => assertSentinel(s, witness, witness), /still present in the lever arm/);
+  // Absent from the witness → the reference is broken.
+  assert.throws(() => assertSentinel(s, arm, arm), /absent from the witness/);
+});
+
+// Bundled-skills listing must be non-empty (§3, §5 step 19)
+
+test('assertBundledSkillsNonEmpty: a non-empty listing returns its size; an empty one is FATAL', () => {
+  assert.equal(assertBundledSkillsNonEmpty(['skill:a', 'skill:b']), 2);
+  assert.throws(() => assertBundledSkillsNonEmpty([]), /bundled-skills listing is empty/);
+  assert.throws(() => assertBundledSkillsNonEmpty(undefined), /bundled-skills listing is empty/);
+});
+
+// Sentinel declarations per arm (§3 table), read against the real committed manifest.
+
+test('leverSentinels: the witness (lever null) declares none; each lever declares the right kind', () => {
+  const m = readManifest(MANIFEST_PATH);
+  const byId = (id) => m.arms.find((a) => a.id === id);
+
+  assert.deepEqual(leverSentinels(byId('arm-00')), []);
+
+  const s01 = leverSentinels(byId('arm-01'));
+  assert.deepEqual(s01, [{ name: 'L1 tools deny', kind: 'slot', slots: ['tool:Workflow'] }]);
+
+  const s02 = leverSentinels(byId('arm-02'));
+  assert.equal(s02.length, 1);
+  assert.equal(s02[0].kind, 'literal');
+  assert.equal(s02[0].text, PERSONA_SENTINEL);
+
+  const s03 = leverSentinels(byId('arm-03'));
+  assert.equal(s03[0].text, CLAUDEMD_SENTINEL);
+
+  const s04 = leverSentinels(byId('arm-04'));
+  assert.equal(s04[0].kind, 'literal'); // a stub tool name
+
+  const s06 = leverSentinels(byId('arm-06'));
+  assert.equal(s06[0].kind, 'literal'); // an agent name from the loaded seed
+
+  // arm-07 (all keys + seed bare) declares all four literal/name sentinels.
+  const s07 = leverSentinels(byId('arm-07'));
+  const texts07 = s07.filter((s) => s.kind === 'literal').map((s) => s.text);
+  assert.ok(texts07.includes(PERSONA_SENTINEL));
+  assert.ok(texts07.includes(CLAUDEMD_SENTINEL));
+  assert.equal(texts07.filter(Boolean).length, 4, 'persona, claude.md, stub tool, agent');
+});
+
+// Orchestrator — the whole step, over synthetic arm views (zero API tokens).
+
+test('assertLeverIntegrity: the witness is a no-op (it IS the reference)', () => {
+  const arm = { id: 'arm-00', lever: null, settings: { hooks: { SessionStart: [{}] } } };
+  assert.deepEqual(assertLeverIntegrity({ arm, witnessView: view([]), armView: view([]) }), { skipped: true });
+});
+
+test('assertLeverIntegrity: a clean L2 arm passes both guards', () => {
+  const arm = { id: 'arm-02', lever: 'L2', label: 'L2 hooks', settings: { hooks: { SessionStart: [] } } };
+  const witnessView = view([['system', 100], ['message#0', 8500]], `turn body ${PERSONA_SENTINEL}`);
+  const armView = view([['system', 100], ['message#0', 300]], 'turn body without the persona');
+  const r = assertLeverIntegrity({ arm, witnessView, armView });
+  assert.deepEqual(r.sentinels, [{ name: 'L2 hooks', presentInWitness: true, absentInArm: true }]);
+});
+
+test('assertLeverIntegrity: a knob that did not take is FATAL at Guard 1', () => {
+  const arm = { id: 'arm-03', lever: 'L3', label: 'L3', settings: { claudeMdExcludes: ['CLAUDE.md'] } };
+  const same = view([['message#0', 8500]], `body ${CLAUDEMD_SENTINEL}`);
+  assert.throws(() => assertLeverIntegrity({ arm, witnessView: same, armView: same }), /never took/);
+});
+
+test('assertLeverIntegrity: the persona injected on the WRONG bytes (Guard 1 green, Guard 2 red)', () => {
+  // A failing `cat` injects an error string: the arm differs from the witness (Guard
+  // 1 passes) but the persona sentinel is still gone from the arm as expected AND the
+  // arm re-introduces it — model the dangerous case where it lingers in the arm.
+  const arm = { id: 'arm-02', lever: 'L2', label: 'L2', settings: { hooks: { SessionStart: [] } } };
+  const witnessView = view([['message#0', 8500]], `ok ${PERSONA_SENTINEL}`);
+  const armView = view([['message#0', 120]], `error string but still ${PERSONA_SENTINEL}`);
+  assert.throws(() => assertLeverIntegrity({ arm, witnessView, armView }), /still present in the lever arm/);
+});
+
+test('assertLeverIntegrity: L5 asserts the witness skills listing non-empty and the arm strips it', () => {
+  const arm = { id: 'arm-05', lever: 'L5', label: 'L5', settings: { disableBundledSkills: true } };
+  const witnessView = view([['tool:Read', 10]]);
+  const armView = view([['tool:Read', 10], ['x', 1]]); // slot set differs → Guard 1 ok
+  // Happy path — witness has skills, the arm has none.
+  const r = assertLeverIntegrity({
+    arm, witnessView, armView,
+    witnessSkills: ['skill:code-review', 'skill:tdd'],
+    armSkills: [],
+  });
+  assert.ok(r.sentinels.some((s) => s.name === 'L5 skills'));
+  // An empty witness listing is FATAL (L5 would be an empty arm).
+  assert.throws(
+    () => assertLeverIntegrity({ arm, witnessView, armView, witnessSkills: [], armSkills: [] }),
+    /bundled-skills listing is empty/,
+  );
+  // A skill still present in the arm is FATAL (the knob did not take).
+  assert.throws(
+    () =>
+      assertLeverIntegrity({
+        arm, witnessView, armView,
+        witnessSkills: ['skill:tdd'],
+        armSkills: ['skill:tdd'],
+      }),
+    /bundled skills still present/,
+  );
+});
+
+test('assertLeverIntegrity: arm-07 checks all four literal sentinels absent from the arm', () => {
+  const m = readManifest(MANIFEST_PATH);
+  const arm = m.arms.find((a) => a.id === 'arm-07');
+  const stubTool = leverSentinels(arm).filter((s) => s.kind === 'literal').map((s) => s.text)[2];
+  const agent = leverSentinels(arm).filter((s) => s.kind === 'literal').map((s) => s.text)[3];
+  // Witness carries every sentinel; the arm (seed bare + all keys) carries none.
+  const witnessView = view(
+    [['tool:Workflow', 100], ['message#0', 8500]],
+    `${PERSONA_SENTINEL} ${CLAUDEMD_SENTINEL} ${stubTool} ${agent}`,
+  );
+  const armView = view([['message#0', 120]], 'nothing subtractive survived');
+  const r = assertLeverIntegrity({
+    arm, witnessView, armView,
+    witnessSkills: ['skill:tdd'],
+    armSkills: [],
+  });
+  assert.ok(r.sentinels.length >= 4);
+  // If any one sentinel lingers in the arm, it is FATAL.
+  const armWithAgent = view([['message#0', 120]], `leaked ${agent}`);
+  assert.throws(
+    () => assertLeverIntegrity({ arm, witnessView, armView: armWithAgent, witnessSkills: ['skill:tdd'], armSkills: [] }),
+    /still present in the lever arm/,
+  );
 });
