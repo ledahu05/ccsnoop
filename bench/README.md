@@ -90,7 +90,7 @@ throwaway directories.** It is not free, and it is not a casual command.
 
 - **Cost.** Each arm is one short task (about two requests). At the pinned model
   (`claude-haiku-4-5-20251001`) that is roughly **≈ $0.05 per arm**, so a full
-  run of all eight arms is **≈ $0,40**. `diff` and `teardown` cost nothing — they
+  run of all eight arms is **≈ $0.40**. `diff` and `teardown` cost nothing — they
   only read or delete files on disk. (Derived in [SPEC.md §8](SPEC.md).)
 - **Credentials.** To run a real session the bench copies
   `~/.claude/.credentials.json` (read-only `0600`) into each arm's throwaway
