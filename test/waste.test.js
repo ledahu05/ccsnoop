@@ -19,6 +19,8 @@ function usage({ input = 0, cacheRead = 0, cacheCreation = 0, output = 0 } = {})
     outputTokens: output,
     cacheReadInputTokens: cacheRead,
     cacheCreationInputTokens: cacheCreation,
+    cacheCreation5mInputTokens: 0,
+    cacheCreation1hInputTokens: 0,
     stopReason: null,
     streaming: true,
   };

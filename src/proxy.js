@@ -137,7 +137,12 @@ export function createProxyServer(options = {}) {
 
       // Forward: restore first-party Host (spec §1.5), pass everything else
       // (including auth) through untouched on the wire.
-      const headers = { ...creq.headers, host: UPSTREAM_HOST };
+      // Pin accept-encoding to gzip: Claude Code advertises `gzip, deflate, br,
+      // zstd`, and br/zstd have no reliable magic bytes, so `decodeBlob` (report)
+      // could not inflate a captured body served in them — usage would read null
+      // and waste would flip to a false `cold` (issue #45). Forcing gzip leaves
+      // upstream only gzip or plain, the two cases decodeBlob already handles.
+      const headers = { ...creq.headers, host: UPSTREAM_HOST, 'accept-encoding': 'gzip' };
       const ureq = requestFn(
         {
           hostname: upstreamHost,
