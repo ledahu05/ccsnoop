@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stub": {
+      "command": "node",
+      "args": ["./mcp-stub.mjs"]
+    }
+  }
+}

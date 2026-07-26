@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 1,
+  "prompt": "Read the file FIXED.txt and reply with only its first word.",
+  "model": "claude-haiku-4-5-20251001",
+  "turns": 2,
+  "cwd": "bench/fixture",
+  "arms": [
+    {
+      "id": "arm-00",
+      "label": "temoin",
+      "lever": null,
+      "seed": "loaded",
+      "settings": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
+          ]
+        }
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-01",
+      "label": "L1 tools deny",
+      "lever": "L1",
+      "seed": "loaded",
+      "settings": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
+          ]
+        },
+        "permissions": { "deny": ["Workflow"] }
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-02",
+      "label": "L2 hooks",
+      "lever": "L2",
+      "seed": "loaded",
+      "settings": {
+        "hooks": { "SessionStart": [] }
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-03",
+      "label": "L3 CLAUDE.md",
+      "lever": "L3",
+      "seed": "loaded",
+      "settings": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
+          ]
+        },
+        "claudeMdExcludes": ["CLAUDE.md"]
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-04",
+      "label": "L4 MCP",
+      "lever": "L4",
+      "seed": "loaded",
+      "settings": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
+          ]
+        },
+        "disabledMcpjsonServers": ["stub"]
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-05",
+      "label": "L5 skills",
+      "lever": "L5",
+      "seed": "loaded",
+      "settings": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
+          ]
+        },
+        "disableBundledSkills": true
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-06",
+      "label": "L6 agents",
+      "lever": "L6",
+      "seed": "bare",
+      "settings": {
+        "hooks": {
+          "SessionStart": [
+            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
+          ]
+        }
+      },
+      "env": {}
+    },
+    {
+      "id": "arm-07",
+      "label": "all",
+      "lever": "all",
+      "seed": "bare",
+      "settings": {
+        "hooks": { "SessionStart": [] },
+        "permissions": { "deny": ["Workflow"] },
+        "claudeMdExcludes": ["CLAUDE.md"],
+        "disabledMcpjsonServers": ["stub"],
+        "disableBundledSkills": true
+      },
+      "env": {}
+    }
+  ]
+}

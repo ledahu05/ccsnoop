@@ -1,0 +1,4 @@
+SNOOPWORD is the first word of this frozen bench fixture file. The canonical
+bench prompt reads FIXED.txt and replies with only its first word, forcing
+exactly one Read tool call so the second POST (and the cache axis) exist.
+Do NOT edit — the content is fixed by design (bench/SPEC.md §7).
