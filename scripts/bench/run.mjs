@@ -1756,6 +1756,9 @@ export function buildDiff({ run, manifest, provenance, arms }) {
   if (!witnessRecord) {
     throw new BenchError(`witness arm ${witnessArm.id} has no arm.json in the run — capture it before diff (bench/SPEC.md §6)`);
   }
+  if (!witnessRecord.turn1) {
+    throw new BenchError(`witness arm ${witnessArm.id} captured no turn1 — nothing to diff against (bench/SPEC.md §6)`);
+  }
 
   const cacheAvailable = arms.every((a) => a.usage?.turn1 && a.usage?.turn2);
   const degraded = cacheAvailable
@@ -1765,7 +1768,9 @@ export function buildDiff({ run, manifest, provenance, arms }) {
   const fixtureCounts = provenance?.fixtureCounts;
   const manifestById = new Map(manifest.arms.map((/** @type {any} */ a) => [a.id, a]));
   const levers = arms
-    .filter((a) => a.lever != null)
+    // A lever arm that captured no turn1 (a failed exchange) has no baseline to
+    // diff — skip it, consistent with `computeInteraction` and the render loop.
+    .filter((a) => a.lever != null && a.turn1)
     .sort((a, b) => a.id.localeCompare(b.id))
     .map((armRecord) =>
       buildLeverEntry({

@@ -1200,6 +1200,33 @@ test('cmdDiff: prefers the run manifest snapshot, falls back to the committed ma
   }
 });
 
+test('buildDiff: a lever arm that captured no turn1 is skipped, not a crash (partial run)', () => {
+  const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200 });
+  // arm-01's exchange failed — its arm.json carries no turn1 at all.
+  const brokenLever = { id: 'arm-01', lever: 'L1', label: 'L1', turns: 0 };
+  const l2 = armRecord({ id: 'arm-02', lever: 'L2', anatomy1: { system: 1, tools: 90, history: 0, currentTurn: 1 }, request1: 190 });
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+    { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Bash'] } } },
+    { id: 'arm-02', lever: 'L2', seed: 'loaded', settings: { hooks: { SessionStart: [] } } },
+  ]);
+  const diff = buildDiff({ run: 'r', manifest, provenance: {}, arms: [witness, brokenLever, l2] });
+  // The turn1-less lever is dropped from levers[] (same guard as the render loop
+  // and computeInteraction); the intact lever still renders.
+  assert.deepEqual(diff.levers.map((l) => l.id), ['arm-02']);
+  assert.doesNotThrow(() => renderDiffTable(diff));
+});
+
+test('buildDiff: a witness that captured no turn1 fails loudly with a BenchError, not a TypeError', () => {
+  const brokenWitness = { id: 'arm-00', lever: null, label: 'temoin', turns: 0 };
+  const l1 = armRecord({ id: 'arm-01', lever: 'L1', anatomy1: { system: 1, tools: 60, history: 0, currentTurn: 1 }, request1: 160 });
+  const manifest = diffManifest([
+    { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
+    { id: 'arm-01', lever: 'L1', seed: 'loaded', settings: { permissions: { deny: ['Bash'] } } },
+  ]);
+  assert.throws(() => buildDiff({ run: 'r', manifest, provenance: {}, arms: [brokenWitness, l1] }), /witness arm arm-00 captured no turn1/);
+});
+
 test('readArmRecords: loads every arm.json under the run, ignores non-arm dirs', () => {
   const runDir = mkTmp('diff-scan');
   try {
