@@ -391,3 +391,21 @@ system prompt, and the full contents of any files it read. Secret request header
   contents and prompts. Treat a capture or report like a copy of your source and
   conversation — because that is what it is. To dispose of one, delete the repo's
   `.ccsnoop/` folder.
+
+---
+
+## For maintainers — the tuning bench
+
+Beyond snooping a single session, this repo ships a **tuning bench**: a
+developer-only harness that runs the same short task through ccsnoop with each
+Claude Code "lever" turned off one at a time, and measures — in bytes and cache
+tokens — how much each one trims from what Claude Code sends. It answers *"do
+these tuning levers actually shrink the request, and by how much?"* with
+numbers, not guesses.
+
+It is a maintainer tool, **not** a `ccsnoop` subcommand: it spends real API
+tokens and copies your Claude Code credentials into throwaway config dirs. If
+you want to understand how it works or run it yourself, start with the
+**[beginner on-ramp → bench/README.md](bench/README.md)**; the locked contract
+(the 21-step sequence, the `diff.json` schema, the exit-code table) lives in
+[bench/SPEC.md](bench/SPEC.md).
