@@ -60,7 +60,7 @@ test('classifySystemBlock maps each bench sentinel to its lever', () => {
   );
 });
 
-test('classifySystemBlock falls anything unattributable (incl. the harness) to harness', () => {
+test('classifySystemBlock falls back to harness for anything unattributable (incl. the harness)', () => {
   // CC identity/capabilities preamble — no lever sentinel.
   const harness = classifySystemBlock(text('You are Claude Code, Anthropic’s CLI.\ntools are available.'));
   assert.equal(harness.lever, 'harness');
@@ -163,6 +163,21 @@ test('a cache_control marker on a block does not change its lever (text still dr
   assert.deepEqual(attribs.map((a) => a.lever), ['claude-md', 'harness']);
 });
 
+test('a null block inside the system array is a 0-byte harness floor, byte-aligned with waste.js', () => {
+  // segmentRequest emits a segment per array entry (incl. null); attribution must
+  // stay in lock-step so the per-lever sum equals the per-slot Segment.bytes sum.
+  const body = { system: [null, text('x')] };
+  const attribs = attributeSystemBlocks(body);
+  assert.deepEqual(attribs.map((a) => a.slot), ['system#0', 'system#1']);
+  assert.equal(attribs[0].lever, 'harness');
+  assert.equal(attribs[0].floor, true);
+
+  const segBytes = Object.fromEntries(
+    segmentRequest(body).filter((s) => s.bucket === 'system').map((s) => [s.slot, s.bytes]),
+  );
+  for (const a of attribs) assert.equal(a.bytes, segBytes[a.slot]);
+});
+
 // ── AC #3 — the harness floor is never emitted downstream ─────────────────────
 
 test('filterFloor drops the harness / unattributable blocks, keeps the actionable levers', () => {
@@ -253,11 +268,14 @@ test('FT3 system-bucket lever mapping — AC #1–#2 (issue #73)', fixtureGateOp
 
 /** Extract the text of the system block at a slot, mirroring report.js contentForSlot. */
 function textOfBlockForSlot(body, slot) {
-  if (!body || !Array.isArray(body.system)) return '';
+  if (!body) return '';
+  // Bare-string `system` (slot 'system') — checked first, exactly like contentForSlot.
   if (slot === 'system') return typeof body.system === 'string' ? body.system : '';
+  if (!Array.isArray(body.system)) return '';
   const m = slot.match(/^system#(\d+)$/);
   if (!m) return '';
   const block = body.system[Number(m[1])];
-  if (block == null) return '';
-  return typeof block === 'string' ? block : typeof block.text === 'string' ? block.text : '';
+  if (typeof block === 'string') return block;
+  if (block && typeof block.text === 'string') return block.text;
+  return '';
 }
