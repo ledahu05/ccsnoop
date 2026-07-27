@@ -122,6 +122,18 @@ test('loadBuiltinDenylist rejects a non-string field', () => {
   assert.throws(() => loadBuiltinDenylist(p), /'name'/);
 });
 
+test('loadBuiltinDenylist rejects a duplicate name (would emit a dup deny)', () => {
+  const p = path.join(mkTmpDir(), 'bad.json');
+  fs.writeFileSync(
+    p,
+    JSON.stringify([
+      { name: 'Workflow', category: 'orchestration', note: 'a' },
+      { name: 'Workflow', category: 'orchestration', note: 'b' },
+    ])
+  );
+  assert.throws(() => loadBuiltinDenylist(p), /duplicate name 'Workflow'/);
+});
+
 // ── denyIntersection (AC #2: bare names, denylist order) ──────────────────────
 
 test('denyIntersection returns bare names, denylist order, only shipped', () => {

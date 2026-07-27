@@ -52,6 +52,8 @@ export function loadBuiltinDenylist(denylistPath = DEFAULT_DENYLIST_PATH) {
   }
   /** @type {DenylistEntry[]} */
   const out = [];
+  /** @type {Set<string>} */
+  const seenNames = new Set();
   for (let i = 0; i < raw.length; i++) {
     const entry = raw[i];
     if (!entry || typeof entry !== 'object') {
@@ -62,6 +64,12 @@ export function loadBuiltinDenylist(denylistPath = DEFAULT_DENYLIST_PATH) {
         throw new Error(`built-in denylist entry #${i} (${entry.name ?? '?'}): missing non-empty '${key}'`);
       }
     }
+    // The denylist is a set keyed by name — a duplicate would emit that name twice
+    // in permissions.deny. Reject it loudly rather than ship an invalid block.
+    if (seenNames.has(entry.name)) {
+      throw new Error(`built-in denylist entry #${i}: duplicate name '${entry.name}'`);
+    }
+    seenNames.add(entry.name);
     out.push({ name: entry.name, category: entry.category, note: entry.note });
   }
   return out;
