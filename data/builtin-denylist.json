@@ -1,0 +1,11 @@
+[
+  { "name": "Workflow", "category": "orchestration", "note": "multi-agent / ultracode" },
+  { "name": "Artifact", "category": "publication", "note": "HTML render" },
+  { "name": "AskUserQuestion", "category": "structured UI", "note": "structured prompts" },
+  { "name": "ScheduleWakeup", "category": "scheduling", "note": "/loop self-pacing" },
+  { "name": "ReportFindings", "category": "review output", "note": "code-review" },
+  { "name": "CronCreate", "category": "scheduling", "note": "cron jobs" },
+  { "name": "CronDelete", "category": "scheduling", "note": "cron jobs" },
+  { "name": "CronList", "category": "scheduling", "note": "cron jobs" },
+  { "name": "RemoteTrigger", "category": "scheduling", "note": "remote trigger" }
+]

@@ -5,9 +5,10 @@
 import { start } from '../src/proxy.js';
 import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
+import { fineTune } from '../src/finetune.js';
 import { init } from '../src/init.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -39,6 +40,7 @@ async function main() {
   if (sub === 'stop') return runStop(home, args);
   if (sub === 'status') return runStatus(home, args);
   if (sub === 'report') return runReport(args);
+  if (sub === 'fine-tune') return runFineTune(args);
 }
 
 /**
@@ -163,6 +165,23 @@ function runReport(args) {
 }
 
 /**
+ * `fine-tune` — print a CLI diagnostic + a paste-ready settings.json block for
+ * one captured session (fine-tune-spec.md; FT1 = issue #71). Single-session
+ * skeleton: emits `permissions.deny` = intersection of the session's tools[]
+ * with data/builtin-denylist.json. Flags/dispatch mirror {@link runReport}.
+ * @param {string[]} args
+ */
+function runFineTune(args) {
+  const result = fineTune({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    session: getFlag(args, '--session'),
+    all: hasFlag(args, '--all'),
+  });
+  for (const line of result.lines) console.log(line);
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -204,7 +223,11 @@ Commands:
              --all                widen discovery across ~/.ccsnoop/routes.json
              --out <path>         output file (default <session-dir>/report.html)
              --bloat-floor <n>    bloat: absolute byte floor (default 4096)
-             --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)`);
+             --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
+  fine-tune  Print a byte diagnostic + paste-ready settings.json for one session
+             --root <path>        capture root (default ./.ccsnoop)
+             --session <id>       session to tune (default: latest)
+             --all                widen discovery across ~/.ccsnoop/routes.json`);
 }
 
 main().catch((err) => {
