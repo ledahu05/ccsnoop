@@ -144,6 +144,25 @@ scope. They live in this ADR and in the code.
   "test"]`), so this code is not covered by `npm run typecheck`. Known limit, left
   as is.
 
+## Amendment — D5 confirmed by the first `opus` run (#72, 2026-07-28)
+
+D5 kept the reviewer running unconditionally in profile `opus`, on the argument that
+context diversity (fresh context, distinct prompt, isolated worktree) is worth
+something even without model diversity. That was a bet; the first all-Opus run
+settled it. The Opus reviewer, reviewing Opus's own implementation, committed two
+substantive fixes:
+
+- a `tool_use` block counted **twice** when a stream reported it in both
+  `content_block_start` and `message_start`'s inlined `content[]`;
+- a half-written `manifest.jsonl` line taking down the whole session — which would
+  have handed T4's MCP guard a falsely *empty* called-tool set, i.e. denied tools
+  that were in fact used.
+
+Both are the kind of defect the implementer's own context was blind to, and neither
+needed a second model to surface. **D5 stands, now on evidence rather than
+argument.** The corollary also holds: this says nothing about `split` being
+unnecessary — it says the all-Opus reviewer is not decoration.
+
 ## Amendment — run bounds are env-overridable too
 
 `MAX_ITERATIONS` / `MAX_PARALLEL` were hardcoded at 10 / 4. They are now read from
