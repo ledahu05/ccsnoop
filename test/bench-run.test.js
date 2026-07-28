@@ -598,7 +598,7 @@ test('readCaptureManifest: absent and empty manifests are both zero-capture', ()
 test('assertGzipObserved: a TRUNCATED gzip whose usage reads null still passes', () => {
   const dir = mkTmp('gzip');
   try {
-    // `1f 8b` then garbage: gunzip fails, decodeBlob falls back to raw bytes,
+    // `1f 8b` then garbage: gunzip fails, decodeResponseBlob falls back to raw bytes,
     // readUsage returns null — and the guard must still pass, because it reads
     // the magic bytes, not `usage`. This is the whole point of step 18.
     const truncated = Buffer.concat([Buffer.from([0x1f, 0x8b]), Buffer.from('garbage')]);
