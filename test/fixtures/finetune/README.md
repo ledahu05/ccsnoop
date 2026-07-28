@@ -51,6 +51,21 @@ the stub declares — §10.4's open question, closed by this paying run. The old
 `/\bt00\b/` marker could never match (`_` is a word char, so the boundary never
 lands), in this gate or in the bench's own lever sentinels.
 
+## Downstream contract — called-tool set (issue #72 / FT2)
+
+`src/finetune-response.js` turns this fixture's gzip `.response.sse` blobs into the
+session's **called-tool set** — every name appearing as the `name` of a `tool_use`
+content block (fine-tune-spec §2.2). It reuses `report.js`'s `decodeResponseBlob` +
+`parseSseEvents` (one gzip/SSE decoder, the same path `readUsage` takes) and never
+touches `usage`: the signal is SSE bytes only, never re-tokenized.
+
+`test/finetune-response.test.js` holds the gate (AC #2–#3). It re-derives the
+expected set from the decoded blobs by an independent regex rather than restating
+the implementation, and asserts the multi-turn / no-`tool_use` branches. On this
+fixture the observed set is **`{Read}`** across turns 1–5, with **turn 6 calling
+nothing** — both branches exercised. The corpus roll-up and the
+`sessionCount>=3 AND calledCount==0` MCP guard consume this per session (T4 / #74).
+
 ## Downstream contract — system-bucket attribution (issue #73 / FT3)
 
 `src/finetune-system.js` splits the `system` bucket by source, attributing each

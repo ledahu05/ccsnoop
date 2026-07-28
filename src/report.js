@@ -77,7 +77,7 @@ export function parseRequestBlob(buf) {
  * @returns {Usage | null} null when no `usage` is present (e.g. a HEAD/error blob).
  */
 export function readUsage(buf) {
-  const text = decodeBlob(buf);
+  const text = decodeResponseBlob(buf);
   if (text.trim().length === 0) return null;
 
   // SSE path: collect every `data:` JSON line and fold usage across events.
@@ -118,10 +118,14 @@ export function readUsage(buf) {
  * exchange (issue #53). Detect the gzip magic (`1f 8b`) and inflate before
  * treating the bytes as text; a plain-text blob (or a string) passes through.
  *
+ * Exported because the responses are read twice for different signals: `usage`
+ * here, and the `tool_use` names the fine-tune called-tool set needs
+ * (src/finetune-response.js, fine-tune-spec §2.2). One decoder, one gzip rule.
+ *
  * @param {Buffer | string} buf
  * @returns {string}
  */
-function decodeBlob(buf) {
+export function decodeResponseBlob(buf) {
   if (typeof buf === 'string') return buf;
   if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
     try {
@@ -136,10 +140,11 @@ function decodeBlob(buf) {
 /**
  * Split an SSE text stream into its parsed `data:` JSON payloads. Anthropic
  * emits one JSON object per `data:` line; malformed lines are skipped.
+ * Exported alongside {@link decodeResponseBlob} for the same reason.
  * @param {string} text
  * @returns {any[]}
  */
-function parseSseEvents(text) {
+export function parseSseEvents(text) {
   /** @type {any[]} */
   const out = [];
   for (const rawLine of text.split('\n')) {
