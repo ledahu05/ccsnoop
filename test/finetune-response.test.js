@@ -77,6 +77,24 @@ test('toolUseNames keeps every occurrence in emission order (repeats included)',
   assert.deepEqual(toolUseNames(turnCalling(['Read', 'Read', 'Bash'])), ['Read', 'Read', 'Bash']);
 });
 
+test('toolUseNames counts a block reported twice by the stream as ONE call', () => {
+  // A stream that both inlines finished blocks in `message_start.content[]` AND
+  // streams them as `content_block_start` reports the same block twice. It is
+  // still one call, so the counts calledToolSet reports must not double.
+  let s = sse('message_start', {
+    message: { id: 'msg_1', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
+  });
+  s += sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} } });
+  assert.deepEqual(toolUseNames(s), ['Read']);
+});
+
+test('toolUseNames still counts genuine repeat calls — distinct ids, same name', () => {
+  // The dedupe above keys on the block id, so two real calls to one tool both count.
+  let s = sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'Read' } });
+  s += sse('content_block_start', { index: 1, content_block: { type: 'tool_use', id: 'toolu_2', name: 'Read' } });
+  assert.deepEqual(toolUseNames(s), ['Read', 'Read']);
+});
+
 test('toolUseNames reads a non-streaming JSON response body', () => {
   const body = JSON.stringify({
     type: 'message',
@@ -88,6 +106,13 @@ test('toolUseNames reads a non-streaming JSON response body', () => {
     usage: { input_tokens: 1, output_tokens: 1 },
   });
   assert.deepEqual(toolUseNames(body), ['mcp__stub__t00']);
+});
+
+test('toolUseNames reads a GZIP non-streaming JSON body (the shape the proxy forces)', () => {
+  // proxy.js pins `accept-encoding: gzip`, so a non-streaming body is captured
+  // gzipped too — both halves of the decode must compose, not just SSE+gzip.
+  const body = JSON.stringify({ type: 'message', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Edit' }] });
+  assert.deepEqual(toolUseNames(zlib.gzipSync(Buffer.from(body, 'utf8'))), ['Edit']);
 });
 
 test('toolUseNames ignores non-tool_use blocks (thinking, text, server-side deltas)', () => {
@@ -207,6 +232,45 @@ test('calledToolSet throws a named error when the session dir has no manifest', 
   assert.throws(() => calledToolSet(path.join(root, 'nope')), /manifest\.jsonl/);
 });
 
+test('calledToolSet survives a half-written manifest line (capture killed mid-append)', () => {
+  // `manifest.jsonl` is appended one line per exchange, so a killed capture can
+  // leave the last line truncated. The complete turns before it must still report:
+  // dropping the whole session would hand T4's guard a falsely-EMPTY called set,
+  // i.e. deny tools that were in fact used.
+  const root = mkTmpDir();
+  const dir = writeSession(root, 'sess-g', [['Read'], ['Bash']]);
+  const manifest = path.join(dir, 'manifest.jsonl');
+  fs.appendFileSync(manifest, '{"turn":3,"response_blob":"0003.resp');
+
+  const called = calledToolSet(dir, 'sess-g');
+  assert.deepEqual([...called.names].sort(), ['Bash', 'Read']);
+  assert.equal(called.responses, 2, 'both intact turns decoded');
+  assert.equal(called.missing, 1, 'the truncated line counts as an unreadable turn');
+});
+
+test('calledToolSet counts a manifest line naming no response blob as missing', () => {
+  const root = mkTmpDir();
+  const dir = writeSession(root, 'sess-h', [['Read']]);
+  fs.appendFileSync(path.join(dir, 'manifest.jsonl'), JSON.stringify({ turn: 2 }) + '\n');
+
+  const called = calledToolSet(dir, 'sess-h');
+  assert.deepEqual([...called.names], ['Read']);
+  assert.equal(called.missing, 1);
+  assert.deepEqual(called.perTurn[1], { turn: 2, blob: null, names: [], decoded: false });
+});
+
+test('calledToolSet accounts for every manifest line: responses + missing === perTurn', () => {
+  // The invariant a caller needs to know whether the picture is complete — no
+  // turn is silently dropped, whatever went wrong with it.
+  const root = mkTmpDir();
+  const dir = writeSession(root, 'sess-i', [['Read'], null, []]);
+  fs.appendFileSync(path.join(dir, 'manifest.jsonl'), '{"turn":4,"trunca');
+
+  const called = calledToolSet(dir, 'sess-i');
+  assert.equal(called.perTurn.length, 4);
+  assert.equal(called.responses + called.missing, called.perTurn.length);
+});
+
 // ── AC #2–#3 — fixture gate over the committed FT0 capture ────────────────────
 //
 // Self-activating, like FT0's own gate: while no `session-*` fixture is committed
@@ -240,6 +304,7 @@ test('FT2 called-tool set against the FT0 fixture — AC #2–#3 (issue #72)', g
     /** @type {Set<string>} */
     const expected = new Set();
     for (const line of manifestLines(dir)) {
+      if (typeof line.response_blob !== 'string') continue;
       const blob = path.join(dir, line.response_blob);
       if (!fs.existsSync(blob)) continue;
       const text = decodeForTest(fs.readFileSync(blob));
