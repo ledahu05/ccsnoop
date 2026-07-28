@@ -11,6 +11,7 @@
       "lever": null,
       "seed": "loaded",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": {
           "SessionStart": [
             { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
@@ -25,6 +26,7 @@
       "lever": "L1",
       "seed": "loaded",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": {
           "SessionStart": [
             { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
@@ -40,6 +42,7 @@
       "lever": "L2",
       "seed": "loaded",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": { "SessionStart": [] }
       },
       "env": {}
@@ -50,6 +53,7 @@
       "lever": "L3",
       "seed": "loaded",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": {
           "SessionStart": [
             { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
@@ -65,6 +69,7 @@
       "lever": "L4",
       "seed": "loaded",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": {
           "SessionStart": [
             { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
@@ -80,6 +85,7 @@
       "lever": "L5",
       "seed": "loaded",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": {
           "SessionStart": [
             { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
@@ -95,6 +101,7 @@
       "lever": "L6",
       "seed": "bare",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": {
           "SessionStart": [
             { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
@@ -109,6 +116,7 @@
       "lever": "all",
       "seed": "bare",
       "settings": {
+        "enabledMcpjsonServers": ["stub"],
         "hooks": { "SessionStart": [] },
         "permissions": { "deny": ["Workflow"] },
         "claudeMdExcludes": ["CLAUDE.md"],

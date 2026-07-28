@@ -5,23 +5,50 @@ session: `session-<id>/` containing `manifest.jsonl` + per-turn `NNNN.request.ht
 + `NNNN.response.sse` (gzip). This is the substrate the downstream fine-tune
 tickets (T1–T7, `docs/fine-tune-spec.md`) test against.
 
-## Status — issue #70 (FT0)
+## Status — issue #70 (FT0): landed
 
-**No fixture is committed yet.** This directory is intentionally empty of
-`session-*` dirs while FT0 is blocked.
-
-The intended source is a lever-complete witness capture produced **through the
-bench** (`scripts/bench/run.mjs`, `bench/SPEC.md` §0) — claude.ai OAuth →
-`api.anthropic.com`, model `claude-haiku-4-5-20251001`. In agent sandboxes that
-lack `~/.claude/.credentials.json` (claude.ai subscription auth inactive) and
-have no direct `api.anthropic.com` access, the bench's `copyCredentials` step
-(bench `step 10`) is fatal and **no genuine capture can be produced**. AC #5
-forbids synthesizing a fake one, so FT0 escalates rather than ships a stand-in.
+`session-963204f5-937b-4a13-b658-f1cbffd21421/` — **6 exchanges**, lever-complete,
+produced through the bench on a host with claude.ai OAuth (proxy route → the
+witness's isolated `CLAUDE_CONFIG_DIR`, materialized `bench/fixture/` cwd,
+`claude-haiku-4-5-20251001`, `ENABLE_TOOL_SEARCH=true`). Turn 1 carries all four
+levers; turn 6 carries none of the response-side `tool_use`, which is what makes
+the fixture exercise both branches.
 
 The acceptance criteria (AC #1–#4) are encoded as a self-activating gate in
 `test/finetune-fixture.test.js`: it self-skips while this dir has no `session-*`
 entry, then auto-validates any committed fixture (four levers, a `tool_use`
 response, scrubbed headers/paths).
+
+### Why the first attempt shipped lever-incomplete — and why this one has ≥3 turns
+
+The first capture passed for the persona and CLAUDE.md sentinels but carried
+**zero MCP tools**, and nothing complained. Two independent defects:
+
+1. A project-scoped `.mcp.json` server stays at `⏸ Pending approval` under `-p`.
+   No arm enabled it, so the stub never connected at all. Fixed by pinning
+   `enabledMcpjsonServers` on all 8 arms and by bench **step 11b**, which runs
+   `claude mcp list` (zero tokens) and refuses a run whose fixture server is not
+   connected. Step 11's `system/init` is blind to this: it is emitted *before* the
+   MCP handshake (status always `pending`) and `ENABLE_TOOL_SEARCH` defers the
+   stub's tools out of `event.tools`.
+2. **Even connected, the MCP tools do not reach the wire before turn 3.** Turns 1
+   and 2 carry `The following MCP servers are still connecting … not yet
+   available: stub`; from turn 3 on, all 64 appear. A 2-turn capture therefore
+   *cannot* carry the L4 lever — which is why this fixture was captured with a
+   multi-tool-call prompt rather than `bench/manifest.json`'s canonical 2-turn
+   one.
+
+⚠ **Consequence for the bench, still open.** `bench/manifest.json` pins
+`turns: 2` and the lever diff reads **request #1**, so `arm-04`'s L4 sentinel can
+never be present in the witness: L4 measures the removal of nothing. Step 11b
+catches an unconnected server but not this race. Resolving it means either giving
+the canonical prompt enough turns (and re-baselining every byte figure in
+`bench/SPEC.md` §4) or declaring L4 unmeasurable under `-p`.
+
+The on-wire spelling of a stub tool is **`mcp__stub__t00`**, not the bare `t00`
+the stub declares — §10.4's open question, closed by this paying run. The old
+`/\bt00\b/` marker could never match (`_` is a word char, so the boundary never
+lands), in this gate or in the bench's own lever sentinels.
 
 ## Downstream contract — system-bucket attribution (issue #73 / FT3)
 
@@ -53,8 +80,12 @@ it lands.
 
 ## To land a fixture (on a host with claude.ai OAuth)
 
-1. `node scripts/bench/run.mjs arm arm-00` — the witness (all four levers present).
-2. Copy `<run>/arm-00/capture/` → `test/fixtures/finetune/session-<id>/`.
+1. `node scripts/bench/run.mjs arm arm-00` — stands up the proxy route and the
+   witness config dir, and its **step 11b** proves the `.mcp.json` server connects.
+   ⚠ Its own 2-turn capture is *not* usable as a fixture: MCP tools land only from
+   turn 3 (see above). Drive a multi-tool-call prompt against the same run dir and
+   config dir, and take that session instead.
+2. Copy the session dir → `test/fixtures/finetune/session-<id>/`.
 3. Verify redaction (spec §1.3 / §3.3): denylist headers are `‹REDACTED›`, no
    `/tmp/ccsnoop-bench/…` paths in `manifest.jsonl`.
 4. `npm test` — the gate activates and must pass.

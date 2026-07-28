@@ -21,7 +21,18 @@ const mode = process.env.CCSNOOP_FAKE_MODE ?? '';
 // `node --test` discovers everything under test/ (**/test/**/*.mjs) and would
 // otherwise EXECUTE this stub as a test file. Every real call carries `-p` or
 // `--version`; anything else is the test runner, and does nothing.
-if (!argv.includes('-p') && !argv.includes('--version')) process.exit(0);
+const isMcpList = argv[0] === 'mcp' && argv[1] === 'list';
+if (!argv.includes('-p') && !argv.includes('--version') && !isMcpList) process.exit(0);
+
+if (isMcpList) {
+  // Step 11b's instrument. `mcppending` reproduces the failure that shipped a
+  // lever-less witness: a project-scoped server never approved under `-p`.
+  const status =
+    mode === 'mcppending' ? '⏸ Pending approval (run `claude` to approve)' : '✔ Connected';
+  process.stdout.write('Checking MCP server health…\n\n');
+  process.stdout.write(`stub: node ./mcp-stub.mjs - ${status}\n`);
+  process.exit(0);
+}
 
 if (argv.includes('--version')) {
   process.stdout.write('2.1.220 (Claude Code)\n');

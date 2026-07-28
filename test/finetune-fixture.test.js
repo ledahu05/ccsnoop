@@ -31,11 +31,16 @@ const FIXTURES_DIR = fileURLToPath(new URL('./fixtures/finetune', import.meta.ur
 // Bench-written lever markers — the on-wire proof of each lever. The fixture is
 // generated THROUGH the bench per issue #70's updated plan, so the bench's own
 // sentinels (bench/fixture/hook-persona.txt, bench/fixture/CLAUDE.md) and the
-// L4 MCP stub tool name (`t00`) are the evidence; scripts/bench/run.mjs asserts
-// these same markers in its lever guards.
+// L4 MCP stub tool name are the evidence; scripts/bench/run.mjs asserts these
+// same markers in its lever guards.
+//
+// The stub declares bare names (`t00`…`t63`) but the wire carries
+// `mcp__<server>__<tool>` — pinned by the first paying run, and the reason the
+// previous `/\bt00\b/` marker could never match a real capture (`_` is a word
+// char, so the word boundary never lands before `t00` in `mcp__stub__t00`).
 const PERSONA_RE = /CCSNOOP-BENCH-SENTINEL-PERSONA-[0-9a-f]+/;
 const CLAUDEMD_RE = /CCSNOOP-BENCH-SENTINEL-CLAUDEMD-[0-9a-f]+/;
-const MCP_STUB_TOOL_RE = /\bt00\b/;
+const MCP_STUB_TOOL_RE = /mcp__[a-z0-9_-]+__t\d\d\b/i;
 
 // bench-run-local roots that must not leak into a committed fixture's manifest.
 const LOCAL_PATH_RE = /\/tmp\/|\/home\/|ccsnoop-bench/i;

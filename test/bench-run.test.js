@@ -35,6 +35,10 @@ import {
   scrubCredentials,
   parseSystemInit,
   preflightSystemInit,
+  fixtureMcpServerNames,
+  parseMcpHealth,
+  assertMcpjsonServersTook,
+  mcpHealthList,
   pickFreshSession,
   readCaptureManifest,
   assertGzipObserved,
@@ -478,6 +482,99 @@ test('preflightSystemInit: fatal when no init event is emitted, or zero tools', 
   }
 });
 
+// ── step 11b: the `.mcp.json` health guard ───────────────────────────────────
+//
+// The witness's first capture shipped with ZERO stub tools on the wire: a
+// project-scoped `.mcp.json` server sits at `⏸ Pending approval` under `-p`
+// unless a settings key enables it, and `system/init` reports it as `pending`
+// (it is emitted before the handshake), so step 11 could not see it. L4 was a
+// silently empty lever, and only a lever ARM would ever have noticed — never the
+// witness, which is what the FT0 fixture is copied from.
+
+test('fixtureMcpServerNames: the server names come from the fixture, not a literal', () => {
+  assert.deepEqual(fixtureMcpServerNames(), ['stub']);
+});
+
+test('parseMcpHealth: name → status, tolerating URLs, headers and blank lines', () => {
+  const stdout =
+    'Checking MCP server health…\n' +
+    '\n' +
+    'claude.ai Exa: https://mcp.exa.ai/mcp - ✔ Connected\n' +
+    'claude.ai Canva: https://mcp.canva.com/mcp - ! Needs authentication\n' +
+    'stub: node ./mcp-stub.mjs - ⏸ Pending approval (run `claude` to approve)\n';
+  const health = parseMcpHealth(stdout);
+  assert.equal(health.stub, '⏸ Pending approval (run `claude` to approve)');
+  assert.equal(health['claude.ai Exa'], '✔ Connected');
+  assert.equal(health['claude.ai Canva'], '! Needs authentication');
+  assert.deepEqual(parseMcpHealth(''), {});
+});
+
+test('assertMcpjsonServersTook: a non-L4 arm requires the fixture server CONNECTED', () => {
+  const arm = { id: 'arm-00', settings: {} };
+  const connected = 'stub: node ./mcp-stub.mjs - ✔ Connected\n';
+  assert.deepEqual(assertMcpjsonServersTook({ stdout: connected, arm }), {
+    connected: ['stub'],
+    suppressed: [],
+  });
+
+  // The exact failure that produced a lever-less witness capture.
+  assert.throws(
+    () => assertMcpjsonServersTook({ stdout: 'stub: node ./mcp-stub.mjs - ⏸ Pending approval\n', arm }),
+    (err) => err instanceof BenchError && /enabledMcpjsonServers/.test(err.message),
+  );
+  // Absent from the listing altogether is the same failure.
+  assert.throws(() => assertMcpjsonServersTook({ stdout: '', arm }), BenchError);
+});
+
+test('assertMcpjsonServersTook: an L4 arm requires it NOT connected — the lever is the point', () => {
+  const arm = { id: 'arm-04', settings: { disabledMcpjsonServers: ['stub'] } };
+  // Observed: `disabledMcpjsonServers` drops the server from the listing entirely.
+  assert.deepEqual(assertMcpjsonServersTook({ stdout: '', arm }), {
+    connected: [],
+    suppressed: ['stub'],
+  });
+  assert.throws(
+    () => assertMcpjsonServersTook({ stdout: 'stub: node ./mcp-stub.mjs - ✔ Connected\n', arm }),
+    (err) => err instanceof BenchError && /disabledMcpjsonServers/.test(err.message),
+  );
+});
+
+test('mcpHealthList + guard: zero-token, and every manifest arm satisfies the guard', () => {
+  const run = mkTmp('mcp-health');
+  try {
+    const configDir = writeArmConfig(run, { id: 'arm-00', settings: {}, seed: 'bare' });
+    const stdout = mcpHealthList({ configDir, cwd: run, claudeBin: FAKE_CLAUDE });
+    assert.match(stdout, /stub/);
+    assert.deepEqual(assertMcpjsonServersTook({ stdout, arm: { id: 'arm-00', settings: {} } }), {
+      connected: ['stub'],
+      suppressed: [],
+    });
+  } finally {
+    fs.rmSync(run, { recursive: true, force: true });
+  }
+});
+
+test('every manifest arm declares the .mcp.json server it does not deliberately disable', () => {
+  // The regime must be identical across arms (bench/SPEC.md §1: only the measured
+  // lever may differ), so every arm that is NOT the L4 arm has to enable the
+  // fixture's server — otherwise its MCP content is missing for a reason that has
+  // nothing to do with its own lever.
+  const manifest = readManifest();
+  const names = fixtureMcpServerNames();
+  for (const arm of manifest.arms) {
+    const s = arm.settings ?? {};
+    const disabled = new Set(s.disabledMcpjsonServers ?? []);
+    const enabled = new Set(s.enabledMcpjsonServers ?? []);
+    for (const name of names) {
+      if (disabled.has(name)) continue;
+      assert.ok(
+        enabled.has(name),
+        `${arm.id}: settings must enable the .mcp.json server '${name}' (or deliberately disable it)`,
+      );
+    }
+  }
+});
+
 // ── steps 13, 16, 18: session proof, extraction, hard observations ───────────
 
 test('pickFreshSession: 0 new dirs is the session proof failing; >1 is ambiguous', () => {
@@ -680,6 +777,33 @@ test('cmdArm: an arm that captures nothing is FATAL, and still scrubs the secret
   }
 });
 
+test('cmdArm: step 11b is WIRED — an unapproved .mcp.json server is FATAL before any token', async () => {
+  const root = mkTmp('arm-mcp-pending');
+  const credsSrc = path.join(root, 'fake-creds.json');
+  fs.writeFileSync(credsSrc, '{"claudeAiOauth":{"accessToken":"not-a-real-token"}}');
+  const prev = process.env.CCSNOOP_FAKE_MODE;
+  // The exact regression: the server is declared but never approved under `-p`.
+  process.env.CCSNOOP_FAKE_MODE = 'mcppending';
+  try {
+    await assert.rejects(
+      () => cmdArm('arm-00', { root, claudeBin: FAKE_CLAUDE, credentialsPath: credsSrc }),
+      /enabledMcpjsonServers/,
+    );
+    // It fires BEFORE step 12, so nothing was captured and the secret is gone.
+    const runDir = fs
+      .readdirSync(root)
+      .map((e) => path.join(root, e))
+      .find((p) => fs.existsSync(path.join(p, 'cwd')));
+    assert.equal(fs.existsSync(path.join(runDir, 'arm-00', 'capture')), false);
+    assert.equal(fs.existsSync(path.join(runDir, 'arm-00', '.claude', '.credentials.json')), false);
+  } finally {
+    if (prev === undefined) delete process.env.CCSNOOP_FAKE_MODE;
+    else process.env.CCSNOOP_FAKE_MODE = prev;
+    await sweepOrphans(root);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── Step 19: lever integrity guards (bench/SPEC.md §4, §5) ───────────────────
 
 /** A synthetic turn-1 view: segment slots (keys + bytes) and raw request text. */
@@ -854,7 +978,13 @@ test('leverSentinels: the witness (lever null) declares none; each lever declare
   assert.equal(s03[0].text, CLAUDEMD_SENTINEL);
 
   const s04 = leverSentinels(byId('arm-04'));
-  assert.equal(s04[0].kind, 'literal'); // a stub tool name
+  assert.equal(s04[0].kind, 'literal');
+  // §10.4's open question, now closed by a paying run: the on-wire spelling is
+  // `mcp__<server>__<tool>`, never the bare name the stub declares. A bare `t00`
+  // sentinel matches nothing in a real capture (`_` is a word char, so even
+  // /\bt00\b/ misses `mcp__stub__t00`) — it would pass the witness-present half
+  // only by accident and silently fail the arm-absent half.
+  assert.equal(s04[0].text, 'mcp__stub__t00');
 
   const s06 = leverSentinels(byId('arm-06'));
   assert.equal(s06[0].kind, 'literal'); // an agent name from the loaded seed
