@@ -4,13 +4,82 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
-// --- Model split (diversity invariant: reviewer ≠ implementer model). ---------
-// impl side (planner / implementer / merger) on GLM via z.ai ; reviewer on Claude
-// opus via Anthropic. Different model on review than on impl → catches blind spots
-// the author model shares. See docs/adr/0001-sandcastle-cross-provider-split.md.
-const IMPL_MODEL = "glm-5.2[1m]";
-const REVIEW_MODEL = "claude-opus-4-8";
+// --- Model profiles. ----------------------------------------------------------
+// A *provider* is the triplet {model id, base URL, token}; that triplet is what
+// gets baked into a docker({env}). A *profile* assigns one provider to each of the
+// four roles. Picked per run via SANDCASTLE_PROFILE, `split` by default.
+//
+//   split — planner/implementer/merger on GLM via z.ai, reviewer on Opus via
+//           Anthropic. Nominal regime: the reviewer runs a different model than
+//           the implementer, so it catches blind spots the author model shares.
+//   opus  — all four roles on Opus. The model-diversity guarantee is deliberately
+//           given up; review keeps only context diversity (fresh context, distinct
+//           prompt, isolated worktree). Assumed price of the profile.
+//
+// See docs/adr/0002-sandcastle-model-profiles.md (amends ADR-0001).
+const OPUS_MODEL = "claude-opus-5";
+const GLM_MODEL = "glm-5.2[1m]";
 const ZAI_BASE_URL = "https://api.z.ai/api/anthropic";
+
+// baseUrl null → omit ANTHROPIC_BASE_URL entirely; that absence is what makes
+// claude-code hit api.anthropic.com.
+const PROVIDERS = {
+  zai: {
+    model: GLM_MODEL,
+    tokenKey: "ANTHROPIC_AUTH_TOKEN",
+    baseUrl: ZAI_BASE_URL,
+  },
+  anthropic: {
+    model: OPUS_MODEL,
+    tokenKey: "CLAUDE_CODE_OAUTH_TOKEN",
+    baseUrl: null,
+  },
+} as const;
+
+const PROFILES = {
+  split: {
+    planner: "zai",
+    implementer: "zai",
+    reviewer: "anthropic",
+    merger: "zai",
+  },
+  opus: {
+    planner: "anthropic",
+    implementer: "anthropic",
+    reviewer: "anthropic",
+    merger: "anthropic",
+  },
+} as const;
+
+type Role = "planner" | "implementer" | "reviewer" | "merger";
+type ProviderName = keyof typeof PROVIDERS;
+type Provider = (typeof PROVIDERS)[ProviderName];
+
+// Every profile must name a provider for every role — a profile missing a role, or
+// naming a provider that does not exist, is a type error rather than a run-time one.
+const _profilesAreTotal: Record<string, Record<Role, ProviderName>> = PROFILES;
+
+// --- Profile resolution. ------------------------------------------------------
+// Resolved BEFORE the secrets file is read, so a typo in SANDCASTLE_PROFILE reports
+// itself as a typo rather than as whatever the secrets file happens to be missing.
+// Unknown name throws: never fall back to `split` silently, or the typo would run
+// the wrong regime while looking like it worked.
+const PROFILE_NAME = process.env.SANDCASTLE_PROFILE ?? "split";
+if (!(PROFILE_NAME in PROFILES)) {
+  throw new Error(
+    `Unknown SANDCASTLE_PROFILE=${JSON.stringify(PROFILE_NAME)}. ` +
+      `Valid profiles: ${Object.keys(PROFILES).join(", ")}.`
+  );
+}
+const PROFILE = PROFILES[PROFILE_NAME as keyof typeof PROFILES];
+
+const ROLES = Object.keys(PROFILE) as Role[];
+const providerFor = (role: Role): Provider => PROVIDERS[PROFILE[role]];
+
+// Distinct providers this profile actually uses. Only their tokens are required:
+// making `opus` depend on a valid z.ai key it never sends would be the kind of
+// gratuitous coupling that stops people from switching profile at all.
+const requiredProviders = [...new Set(Object.values(PROFILE))];
 
 // --- S1: auth-token isolation. ------------------------------------------------
 // sandcastle's resolveEnv merges ALL of .sandcastle/.env into every sandbox, and
@@ -27,9 +96,10 @@ function loadSecrets(): Record<string, string> {
     raw = readFileSync(SECRETS_PATH, "utf8");
   } catch {
     throw new Error(
-      `Missing ${SECRETS_PATH}. Create it from .env.secrets.example with:\n` +
-        "  ANTHROPIC_AUTH_TOKEN=<z.ai key>\n" +
-        "  CLAUDE_CODE_OAUTH_TOKEN=<anthropic OAuth token>\n" +
+      `Missing ${SECRETS_PATH}. Create it from .env.secrets.example. Which keys are\n` +
+        "required depends on the active profile — only the providers it references:\n" +
+        "  ANTHROPIC_AUTH_TOKEN=<z.ai key>              (profile `split`)\n" +
+        "  CLAUDE_CODE_OAUTH_TOKEN=<anthropic OAuth token>  (profiles `split`, `opus`)\n" +
         "Auth tokens must NOT live in .sandcastle/.env (leaks to every sandbox → 401)."
     );
   }
@@ -50,69 +120,95 @@ function loadSecrets(): Record<string, string> {
 }
 
 const secrets = loadSecrets();
+
 const need = (key: string): string => {
   const v = secrets[key];
-  if (!v) throw new Error(`${key} missing in ${SECRETS_PATH}`);
+  if (!v) {
+    throw new Error(
+      `Profile \`${PROFILE_NAME}\` requires ${key}, missing in ${SECRETS_PATH}.`
+    );
+  }
   return v;
 };
 
+// Fail at startup, not at the first createSandbox. The reviewer runs per issue at
+// iteration N, *after* a full implementation cycle, and its failure is swallowed by
+// a best-effort catch — so a missing token used to surface late AND silently: the
+// run merged and nobody saw that review never happened.
+const validateTokens = () => {
+  for (const name of requiredProviders) need(PROVIDERS[name].tokenKey);
+};
+
 // Per-sandbox provider env. Baked on docker({env}); layered ON TOP of resolvedEnv.
-const zaiEnv = () => ({
-  ANTHROPIC_BASE_URL: ZAI_BASE_URL,
-  ANTHROPIC_AUTH_TOKEN: need("ANTHROPIC_AUTH_TOKEN"),
-  ANTHROPIC_DEFAULT_OPUS_MODEL: IMPL_MODEL,
-  ANTHROPIC_DEFAULT_SONNET_MODEL: IMPL_MODEL,
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: IMPL_MODEL,
+// Exactly ONE auth token per sandbox — that is invariant S1 of ADR-0001. Omitting
+// ANTHROPIC_BASE_URL entirely is what makes claude-code hit api.anthropic.com; the
+// token value is a parameter so the dry-run can print this very object with the
+// secret masked, instead of re-deriving the shape and leaving S1 unexercised.
+const buildEnv = (provider: Provider, token: string): Record<string, string> => ({
+  ...(provider.baseUrl ? { ANTHROPIC_BASE_URL: provider.baseUrl } : {}),
+  [provider.tokenKey]: token,
+  ANTHROPIC_DEFAULT_OPUS_MODEL: provider.model,
+  ANTHROPIC_DEFAULT_SONNET_MODEL: provider.model,
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.model,
 });
-const anthropicEnv = () => ({
-  // No ANTHROPIC_BASE_URL → claude-code hits api.anthropic.com (Anthropic native).
-  CLAUDE_CODE_OAUTH_TOKEN: need("CLAUDE_CODE_OAUTH_TOKEN"),
-  ANTHROPIC_DEFAULT_OPUS_MODEL: REVIEW_MODEL,
-  ANTHROPIC_DEFAULT_SONNET_MODEL: REVIEW_MODEL,
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: REVIEW_MODEL,
-});
+
+const envFor = (role: Role): Record<string, string> => {
+  const provider = providerFor(role);
+  return buildEnv(provider, need(provider.tokenKey));
+};
+
+const modelFor = (role: Role): string => providerFor(role).model;
 
 const MAX_ITERATIONS = 10;
 const MAX_PARALLEL = 4;
 
 // --- Dry-run: validate wiring without launching any agent. --------------------
+// Runs BEFORE validateTokens() so a missing token is *reported* as <MISSING>
+// rather than thrown — an unknown profile name, resolved above, still throws.
 if (process.env.SANDCASTLE_DRYRUN) {
-  console.log("[dryrun] sandcastle model-split config:");
-  console.log({
-    models: {
-      planner: IMPL_MODEL,
-      implementer: IMPL_MODEL,
-      reviewer: REVIEW_MODEL,
-      merger: IMPL_MODEL,
-    },
-    sandboxEnv: {
-      zai: {
-        ANTHROPIC_BASE_URL: ZAI_BASE_URL,
-        ANTHROPIC_AUTH_TOKEN: secrets.ANTHROPIC_AUTH_TOKEN ? "<set>" : "<MISSING>",
-        models: IMPL_MODEL,
-      },
-      anthropic: {
-        ANTHROPIC_BASE_URL: "<default api.anthropic.com>",
-        CLAUDE_CODE_OAUTH_TOKEN: secrets.CLAUDE_CODE_OAUTH_TOKEN
-          ? "<set>"
-          : "<MISSING>",
-        models: REVIEW_MODEL,
-      },
-    },
+  console.log(`[dryrun] sandcastle profile: ${PROFILE_NAME}`);
+  // depth: null — the per-role `env` is the point of this output; the default
+  // depth of 2 would collapse it to [Object].
+  console.dir({
+    roles: Object.fromEntries(
+      ROLES.map((role) => {
+        const provider = providerFor(role);
+        return [
+          role,
+          {
+            provider: PROFILE[role],
+            model: provider.model,
+            // The env actually baked into this role's sandbox, secret masked.
+            env: buildEnv(
+              provider,
+              secrets[provider.tokenKey] ? "<set>" : "<MISSING>"
+            ),
+          },
+        ];
+      })
+    ),
+    requiredTokens: Object.fromEntries(
+      requiredProviders.map((name) => {
+        const { tokenKey } = PROVIDERS[name];
+        return [tokenKey, secrets[tokenKey] ? "<set>" : "<MISSING>"];
+      })
+    ),
     MAX_ITERATIONS,
     MAX_PARALLEL,
-  });
+  }, { depth: null });
   process.exit(0);
 }
+
+validateTokens();
 
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
 
   // Phase 1: Plan — orchestrator agent analyzes issues and picks parallelizable work.
   const plan = await sandcastle.run({
-    sandbox: docker({ env: zaiEnv() }),
+    sandbox: docker({ env: envFor("planner") }),
     name: "Planner",
-    agent: sandcastle.claudeCode(IMPL_MODEL),
+    agent: sandcastle.claudeCode(modelFor("planner")),
     promptFile: "./.sandcastle/plan-prompt.md",
   });
 
@@ -163,9 +259,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     issues.map(async (issue) => {
       await acquire();
       try {
-        // --- Implement (z.ai worktree) ---
+        // --- Implement (implementer worktree) ---
         const implSandbox = await sandcastle.createSandbox({
-          sandbox: docker({ env: zaiEnv() }),
+          sandbox: docker({ env: envFor("implementer") }),
           branch: issue.branch,
           hooks: {
             host: {
@@ -177,7 +273,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         try {
           result = await implSandbox.run({
             name: "Implementer #" + issue.number,
-            agent: sandcastle.claudeCode(IMPL_MODEL),
+            agent: sandcastle.claudeCode(modelFor("implementer")),
             promptFile: "./.sandcastle/implement-prompt.md",
             promptArgs: {
               ISSUE_NUMBER: String(issue.number),
@@ -191,11 +287,14 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
         if (result.commits.length === 0) return result;
 
-        // --- Review (anthropic worktree, same branch) ---
+        // --- Review (second worktree, same branch) ---
         // Best-effort refinement: a reviewer failure must NOT reject the issue —
         // the implementer's commits already landed on the branch.
+        //
+        // Spun up UNCONDITIONALLY — do not collapse it in profile `opus` just
+        // because both envs are identical there. See ADR-0002 (D5) for why.
         const reviewSandbox = await sandcastle.createSandbox({
-          sandbox: docker({ env: anthropicEnv() }),
+          sandbox: docker({ env: envFor("reviewer") }),
           branch: issue.branch,
           hooks: {
             host: {
@@ -206,7 +305,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         try {
           await reviewSandbox.run({
             name: "Reviewer #" + issue.number,
-            agent: sandcastle.claudeCode(REVIEW_MODEL),
+            agent: sandcastle.claudeCode(modelFor("reviewer")),
             promptFile: "./.sandcastle/review-prompt.md",
             promptArgs: {
               ISSUE_NUMBER: String(issue.number),
@@ -271,10 +370,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
   // Phase 3: Merge — one agent merges all branches together.
   await sandcastle.run({
-    sandbox: docker({ env: zaiEnv() }),
+    sandbox: docker({ env: envFor("merger") }),
     name: "Merger",
     maxIterations: 10,
-    agent: sandcastle.claudeCode(IMPL_MODEL),
+    agent: sandcastle.claudeCode(modelFor("merger")),
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),

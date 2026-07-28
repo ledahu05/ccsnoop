@@ -100,6 +100,9 @@ mutating host branch state, so A2 is cleaner.
   one process and is documented in `.env.example` / `.env.secrets.example`.
 - **Invariant**: the reviewer must be a different model than the implementer.
   If the implementer ever moves to Claude, the reviewer must move off it.
+  *Generalised by [ADR-0002](0002-sandcastle-model-profiles.md): the invariant is
+  now conditional on the active profile — it holds in `split`, and is deliberately
+  given up in `opus`.*
 
 ## References
 

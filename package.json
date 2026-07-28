@@ -18,7 +18,9 @@
   "scripts": {
     "start": "node bin/ccsnoop.js start",
     "typecheck": "tsc --noEmit",
-    "test": "node --test"
+    "test": "node --test",
+    "sandcastle": "npx tsx .sandcastle/main.ts",
+    "sandcastle:opus": "SANDCASTLE_PROFILE=opus npx tsx .sandcastle/main.ts"
   },
   "license": "MIT",
   "devDependencies": {
