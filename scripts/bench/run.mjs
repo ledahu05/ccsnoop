@@ -48,7 +48,7 @@ export const ARM_ID_RE = /^arm-\d\d$/;
  * L6 is carried by `seed: bare`, not by a settings key.
  *
  * `enabledMcpjsonServers` is NOT a lever — it is part of the regime, pinned
- * identically on all 8 arms like `ENABLE_TOOL_SEARCH`. Without it a project-scoped
+ * identically on all 7 arms like `ENABLE_TOOL_SEARCH`. Without it a project-scoped
  * `.mcp.json` server stays at `⏸ Pending approval` under `-p`, its tools never
  * reach the wire, and L4 measures the removal of nothing (step 11b). */
 export const KNOWN_SETTINGS_KEYS = new Set([
@@ -935,8 +935,16 @@ export function preflightSystemInit(opts) {
 // runs for a lever ARM, never for the witness the FT0 fixture is copied from.
 //
 // `claude mcp list` does the handshake and reports the outcome. Zero tokens.
+//
+// The guard OUTLIVED the lever it was built for. #78 settled that L4 is unmeasurable
+// under `-p` (the tools reach the wire at turn 3, the diff reads request #1), so no
+// manifest arm carries `disabledMcpjsonServers` any more and the `disabled` branch
+// below is unexercised by `bench/manifest.json`. It stays: `enabledMcpjsonServers` is
+// pinned on every arm as REGIME (ADR-0003 D1), and this is the only sensor that can
+// tell a connected stub from a `⏸ Pending approval` one — the failure that shipped a
+// lever-less witness in the first place. Both directions keep their unit tests.
 
-/** MCP server names the fixture declares (the L4 lever's subject, read never guessed). */
+/** MCP server names the fixture declares, read from `.mcp.json` and never guessed. */
 export function fixtureMcpServerNames(fixtureDir = FIXTURE_DIR) {
   const file = path.join(fixtureDir, '.mcp.json');
   const names = Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers ?? {});
@@ -969,9 +977,10 @@ export function parseMcpHealth(stdout) {
 
 /**
  * Step 11b: every fixture-declared MCP server must be CONNECTED, except the ones
- * this arm deliberately disables — for those, connected would mean the L4 lever
- * did not take. Spawns nothing (the listing is passed in), so #64 fault-injects it
- * token-free; it does read the fixture's `.mcp.json` for the server names.
+ * this arm deliberately disables — for those, connected would mean the disabling
+ * did not take. No manifest arm disables one today (#78), so in practice this
+ * asserts that the stub connected. Spawns nothing (the listing is passed in), so
+ * #64 fault-injects it token-free; it does read `.mcp.json` for the server names.
  *
  * @param {{ stdout: string, arm: any, fixtureDir?: string }} opts
  * @returns {{ connected: string[], suppressed: string[] }}
@@ -992,7 +1001,7 @@ export function assertMcpjsonServersTook(opts) {
       if (isConnected) {
         throw new BenchError(
           `${arm?.id}: MCP server '${name}' is still connected despite disabledMcpjsonServers — ` +
-            `the L4 lever did not take (bench/SPEC.md §2, step 11b)`,
+            `the key did not take (bench/SPEC.md §2, step 11b)`,
         );
       }
       suppressed.push(name);
@@ -1001,7 +1010,7 @@ export function assertMcpjsonServersTook(opts) {
     if (!isConnected) {
       throw new BenchError(
         `${arm?.id}: MCP server '${name}' is ${status ?? 'absent from `claude mcp list`'} — ` +
-          `its tools will NOT reach the wire, so the L4 lever measures nothing. ` +
+          `its tools will NOT reach the wire, so the arm is off-regime. ` +
           `Add enabledMcpjsonServers: ${JSON.stringify([name])} to this arm's settings ` +
           `(bench/SPEC.md §2, step 11b)`,
       );
@@ -1028,7 +1037,7 @@ export function mcpHealthList(opts) {
 
 /**
  * Step 12 (bench/SPEC.md §2): the paying invocation, argv pinned by the spec.
- * No `--output-format`: the wire must stay byte-comparable across all 8 arms.
+ * No `--output-format`: the wire must stay byte-comparable across all 7 arms.
  * A non-zero exit is NOT fatal here — step 13 is the only session proof.
  *
  * @param {{ prompt: string, model: string, configDir: string, cwd: string,
@@ -1352,7 +1361,7 @@ export function assertDenyTargetsObserved(denyTargets, witnessTools, armId) {
  *  - `slot`:    a set of segment slot keys CC itself supplies (built-in tool names
  *               for L1); present iff EVERY slot is a turn-1 slot.
  *  - `literal`: a substring of the raw turn-1 request text (the fixture-written
- *               markers for L2/L3, a stub tool name for L4, a seed agent name for L6).
+ *               markers for L2/L3, a seed agent name for L6).
  * The integrity claim is identical for both: PRESENT in the witness, ABSENT in the
  * lever arm.
  * @typedef {{ name: string, kind: 'slot'|'literal', slots?: string[], text?: string }} Sentinel
@@ -1449,9 +1458,15 @@ function seedAgentSentinel(fixtureDir) {
  * orchestrator (skill slot names are supplied by CC and confirmed on the wire).
  *
  * L1 slots are derived from the arm's OWN `permissions.deny` (removal-scoped names
- * → `tool:<name>`), never from a list written in advance (§10.3). L4's stub tool
- * name and L6's seed agent name are literals; their exact on-wire spelling is
- * confirmed by the first paying run (#62, §10.4) — fail-closed until then.
+ * → `tool:<name>`), never from a list written in advance (§10.3). L6's seed agent
+ * name is a literal; its exact on-wire spelling is confirmed by the first paying
+ * run (#62, §10.4) — fail-closed until then.
+ *
+ * There is deliberately NO L4 sentinel. #78 settled that the MCP lever is
+ * unmeasurable under `-p`: the deferred tool listing reaches the wire at turn 3,
+ * and the lever diff reads request #1, so a `mcp__<server>__t00` sentinel could
+ * never be present in the witness — it would be a guard nothing can satisfy.
+ * L4 is now a named non-objective (§9), not a lever with a broken check.
  * @param {any} arm
  * @param {{ fixtureDir?: string }} [opts]
  * @returns {Sentinel[]}
@@ -1469,15 +1484,6 @@ export function leverSentinels(arm, opts = {}) {
   }
   if ('claudeMdExcludes' in s) {
     out.push({ name: 'L3 CLAUDE.md', kind: 'literal', text: readFixtureSentinel(fixtureDir, 'CLAUDE.md', CLAUDEMD_SENTINEL_RE) });
-  }
-  if ('disabledMcpjsonServers' in s) {
-    // A single stub tool name. §10.4's open question — bare `t00` vs
-    // `mcp__stub__t00` — is CLOSED by a paying run: the wire carries
-    // `mcp__<server>__<tool>`. The bare form matches nothing in a real capture
-    // (`_` is a word char, so even /\bt00\b/ misses `mcp__stub__t00`), which is
-    // why the server name is read from the fixture rather than written here.
-    const server = fixtureMcpServerNames(fixtureDir)[0];
-    out.push({ name: 'L4 MCP', kind: 'literal', text: `mcp__${server}__t00` });
   }
   if (arm.seed === 'bare') {
     out.push({ name: 'L6 agents', kind: 'literal', text: seedAgentSentinel(fixtureDir) });
@@ -1758,7 +1764,7 @@ export function buildProvenance({ claudeCodeVersion, model, port, timestamp, cou
     claudeCodeVersion,
     ccsnoopVersion: ccsnoopVersion(),
     model,
-    toolSearch: true, // ENABLE_TOOL_SEARCH, pinned on all 8 arms
+    toolSearch: true, // ENABLE_TOOL_SEARCH, pinned on all 7 arms
     port,
     timestamp,
     fixtureCounts: counts,
@@ -1783,13 +1789,13 @@ function gitInit(cwd) {
 
 /** The three mandatory reading notes (bench/SPEC.md §3, §6) — rendered verbatim
  * in the table so a future reader can't mistake a count-lever for a byte-lever.
- * Note 1 interpolates the declared counts (64/8 in the frozen fixture), which
- * keeps it honest rather than hard-coding a number the fixture could move. */
+ * Note 1 interpolates the declared count (8 in the frozen fixture), which keeps it
+ * honest rather than hard-coding a number the fixture could move. It reads L6 only:
+ * L4 was the other count-sized lever, and #78 removed it from the arm set. */
 export function diffNotes(fixtureCounts) {
-  const mcp = fixtureCounts?.mcpTools ?? 64;
   const agents = fixtureCounts?.seedAgents ?? 8;
   return [
-    `L4/L6 sont dimensionnés en compte (${mcp} outils / ${agents} agents), pas en octets.`,
+    `L6 est dimensionné en compte (${agents} agents), pas en octets.`,
     'Les agent-types bundled sont un plancher constant : le delta L6 ne mesure que les agents ajoutés.',
     "8 192 o d'entrée ne donnent pas des lignes de base égales sur le fil (encadrements d'injection).",
   ];
@@ -1834,11 +1840,11 @@ export function substitutions(armTurn1, witnessTurn1) {
     .map((/** @type {any} */ s) => ({ slot: s.slot, bytes: s.bytes }));
 }
 
-/** `declaredCount` (bench/SPEC.md §6): L4 is sized in MCP-tool count, L6 in
- * seed-agent count — printed beside the delta so nobody reads "MCP is a small
- * lever" when they are reading "the fixture declared 64 tools". Null otherwise. */
+/** `declaredCount` (bench/SPEC.md §6): L6 is sized in seed-agent count — printed
+ * beside the delta so nobody reads "agents are a small lever" when they are reading
+ * "the fixture declared 8 agents". Null otherwise. L4 was the other count-sized
+ * lever; #78 removed it from the arm set, so no arm can carry that lever. */
 function declaredCountFor(lever, fixtureCounts) {
-  if (lever === 'L4') return fixtureCounts?.mcpTools ?? null;
   if (lever === 'L6') return fixtureCounts?.seedAgents ?? null;
   return null;
 }
@@ -1847,7 +1853,10 @@ function declaredCountFor(lever, fixtureCounts) {
  * The integrity-sentinel descriptor recorded for a lever (bench/SPEC.md §4.2). The
  * arm.json's very existence means step 19's guards passed at capture time, so both
  * claims hold — `presentInWitness` AND `absentInArm`. Kinds only (no fixture text):
- * L1/L5 are CC-supplied slot-set diffs, L2/L3/L4/L6 are literal markers.
+ * L1/L5 are CC-supplied slot-set diffs, L2/L3/L6 are literal markers. No L4 branch:
+ * that lever left the arm set with #78, so `disabledMcpjsonServers` no longer appears
+ * in any manifest arm and describing a sentinel for it would describe a guard
+ * {@link leverSentinels} deliberately does not run.
  * @param {any} manifestArm  the manifest entry (carries `settings`/`seed`).
  * @returns {any} a single descriptor, or an array when a lever bundles several (`all`).
  */
@@ -1860,7 +1869,6 @@ export function sentinelDescriptor(manifestArm) {
     kinds.push({ name: 'L2 persona literal', kind: 'literal' });
   }
   if ('claudeMdExcludes' in s) kinds.push({ name: 'L3 CLAUDE.md literal', kind: 'literal' });
-  if ('disabledMcpjsonServers' in s) kinds.push({ name: 'L4 MCP stub literal', kind: 'literal' });
   if (s.disableBundledSkills) kinds.push({ name: 'slot-set-diff', kind: 'slot' });
   if (manifestArm?.seed === 'bare') kinds.push({ name: 'L6 seed-agent literal', kind: 'literal' });
   const withClaims = kinds.map((k) => ({ ...k, presentInWitness: true, absentInArm: true }));
@@ -2010,7 +2018,7 @@ function signed(n) {
  * SAME object, never recalculated from captures — editing `diff.json` and
  * re-rendering changes the table. Constraints enforced: degradation banner at the
  * HEAD (not a footnote), BOTH totals with the gap visible, the declared count
- * beside L4/L6, substitutions under each lever, the two global lines, the three
+ * beside L6, substitutions under each lever, the two global lines, the three
  * notes.
  * @param {any} diff
  * @returns {string}

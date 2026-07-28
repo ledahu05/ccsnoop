@@ -212,19 +212,25 @@ them at once).
 | `arm-01`| one built-in tool                 | **L1 tools**    | `permissions.deny` a tool the witness actually sends |
 | `arm-02`| the session-start hook            | **L2 hooks**    | empty out `hooks.SessionStart` |
 | `arm-03`| the project `CLAUDE.md`           | **L3 CLAUDE.md**| `claudeMdExcludes: ["CLAUDE.md"]` |
-| `arm-04`| the fixture's MCP server          | **L4 MCP**      | `disabledMcpjsonServers` |
 | `arm-05`| Claude Code's bundled skills      | **L5 skills**   | `disableBundledSkills` |
 | `arm-06`| your own agent types              | **L6 agents**   | a "bare" config dir with no added agents |
-| `arm-07`| all six at once                   | **all**         | every lever + the bare seed |
+| `arm-07`| all five at once                  | **all**         | every lever + the bare seed |
 
 Three things that often surprise beginners (all explained in [SPEC.md
 §3](SPEC.md)):
 
-- **MCP and agents are measured by *count*, not bytes.** Under
-  `ENABLE_TOOL_SEARCH`, MCP tools go across as a short deferred *list of names*,
-  so their cost scales with *how many* there are, not their schema size. The
-  table prints the declared count (64 tools, 8 agents) next to the delta so you
-  don't misread "small" as "unimportant".
+- **There is no MCP arm, on purpose.** The fixture *does* declare a 64-tool MCP
+  stub, and the bench checks it connects — but `claude -p` sends its first
+  request before the MCP handshake finishes, so those tool names only reach the
+  wire on turn 3, and the lever diff reads request #1. Measuring L4 would mean
+  lengthening the canonical prompt and re-measuring every byte figure in the
+  spec, so it was dropped instead
+  ([#78](https://github.com/ledahu05/ccsnoop/issues/78), SPEC.md §9). The MCP
+  lever still exists in the *product* (`ccsnoop fine-tune`), just not here.
+- **Agents are measured by *count*, not bytes.** Your agent types go across as a
+  short deferred *list of names*, so their cost scales with *how many* there
+  are, not their description size. The table prints the declared count (8
+  agents) next to the delta so you don't misread "small" as "unimportant".
 - **The witness is *minimal but not empty*.** It carries the hook declaration,
   because without it the hooks lever could not be measured. Each arm is the
   witness *minus one thing*.

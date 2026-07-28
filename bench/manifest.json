@@ -64,22 +64,6 @@
       "env": {}
     },
     {
-      "id": "arm-04",
-      "label": "L4 MCP",
-      "lever": "L4",
-      "seed": "loaded",
-      "settings": {
-        "enabledMcpjsonServers": ["stub"],
-        "hooks": {
-          "SessionStart": [
-            { "hooks": [{ "type": "command", "command": "cat ./hook-persona.txt" }] }
-          ]
-        },
-        "disabledMcpjsonServers": ["stub"]
-      },
-      "env": {}
-    },
-    {
       "id": "arm-05",
       "label": "L5 skills",
       "lever": "L5",
@@ -120,7 +104,6 @@
         "hooks": { "SessionStart": [] },
         "permissions": { "deny": ["Workflow"] },
         "claudeMdExcludes": ["CLAUDE.md"],
-        "disabledMcpjsonServers": ["stub"],
         "disableBundledSkills": true
       },
       "env": {}

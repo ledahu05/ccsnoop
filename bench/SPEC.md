@@ -5,8 +5,8 @@
 [#46](https://github.com/ledahu05/ccsnoop/issues/46). Aucune décision n'est prise ici : ce document
 met à plat B1–B7 et fait tomber les contradictions résiduelles. Chaque affirmation porte sa source.
 
-**Objet** : un harness de dev qui, sans intervention humaine, monte 8 environnements isolés, lance
-8 vraies sessions `claude -p` à travers le proxy ccsnoop, et compare **avant/après tuning** en
+**Objet** : un harness de dev qui, sans intervention humaine, monte 7 environnements isolés, lance
+7 vraies sessions `claude -p` à travers le proxy ccsnoop, et compare **avant/après tuning** en
 octets par bucket et en tokens de cache — prouvant que les leviers de `omniris_tuning.md` réduisent
 bien ce qui part sur le fil. Effet de bord assumé : couverture end-to-end du chemin nominal
 `start → init → claude -p → status → stop → report`.
@@ -23,7 +23,7 @@ absolue sur omniris — non reproductible par construction (B4).
 | Claude Code | `2.1.220`, linux-x64, `sdk-cli` | B1, B2, B6 |
 | Compte | `authMethod: claude.ai`, abonnement (pas `ANTHROPIC_API_KEY`) | B1 |
 | Modèle | **`claude-haiku-4-5-20251001`** — ID daté, pinné (pas l'alias) | B2, B6 |
-| Régime | `ENABLE_TOOL_SEARCH=true`, identique aux 8 bras | B7 |
+| Régime | `ENABLE_TOOL_SEARCH=true`, identique aux 7 bras | B7 |
 | ccsnoop | `readUsage` gunzippe (`src/report.js:126`) — [#53](https://github.com/ledahu05/ccsnoop/issues/53) **fermé** | ci-dessous §7 |
 | ccsnoop | `report --all` honore `CCSNOOP_HOME` — [#54](https://github.com/ledahu05/ccsnoop/issues/54) **fermé** | ci-dessous §7 |
 
@@ -89,7 +89,7 @@ gelé — B7 : L6 n'a **aucune** expression en réglage).
   d'invocations.** B2 a mesuré 2 POSTs pour une invocation du prompt canonique (le `Read` forcé
   produit le second). Lancer `claude -p` deux fois donnerait un tour 1 **chaud** au second lancement
   et détruirait la lecture de cache spécifiée en §4.
-- `env` est **identique aux 8 bras** : `ANTHROPIC_BASE_URL` (posé par `init`, relu et réinjecté dans
+- `env` est **identique aux 7 bras** : `ANTHROPIC_BASE_URL` (posé par `init`, relu et réinjecté dans
   l'env du process) + `ENABLE_TOOL_SEARCH=true`. La « minimalité » du témoin ne porte que sur
   `settings`.
 
@@ -103,7 +103,7 @@ bench/fixture/
   hook-persona.txt     8 192 o exactement   (L2, injecté par `cat ./hook-persona.txt`)
   FIXED.txt            contenu fixe, lu par le prompt canonique (B2)
   .mcp.json            1 serveur stdio → mcp-stub.mjs
-  mcp-stub.mjs         64 outils, noms courts, node nu, zéro réseau  (L4)
+  mcp-stub.mjs         64 outils, noms courts, node nu, zéro réseau  (régime, plus un levier — #78)
   seeds/loaded/agents/ 8 agents, description d'une ligne             (L6)
   seeds/bare/          (vide)
 ```
@@ -137,7 +137,7 @@ pour la table consolidée des codes de sortie).
 
 `init` et `start` reçoivent **le même `--home`**, sinon le daemon lit un `routes.json` sans route et
 ne capture rien (B1 §5). Le daemon, `init` et le cwd sont **run-scoped** : le cwd est partagé par
-les 8 bras (B4), donc il y a **une** route et **un** `init` par run. Un `arm <id>` ultérieur sur le
+les 7 bras (B4), donc il y a **une** route et **un** `init` par run. Un `arm <id>` ultérieur sur le
 même run réutilise l'infra en place ; les étapes 1–7 sont sautées si le dir de run existe déjà et
 que la garde 6 repasse au vert.
 
@@ -149,7 +149,7 @@ que la garde 6 repasse au vert.
 | 9 | **Seeding** : copier `bench/fixture/seeds/<seed>/` dans `<run>/<id>/.claude/` (donc `agents/` pour `loaded`, rien pour `bare`) | oui | B7 |
 | 10 | **Copie du secret** : `install -m 600 ~/.claude/.credentials.json <run>/<id>/.claude/` — les creds OAuth ne survivent **pas** à l'isolation (`{"loggedIn": false}`, exit 1) | oui | B1 §2 |
 | 11 | **Pré-vol `system/init` sur le répertoire même que le run live utilisera** : `claude` avec `CLAUDE_CONFIG_DIR=<run>/<id>/.claude` et un port mort, lire l'événement `system/init` (zéro token, émis avant le POST). Compter les outils. Meilleur que `claude doctor` : il compte. Sert à attraper le settings **silencieusement ignoré** sous `-p` | oui | B1 §1, B6 |
-| 11b | **Santé du `.mcp.json`** : `claude mcp list` sur le même `CLAUDE_CONFIG_DIR` (zéro token — il fait le handshake, pas de POST). Chaque serveur déclaré par `bench/fixture/.mcp.json` doit être **`✔ Connected`**, sauf ceux que le bras désactive délibérément (L4), pour lesquels « connecté » signifierait que le levier n'a pas pris. L'étape 11 est **aveugle** ici : `system/init` précède le handshake (statut `pending` dans tous les cas) et `ENABLE_TOOL_SEARCH` diffère les outils du stub hors de `event.tools`. Sans ce garde, un serveur project-scoped resté `⏸ Pending approval` sous `-p` produit une capture propre où **L4 mesure le retrait de rien** — et seul un bras levier l'aurait vu, jamais le témoin. D'où `enabledMcpjsonServers` épinglé sur les 8 bras, comme `ENABLE_TOOL_SEARCH` | oui | #72 |
+| 11b | **Santé du `.mcp.json`** : `claude mcp list` sur le même `CLAUDE_CONFIG_DIR` (zéro token — il fait le handshake, pas de POST). Chaque serveur déclaré par `bench/fixture/.mcp.json` doit être **`✔ Connected`**, sauf ceux qu'un bras désactiverait délibérément, pour lesquels « connecté » signifierait que la clé n'a pas pris — cas hypothétique depuis #78, aucun bras du manifeste ne désactive. L'étape 11 est **aveugle** ici : `system/init` précède le handshake (statut `pending` dans tous les cas) et `ENABLE_TOOL_SEARCH` diffère les outils du stub hors de `event.tools`. Sans ce garde, un serveur project-scoped resté `⏸ Pending approval` sous `-p` produit une capture propre où **L4 mesure le retrait de rien** — et seul un bras levier l'aurait vu, jamais le témoin. D'où `enabledMcpjsonServers` épinglé sur les 7 bras, comme `ENABLE_TOOL_SEARCH` : c'est du **régime** (ADR-0003 D1), et ce garde survit à la disparition du levier L4 qu'il avait été écrit pour protéger | oui | #72 |
 | 12 | **`claude -p`** : `claude -p "<prompt>" --model claude-haiku-4-5-20251001 --permission-mode bypassPermissions`, avec `CLAUDE_CONFIG_DIR=<run>/<id>/.claude`, cwd `<run>/cwd`, `ANTHROPIC_BASE_URL` + `ENABLE_TOOL_SEARCH` dans l'env du process. `bypassPermissions` ne neutralise pas `deny` (B6) | non par lui-même — voir 13 | B2, B1, B6 |
 | 13 | **Preuve de session** = **au moins un exchange capturé**, jamais `exit 0`. Un lancement cassé (creds, settings malformé) sort **exit 0 sans rien capturer** | **oui** | B5 |
 | 14 | `ccsnoop status --home <run>/ccsnoop-home` : nombre de routes = 1, uptime > 0 | oui | B5 |
@@ -183,7 +183,7 @@ séquentiels n'ont pas invalidé les creds du dev), pas une garantie.
 
 ---
 
-## 3. Les 8 bras (B3, B7)
+## 3. Les 7 bras (B3, B7)
 
 Chaque bras = témoin **+ une seule clé soustractive** — sauf `arm-06` qui est témoin **+ seed
 `bare`**, parce qu'**aucun réglage ne désactive les agent-types** sur le binaire v2.1.220 (B7 :
@@ -195,27 +195,34 @@ Chaque bras = témoin **+ une seule clé soustractive** — sauf `arm-06` qui es
 | `arm-01` | L1 tools | `permissions.deny` | diff d'ensembles de slots (noms d'outils built-in) | −35 916 o net pour 5 noms (B6) |
 | `arm-02` | L2 hooks | `hooks.SessionStart: []` | chaîne littérale de `hook-persona.txt` | ⎫ |
 | `arm-03` | L3 CLAUDE.md | `claudeMdExcludes` | chaîne littérale de `CLAUDE.md` | ⎪ ensemble dans `message#0` |
-| `arm-04` | L4 MCP | `disabledMcpjsonServers` | `mcp__<serveur>__t00` (graphie du fil, §10.4) | ⎬ = 22 919 o (B2) |
 | `arm-05` | L5 skills | `disableBundledSkills` | diff d'ensembles de slots (skills bundled) | ⎪ 8 319 o |
 | `arm-06` | L6 agents | **seed `bare`** | nom d'un agent du seed `loaded` | ⎭ 2 345 o |
-| `arm-07` | `all` | toutes les clés + seed `bare` | les 4 sentinelles absentes | — |
+| `arm-07` | `all` | toutes les clés + seed `bare` | les 3 sentinelles absentes | — |
 
-> ⚠ **L4 est actuellement inmesurable sur la requête #1 — bloquant connu, ticket ouvert.**
-> Même serveur `✔ Connected` (étape 11b), les outils MCP **n'atteignent pas le fil avant le
-> tour 3** : les tours 1 et 2 portent `The following MCP servers are still connecting … not yet
-> available`. Or le manifeste épingle `turns: 2` et le diff de levier lit la **requête #1** —
-> donc la sentinelle L4 est absente du témoin et `arm-04` échoue à l'étape 19 (§5). Le résoudre
-> demande soit d'allonger le prompt canonique et de **re-baseliner** les octets de cette table,
-> soit de déclarer L4 inmesurable sous `-p`. Conformément à §4 (« s'il manque une donnée au banc,
-> c'est un ticket produit — pas un contournement »), aucun contournement n'est appliqué ici.
+> **Il n'y a pas de bras L4 — décision prise sur [#78](https://github.com/ledahu05/ccsnoop/issues/78),
+> le levier MCP est déclaré inmesurable sous `-p`.** Le motif est mécanique : même serveur
+> `✔ Connected` (étape 11b), les outils MCP **n'atteignent pas le fil avant le tour 3** — les
+> tours 1 et 2 portent `The following MCP servers are still connecting … not yet available`. Or le
+> manifeste épingle `turns: 2` et le diff de levier lit la **requête #1**, donc la sentinelle
+> `mcp__<serveur>__t00` ne pouvait jamais être présente dans le témoin : `arm-04` échouait à
+> l'étape 19 (§5) en mesurant le retrait de rien. L'alternative — allonger le prompt canonique
+> jusqu'au tour 3 — est une décision §0 qui impose de **re-baseliner tous les octets** de cette
+> table et de §4 dans une campagne payante complète ; prix jugé trop élevé pour un levier dont
+> l'existence est couverte côté produit (`ccsnoop fine-tune`, [#74](https://github.com/ledahu05/ccsnoop/issues/74)).
+> Le levier rejoint donc §9 comme non-objectif nommé, à côté de sa moitié « connectors claude.ai »
+> déjà écartée. Le repère B2 de 22 919 o reste une mesure **amont** partagée L2/L3/L4 — jamais une
+> mesure du banc. `enabledMcpjsonServers` reste épinglé sur les 7 bras comme **régime** (ADR-0003
+> D1) et l'étape 11b reste fatale : le stub doit se connecter, on cesse seulement de prétendre
+> le **peser**.
 
 **Notes de lecture obligatoires dans la table de sortie** :
 
-- **L4/L6 sont dimensionnés en compte, pas en octets.** Sous `ENABLE_TOOL_SEARCH` les outils MCP
-  partent en **liste différée** (noms) et *les schémas ne sont jamais envoyés* — le poids est
-  fonction du **nombre** d'outils. Repère B6 : ~29 o par nom différé. Donc la table **imprime le
-  compte déclaré à côté du delta** (64 outils, 8 agents), sinon un lecteur lit « MCP = petit levier »
-  alors qu'il lit « la fixture a déclaré 64 outils ». (B7 §2)
+- **L6 est dimensionné en compte, pas en octets.** Sous `ENABLE_TOOL_SEARCH` un listing différé
+  ne porte que des **noms** et *les schémas ne sont jamais envoyés* — le poids est fonction du
+  **nombre** d'entrées. Repère B6 : ~29 o par nom différé. Donc la table **imprime le compte
+  déclaré à côté du delta** (8 agents), sinon un lecteur lit « agents = petit levier » alors qu'il
+  lit « la fixture a déclaré 8 agents ». (B7 §2) Le même raisonnement valait pour L4 et ses 64
+  outils MCP ; il n'a plus de ligne où s'appliquer depuis #78.
 - **Les agent-types bundled sont un plancher constant** présent dans tous les bras, y compris
   `arm-06` : le delta L6 mesure les agents **ajoutés**, jamais la totalité du bloc. (B7 §3)
 - **Les skills bundled ne s'effondrent pas sous config-dir isolé** — elles viennent du binaire.
@@ -360,12 +367,12 @@ sur le chiffre.
 | ≠ 0 | un ancêtre du cwd porte `CLAUDE.md` ou `.claude/` | 3 | B7 |
 | ≠ 0 | daemon injoignable depuis un **enfant spawné** (le 502 de B6) | 6 | B6 |
 | ≠ 0 | settings rejeté au pré-vol `system/init` | 11 | B1 |
-| ≠ 0 | serveur `.mcp.json` non connecté (ou connecté alors que le bras le désactive) | 11b | #72 |
+| ≠ 0 | serveur `.mcp.json` non connecté (ou connecté alors que le bras le désactive — cas hypothétique depuis #78, aucun bras ne désactive) | 11b | #72 |
 | ≠ 0 | **zéro exchange capturé** (jamais `exit 0` de `claude -p` comme preuve) | 13 | B5 |
 | ≠ 0 | capture absente / extraction impossible | 15 | B4 |
 | ≠ 0 | **gzip non observé** sur le blob de réponse | 18 | B5 |
 | ≠ 0 | requête #1 du bras **byte-identique** au témoin (knob non pris) | 19 | B7 |
-| ≠ 0 | sentinelle du levier présente dans le bras (ou absente du témoin) | 19 | B7 |
+| ≠ 0 | sentinelle du levier présente dans le bras (ou absente du témoin) — L1/L2/L3/L5/L6 ; aucune sentinelle L4 n'est déclarée (#78) | 19 | B7 |
 | ≠ 0 | listing skills du témoin vide (L5 serait un bras vide) | 19 | B7 |
 | ≠ 0 | provenance incomplète (version CC absente) | 21 | B4, B2 |
 | **0** | mesure valide — **même si le gain est nul ou négatif** | — | B4 |
@@ -420,7 +427,7 @@ post-destination au lieu de le rendre bloquant en douce.
     "claudeCodeVersion": "2.1.220",
     "ccsnoopVersion": "0.1.0",
     "model": "claude-haiku-4-5-20251001",
-    "toolSearch": true,                // régime ENABLE_TOOL_SEARCH, pinné aux 8 bras
+    "toolSearch": true,                // régime ENABLE_TOOL_SEARCH, pinné aux 7 bras
     "port": 41377,
     "timestamp": "2026-07-25T10:00:00Z",
     "fixtureCounts": { "mcpTools": 64, "seedAgents": 8 },   // déclarés par la fixture
@@ -474,7 +481,7 @@ post-destination au lieu de le rendre bloquant en douce.
       "id": "arm-01",
       "lever": "L1",
       "label": "L1 tools deny",
-      "declaredCount": null,           // renseigné pour L4 (64) et L6 (8) — imprimé à côté du delta
+      "declaredCount": null,           // renseigné pour L6 (8 agents) — imprimé à côté du delta
       "deltaBytes": {                  // net vs témoin, par bucket, sur le tour où le bucket est défini
         "readOn": "turn1",
         "system": 3, "tools": -35919, "history": 0, "currentTurn": 0,
@@ -504,7 +511,7 @@ post-destination au lieu de le rendre bloquant en douce.
   },
 
   "notes": [                           // lectures obligatoires, rendues dans la table (§3)
-    "L4/L6 sont dimensionnés en compte (64 outils / 8 agents), pas en octets.",
+    "L6 est dimensionné en compte (8 agents), pas en octets.",
     "Les agent-types bundled sont un plancher constant : le delta L6 ne mesure que les agents ajoutés.",
     "8 192 o d'entrée ne donnent pas des lignes de base égales sur le fil (encadrements d'injection)."
   ]
@@ -517,7 +524,7 @@ Dérivée du **même objet**, jamais recalculée. Contraintes :
 
 - **Bandeau de dégradation en tête, pas une note en pied**, si `degraded` est non vide.
 - **Les deux totaux imprimés** (`anatomyTotal` et `requestBytes`), avec l'écart visible.
-- **Le compte déclaré imprimé à côté du delta** pour L4 et L6.
+- **Le compte déclaré imprimé à côté du delta** pour L6 (seul levier dimensionné en compte depuis #78).
 - Une ligne par levier ; sous chaque levier, ses **substitutions**.
 - Deux lignes globales : **interaction** et, par bras, **coût de transition**.
 - Les trois `notes` rendues.
@@ -540,7 +547,7 @@ Quatre points où l'assemblage a fait tomber une contradiction ou une donnée p�
    `--home` (seule la variable d'env `CCSNOOP_HOME` est lue).
 2. **`init` et le daemon sont run-scoped, pas per-bras.** B5 décrit la séquence nominale
    `start → init → claude -p → status → stop → report` et B4 découpe en `arm <id>`. Le cwd étant
-   **partagé** par les 8 bras (B4) il n'y a qu'**une** route, donc un `init`. `arm <id>` est
+   **partagé** par les 7 bras (B4) il n'y a qu'**une** route, donc un `init`. `arm <id>` est
    idempotent sur les étapes 1–7 ; `stop` et `init --undo` vivent dans `teardown`.
 3. **`git init` dans le cwd matérialisé est compatible avec « hors de tout repo git ».** B1 le veut
    pour exercer la branche gitignore de `init` ; B7 l'interdit *dans* le repo ccsnoop. Résolu : le
@@ -560,7 +567,7 @@ Quatre points où l'assemblage a fait tomber une contradiction ou une donnée p�
 
 ## 8. Budget du run
 
-**8 bras × 2 tours = 16 requêtes réelles** (B3), un seul run par bras (B2).
+**7 bras × 2 tours = 14 requêtes réelles** (B3), un seul run par bras (B2).
 
 Estimation de **planification** — dérivée du `usage` réellement capturé en B2 (29 367 tokens de
 préfixe pour une requête #1 de 111 ko, + ~20 ko ajoutés par la fixture ⇒ ~30–35 k tokens de préfixe
@@ -578,7 +585,7 @@ $1,25 / MTok · lecture de cache $0,10 / MTok.
 | sorties (2 tours) | ~200 tok @ $5,00 | ~$0,001 |
 | **total** | | **≈ $0,05** |
 
-**Coût d'un run complet des 8 bras : ≈ $0,40.** `diff <run>` est à coût zéro (relit le disque).
+**Coût d'un run complet des 7 bras : ≈ $0,35.** `diff <run>` est à coût zéro (relit le disque).
 Rejouer un seul bras coûte ~$0,05 — c'est ce qui justifie le découpage de B4.
 
 Deux nuances : chaque bras porte un préfixe **différent** (settings différents), donc chacun paie sa
@@ -598,6 +605,7 @@ pas une économie à rechercher.
 | **Intégration CI** | Le banc exige des creds, dépense de vrais tokens et écrit des config-dirs jetables. Reste du brouillard sur la carte #46. |
 | **Référence versionnée d'un run** | Ce qu'on garde quand un run devient une référence, et sous quelle inspection (redaction des artefacts archivés) reste du brouillard sur #46. Aujourd'hui les runs sont locaux ; ccsnoop redacte déjà `Authorization`. |
 | **La moitié « connectors claude.ai » de L4** | Non reproductible sans le compte du dev, et `ANTHROPIC_API_KEY` la rend justement non mesurable (B1). `disableClaudeAiConnectors` abandonné : poids mort sous isolation (B7). |
+| **L'autre moitié de L4 — les serveurs `.mcp.json`** | `claude -p` POSTe avant la fin du handshake MCP : les outils du stub n'atteignent le fil qu'au **tour 3**, hors de portée du diff de requête #1 (`turns: 2`). Mesurable seulement en allongeant le prompt canonique, ce qui imposerait de re-baseliner tous les octets de §3/§4. Écarté sur [#78](https://github.com/ledahu05/ccsnoop/issues/78) ; le levier reste **produit** (`fine-tune`, #74), il n'est plus **pesé** par le banc. Le stub reste déclaré et gardé connecté (étape 11b) : c'est du régime, pas un levier. |
 | **L'économie absolue sur omniris** | Non reproductible par construction. Le banc prouve mécanisme et ordre de grandeur (B4). |
 | **Sous-segmenter `message#0`** | Ni dans le banc (contrat CC non documenté) ni dans `src/waste.js` (modifie le produit sous test). L'attribution est structurelle : un bras par levier (B3). |
 | **Décider ce qui compte comme waste, ou pricer un cache write** | Appartient à [#29](https://github.com/ledahu05/ccsnoop/issues/29) et [#36](https://github.com/ledahu05/ccsnoop/issues/36). Le banc mesure et compare, il ne redéfinit pas (B3). |

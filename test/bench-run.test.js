@@ -134,9 +134,21 @@ test('fixture: mcp-stub declares 64 tools, seeds/loaded/agents has 8 agents, see
 
 // ── the committed manifest (bench/SPEC.md §1) ────────────────────────────────
 
-test('manifest: the committed manifest declares 8 arms and passes pre-flight', () => {
+// 7 arms, not 8: `arm-04` (L4 MCP) left the set with #78 — the deferred MCP listing
+// reaches the wire at turn 3, the lever diff reads request #1, so the arm measured the
+// removal of nothing. L4 is a named non-objective in §9 now. No arm may carry
+// `disabledMcpjsonServers`, which is what makes the absent L4 sentinel honest rather
+// than a hole.
+test('manifest: the committed manifest declares 7 arms and passes pre-flight', () => {
   const m = readManifest(MANIFEST_PATH);
-  assert.equal(m.arms.length, 8);
+  assert.equal(m.arms.length, 7);
+  assert.equal(m.arms.filter((a) => a.id === 'arm-04').length, 0);
+  for (const arm of m.arms) {
+    assert.ok(
+      !('disabledMcpjsonServers' in arm.settings),
+      `${arm.id}: L4 is unmeasurable under -p (#78) — no arm may carry disabledMcpjsonServers`,
+    );
+  }
   assert.equal(m.prompt, 'Read the file FIXED.txt and reply with only its first word.');
   assert.equal(m.model, 'claude-haiku-4-5-20251001');
   assert.equal(m.turns, 2);
@@ -526,8 +538,11 @@ test('assertMcpjsonServersTook: a non-L4 arm requires the fixture server CONNECT
   assert.throws(() => assertMcpjsonServersTook({ stdout: '', arm }), BenchError);
 });
 
-test('assertMcpjsonServersTook: an L4 arm requires it NOT connected — the lever is the point', () => {
-  const arm = { id: 'arm-04', settings: { disabledMcpjsonServers: ['stub'] } };
+// No manifest arm disables a server since #78 dropped L4, so this direction of the
+// guard is unexercised by `bench/manifest.json` — kept because `assertMcpjsonServersTook`
+// still reads the key, and an untested branch is how the first L4 hole survived.
+test('assertMcpjsonServersTook: a disabling arm requires it NOT connected', () => {
+  const arm = { id: 'arm-xx', settings: { disabledMcpjsonServers: ['stub'] } };
   // Observed: `disabledMcpjsonServers` drops the server from the listing entirely.
   assert.deepEqual(assertMcpjsonServersTook({ stdout: '', arm }), {
     connected: [],
@@ -974,24 +989,30 @@ test('leverSentinels: the witness (lever null) declares none; each lever declare
   const s03 = leverSentinels(byId('arm-03'));
   assert.equal(s03[0].text, CLAUDEMD_SENTINEL);
 
-  const s04 = leverSentinels(byId('arm-04'));
-  assert.equal(s04[0].kind, 'literal');
-  // §10.4's open question, now closed by a paying run: the on-wire spelling is
-  // `mcp__<server>__<tool>`, never the bare name the stub declares. A bare `t00`
-  // sentinel matches nothing in a real capture (`_` is a word char, so even
-  // /\bt00\b/ misses `mcp__stub__t00`) — it would pass the witness-present half
-  // only by accident and silently fail the arm-absent half.
-  assert.equal(s04[0].text, 'mcp__stub__t00');
-
   const s06 = leverSentinels(byId('arm-06'));
   assert.equal(s06[0].kind, 'literal'); // an agent name from the loaded seed
 
-  // arm-07 (all keys + seed bare) declares all four literal/name sentinels.
+  // arm-07 (all keys + seed bare) declares THREE literal sentinels, not four: L4 left
+  // the arm set with #78. A `mcp__stub__t00` sentinel would have been unsatisfiable —
+  // the deferred MCP listing reaches the wire at turn 3, and step 19 diffs request #1,
+  // so it could never be PRESENT in the witness.
   const s07 = leverSentinels(byId('arm-07'));
   const texts07 = s07.filter((s) => s.kind === 'literal').map((s) => s.text);
   assert.ok(texts07.includes(PERSONA_SENTINEL));
   assert.ok(texts07.includes(CLAUDEMD_SENTINEL));
-  assert.equal(texts07.filter(Boolean).length, 4, 'persona, claude.md, stub tool, agent');
+  assert.equal(texts07.filter(Boolean).length, 3, 'persona, claude.md, agent');
+  assert.ok(
+    !texts07.some((t) => /^mcp__/.test(t)),
+    'no L4 sentinel may be declared — it is unsatisfiable on request #1 (#78)',
+  );
+});
+
+// A direct guard on the removal, independent of the manifest: even if a future arm
+// reintroduced `disabledMcpjsonServers`, leverSentinels must not grow an L4 sentinel
+// back, because nothing on request #1 can satisfy it.
+test('leverSentinels: disabledMcpjsonServers declares NO sentinel (#78)', () => {
+  const arm = { id: 'arm-xx', lever: 'L4', seed: 'loaded', settings: { disabledMcpjsonServers: ['stub'] } };
+  assert.deepEqual(leverSentinels(arm), []);
 });
 
 // Orchestrator — the whole step, over synthetic arm views (zero API tokens).
@@ -1068,15 +1089,19 @@ test('assertLeverIntegrity: L5 asserts the witness skills listing non-empty and 
   );
 });
 
-test('assertLeverIntegrity: arm-07 checks all four literal sentinels absent from the arm', () => {
+test('assertLeverIntegrity: arm-07 checks all three literal sentinels absent from the arm', () => {
   const m = readManifest(MANIFEST_PATH);
   const arm = m.arms.find((a) => a.id === 'arm-07');
-  const stubTool = leverSentinels(arm).filter((s) => s.kind === 'literal').map((s) => s.text)[2];
-  const agent = leverSentinels(arm).filter((s) => s.kind === 'literal').map((s) => s.text)[3];
+  // Three literals since #78 dropped L4: persona, CLAUDE.md, seed agent. Read the
+  // agent name off the LAST literal rather than a fixed index, so a future lever
+  // added ahead of L6 doesn't silently shift this to the wrong sentinel.
+  const literals = leverSentinels(arm).filter((s) => s.kind === 'literal').map((s) => s.text);
+  assert.equal(literals.length, 3);
+  const agent = literals[literals.length - 1];
   // Witness carries every sentinel; the arm (seed bare + all keys) carries none.
   const witnessView = view(
     [['tool:Workflow', 100], ['message#0', 8500]],
-    `${PERSONA_SENTINEL} ${CLAUDEMD_SENTINEL} ${stubTool} ${agent}`,
+    `${PERSONA_SENTINEL} ${CLAUDEMD_SENTINEL} ${agent}`,
   );
   const armView = view([['message#0', 120]], 'nothing subtractive survived');
   const r = assertLeverIntegrity({
@@ -1084,7 +1109,7 @@ test('assertLeverIntegrity: arm-07 checks all four literal sentinels absent from
     witnessSkills: ['skill:tdd'],
     armSkills: [],
   });
-  assert.ok(r.sentinels.length >= 4);
+  assert.ok(r.sentinels.length >= 3);
   // If any one sentinel lingers in the arm, it is FATAL.
   const armWithAgent = view([['message#0', 120]], `leaked ${agent}`);
   assert.throws(
@@ -1173,20 +1198,25 @@ test('buildLeverEntry: steadyStateTokens reads turn 2 ONLY; transitionCost is a 
   assert.equal('cacheRead' in entry.deltaBytes, false);
 });
 
-test('buildLeverEntry: declaredCount is 64 for L4 and 8 for L6, null otherwise', () => {
+// L6 is the only count-sized lever left: L4 was the other one, and #78 removed it from
+// the arm set, so a `declaredCount` of 64 MCP tools now describes nothing measurable.
+test('buildLeverEntry: declaredCount is 8 for L6, null otherwise — including L4 (#78)', () => {
   const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 1, tools: 100, history: 0, currentTurn: 1 }, request1: 200 });
   const mk = (id, lever) => buildLeverEntry({ armRecord: armRecord({ id, lever, anatomy1: { system: 1, tools: 90, history: 0, currentTurn: 1 }, request1: 190 }), witnessRecord: witness, manifestArm: {}, fixtureCounts: { mcpTools: 64, seedAgents: 8 }, cacheAvailable: false });
-  assert.equal(mk('arm-04', 'L4').declaredCount, 64);
   assert.equal(mk('arm-06', 'L6').declaredCount, 8);
   assert.equal(mk('arm-01', 'L1').declaredCount, null);
+  assert.equal(mk('arm-04', 'L4').declaredCount, null);
 });
 
-test('sentinelDescriptor: L1/L5 are slot-set diffs, L2/L3/L4/L6 literals, `all` bundles them', () => {
+test('sentinelDescriptor: L1/L5 are slot-set diffs, L2/L3/L6 literals, `all` bundles them', () => {
   assert.deepEqual(sentinelDescriptor({ settings: { permissions: { deny: ['Workflow'] } } }), { name: 'slot-set-diff', kind: 'slot', presentInWitness: true, absentInArm: true });
   assert.equal(sentinelDescriptor({ settings: { disableBundledSkills: true } }).kind, 'slot');
   assert.equal(sentinelDescriptor({ seed: 'bare' }).kind, 'literal');
   const all = sentinelDescriptor({ seed: 'bare', settings: { hooks: { SessionStart: [] }, permissions: { deny: ['Workflow'] }, claudeMdExcludes: ['CLAUDE.md'], disabledMcpjsonServers: ['stub'], disableBundledSkills: true } });
   assert.ok(Array.isArray(all) && all.length >= 4, 'the `all` arm records every sentinel it strips');
+  // …but never an L4 one, even when the key is present: #78 makes it unsatisfiable, and
+  // a descriptor claiming `presentInWitness` for it would be a false record.
+  assert.ok(!all.some((d) => /MCP/i.test(d.name)));
 });
 
 test('computeInteraction: Σ(single levers) − all, on request bytes; tokens only when cache is live', () => {
@@ -1273,12 +1303,14 @@ test('buildDiff: a null usage on ANY arm degrades the cache axis — usage is OM
 
 test('renderDiffTable: degradation banner at the HEAD, both totals, declared count, notes, no ratio', () => {
   const witness = armRecord({ id: 'arm-00', lever: null, anatomy1: { system: 100, tools: 40000, history: 0, currentTurn: 8000 }, request1: 50000, segments1: [{ slot: 'tool:Bash', bucket: 'tools', bytes: 11694 }], usage: usage2({ t1cc: 29367, t2cr: 29367 }) });
-  const l4 = armRecord({ id: 'arm-04', lever: 'L4', anatomy1: { system: 100, tools: 38000, history: 0, currentTurn: 8000 }, request1: 48000, usage: usage2({ t1cc: 20000, t2cr: 20000 }) });
+  // The declared-count vehicle is L6, not L4: since #78 L6 is the only count-sized
+  // lever, so it is the only one that can carry a `compte déclaré` cell.
+  const l6 = armRecord({ id: 'arm-06', lever: 'L6', seed: 'bare', anatomy1: { system: 100, tools: 38000, history: 0, currentTurn: 8000 }, request1: 48000, usage: usage2({ t1cc: 20000, t2cr: 20000 }) });
   const manifest = diffManifest([
     { id: 'arm-00', lever: null, seed: 'loaded', settings: {} },
-    { id: 'arm-04', lever: 'L4', seed: 'loaded', settings: { disabledMcpjsonServers: ['stub'] } },
+    { id: 'arm-06', lever: 'L6', seed: 'bare', settings: {} },
   ]);
-  const diff = buildDiff({ run: 'r', manifest, provenance: { fixtureCounts: { mcpTools: 64, seedAgents: 8 }, timestamp: 't' }, arms: [witness, l4] });
+  const diff = buildDiff({ run: 'r', manifest, provenance: { fixtureCounts: { mcpTools: 64, seedAgents: 8 }, timestamp: 't' }, arms: [witness, l6] });
   // Inject a degradation to prove it renders at the head.
   diff.degraded = [{ axis: 'cache', reason: 'usage null' }];
   const table = renderDiffTable(diff);
@@ -1287,9 +1319,9 @@ test('renderDiffTable: degradation banner at the HEAD, both totals, declared cou
   const firstArmIdx = lines.findIndex((l) => /^\s+arm-00\s+/.test(l));
   assert.ok(bannerIdx >= 0 && bannerIdx < firstArmIdx, 'banner precedes the arm rows (head, not footnote)');
   assert.match(table, /anatomy \d+ \/ request \d+/, 'both totals, gap visible');
-  assert.match(table, /compte déclaré 64/, 'the declared count sits beside the L4 delta');
+  assert.match(table, /compte déclaré 8/, 'the declared count sits beside the L6 delta');
   assert.match(table, /8 192 o d'entrée/, 'note 3 verbatim');
-  assert.match(table, /64 outils \/ 8 agents/, 'note 1 with the declared counts');
+  assert.match(table, /8 agents/, 'note 1 with the declared count');
   assert.ok(!/o\/tok|octet.?par.?token|bytes.?per.?token/i.test(table), 'no byte↔token ratio anywhere');
 });
 
@@ -1307,12 +1339,15 @@ test('renderDiffTable: is derived from diff.json alone — editing the object re
   assert.match(renderDiffTable(diff), /Δrequest -99999/);
 });
 
-test('diffNotes: exactly three, interpolating the fixture-declared counts', () => {
+test('diffNotes: exactly three, interpolating the fixture-declared seed-agent count', () => {
   const notes = diffNotes({ mcpTools: 64, seedAgents: 8 });
   assert.equal(notes.length, 3);
-  assert.equal(notes[0], 'L4/L6 sont dimensionnés en compte (64 outils / 8 agents), pas en octets.');
-  // Defaults to 64/8 when provenance lacks counts.
-  assert.match(diffNotes(undefined)[0], /64 outils \/ 8 agents/);
+  // L6 alone: naming L4 here would tell a reader the table has an MCP row to read
+  // the count against, and since #78 it has none.
+  assert.equal(notes[0], 'L6 est dimensionné en compte (8 agents), pas en octets.');
+  assert.ok(!/L4|outils/.test(notes[0]));
+  // Defaults to 8 when provenance lacks counts.
+  assert.match(diffNotes(undefined)[0], /8 agents/);
 });
 
 test('cmdDiff: reads the whole run dir off disk, writes diff.json, exits 0 (zero API)', () => {

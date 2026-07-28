@@ -27,7 +27,7 @@ The first capture passed for the persona and CLAUDE.md sentinels but carried
 
 1. A project-scoped `.mcp.json` server stays at `⏸ Pending approval` under `-p`.
    No arm enabled it, so the stub never connected at all. Fixed by pinning
-   `enabledMcpjsonServers` on all 8 arms and by bench **step 11b**, which runs
+   `enabledMcpjsonServers` on every arm and by bench **step 11b**, which runs
    `claude mcp list` (zero tokens) and refuses a run whose fixture server is not
    connected. Step 11's `system/init` is blind to this: it is emitted *before* the
    MCP handshake (status always `pending`) and `ENABLE_TOOL_SEARCH` defers the
@@ -39,12 +39,14 @@ The first capture passed for the persona and CLAUDE.md sentinels but carried
    multi-tool-call prompt rather than `bench/manifest.json`'s canonical 2-turn
    one.
 
-⚠ **Consequence for the bench, still open.** `bench/manifest.json` pins
-`turns: 2` and the lever diff reads **request #1**, so `arm-04`'s L4 sentinel can
-never be present in the witness: L4 measures the removal of nothing. Step 11b
-catches an unconnected server but not this race. Resolving it means either giving
-the canonical prompt enough turns (and re-baselining every byte figure in
-`bench/SPEC.md` §4) or declaring L4 unmeasurable under `-p`.
+**Consequence for the bench, now settled (#78).** `bench/manifest.json` pins
+`turns: 2` and the lever diff reads **request #1**, so an L4 sentinel could never
+be present in the witness. Rather than re-baseline every byte figure in
+`bench/SPEC.md` §3/§4 against a longer prompt, **L4 was declared unmeasurable
+under `-p`**: `arm-04` is gone, the bench is 7 arms, and the lever is a named
+non-objective in §9 (ADR-0003, amendment). This fixture is unaffected — it still
+carries all 64 stub tools from turn 3 on, which is what makes it, and not the
+canonical witness, the right substrate for #74's MCP work.
 
 The on-wire spelling of a stub tool is **`mcp__stub__t00`**, not the bare `t00`
 the stub declares — §10.4's open question, closed by this paying run. The old

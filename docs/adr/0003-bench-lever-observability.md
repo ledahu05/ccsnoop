@@ -34,7 +34,7 @@ that every other arm is measured against.
 
 ## Decision
 
-1. **D1 — the regime is pinned on all 8 arms, not just where a lever needs it.**
+1. **D1 — the regime is pinned on every arm, not just where a lever needs it.**
    `enabledMcpjsonServers: ["stub"]` joins `ENABLE_TOOL_SEARCH=true` as regime, not
    lever. §1 already required `env` to be identical across arms; settings that
    merely make a lever *observable* are the same kind of thing. `KNOWN_SETTINGS_KEYS`
@@ -104,6 +104,37 @@ that every other arm is measured against.
   fixed too (`root: test/fixtures` → `root: test/fixtures/finetune`): it passed the
   session dirs' *grandparent*, so that gate could never have passed whatever fixture
   landed. Unrelated defect, unavoidable in the same change.
+
+## Amendment — D5 settled: L4 is declared unmeasurable (#78, 2026-07-28)
+
+D5 left the turn-3 race open as a ticket rather than a workaround. The ticket is now
+decided, and the decision is **option 2: L4 leaves the arm set.** `arm-04` is deleted
+from `bench/manifest.json`, `disabledMcpjsonServers` is dropped from `arm-07`,
+`leverSentinels` declares no L4 sentinel, and the lever joins `bench/SPEC.md` §9 as a
+named non-objective — right beside its own "claude.ai connectors" half, which had
+already been abandoned there for a different reason. The bench is 7 arms, 14 real
+requests, ≈ $0,35 a run.
+
+**Why option 1 was rejected.** Lengthening the canonical prompt so the invocation lives
+past turn 3 is a §0 regime change, and §3/§4's byte figures are all measured on the
+current prompt (B2). Taking it would mean re-baselining every one of them inside a
+fresh paying campaign — a real cost, paid to weigh a lever whose *product* side is
+delivered elsewhere.
+
+**The corollary, stated plainly: #74 (FT4) ships an MCP lever the bench can no longer
+weigh.** `ccsnoop fine-tune` will recommend `disabledMcpjsonServers` on the strength of
+`Segment.bytes` over real captures and its own `sessionCount >= 3 AND calledCount == 0`
+guard — never on the strength of an arm delta. That is a weaker footing than the other
+five levers enjoy, and it should be read as such. The B2 benchmark of 22 919 o stays in
+§3 as an **upstream** measurement shared by L2/L3/L4; it was never a bench measurement.
+
+**What deliberately did not change.** `bench/fixture/.mcp.json`, the 64-tool stub, and
+`enabledMcpjsonServers` on every remaining arm all stay: D1 made them *regime*, and the
+committed FT0 fixture needs MCP on the wire for #74's AC #1 to be satisfiable at all.
+Step 11b stays **fatal** — it is still the only sensor that distinguishes a connected
+stub from a `⏸ Pending approval` one. Its "deliberately disabled ⇒ must not be
+connected" branch is now unexercised by the manifest; it keeps its unit test, because an
+untested branch is exactly how the original L4 hole survived.
 
 ## References
 
