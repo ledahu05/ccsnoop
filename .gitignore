@@ -3,3 +3,5 @@ sessions/
 .ccsnoop/
 *.log
 bench/runs/
+.claude/worktrees/
+.sandcastle/worktrees/
