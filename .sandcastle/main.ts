@@ -51,7 +51,11 @@ const PROFILES = {
   },
 } as const;
 
-type Role = "planner" | "implementer" | "reviewer" | "merger";
+// Single source of truth for the role vocabulary — Role is derived from it, so the
+// list and the type cannot drift apart.
+const ROLES = ["planner", "implementer", "reviewer", "merger"] as const;
+type Role = (typeof ROLES)[number];
+type ProfileName = keyof typeof PROFILES;
 type ProviderName = keyof typeof PROVIDERS;
 type Provider = (typeof PROVIDERS)[ProviderName];
 
@@ -64,16 +68,20 @@ const _profilesAreTotal: Record<string, Record<Role, ProviderName>> = PROFILES;
 // itself as a typo rather than as whatever the secrets file happens to be missing.
 // Unknown name throws: never fall back to `split` silently, or the typo would run
 // the wrong regime while looking like it worked.
+// Object.hasOwn rather than `in`: `in` walks the prototype chain, so
+// SANDCASTLE_PROFILE=toString would pass the guard and then die on an opaque
+// TypeError inside envFor() instead of naming the valid profiles.
+const isProfileName = (name: string): name is ProfileName => Object.hasOwn(PROFILES, name);
+
 const PROFILE_NAME = process.env.SANDCASTLE_PROFILE ?? "split";
-if (!(PROFILE_NAME in PROFILES)) {
+if (!isProfileName(PROFILE_NAME)) {
   throw new Error(
     `Unknown SANDCASTLE_PROFILE=${JSON.stringify(PROFILE_NAME)}. ` +
       `Valid profiles: ${Object.keys(PROFILES).join(", ")}.`
   );
 }
-const PROFILE = PROFILES[PROFILE_NAME as keyof typeof PROFILES];
+const PROFILE = PROFILES[PROFILE_NAME];
 
-const ROLES = Object.keys(PROFILE) as Role[];
 const providerFor = (role: Role): Provider => PROVIDERS[PROFILE[role]];
 
 // Distinct providers this profile actually uses. Only their tokens are required:
