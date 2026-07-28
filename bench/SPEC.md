@@ -195,10 +195,19 @@ Chaque bras = témoin **+ une seule clé soustractive** — sauf `arm-06` qui es
 | `arm-01` | L1 tools | `permissions.deny` | diff d'ensembles de slots (noms d'outils built-in) | −35 916 o net pour 5 noms (B6) |
 | `arm-02` | L2 hooks | `hooks.SessionStart: []` | chaîne littérale de `hook-persona.txt` | ⎫ |
 | `arm-03` | L3 CLAUDE.md | `claudeMdExcludes` | chaîne littérale de `CLAUDE.md` | ⎪ ensemble dans `message#0` |
-| `arm-04` | L4 MCP | `disabledMcpjsonServers` | nom d'un outil du stub | ⎬ = 22 919 o (B2) |
+| `arm-04` | L4 MCP | `disabledMcpjsonServers` | `mcp__<serveur>__t00` (graphie du fil, §10.4) | ⎬ = 22 919 o (B2) |
 | `arm-05` | L5 skills | `disableBundledSkills` | diff d'ensembles de slots (skills bundled) | ⎪ 8 319 o |
 | `arm-06` | L6 agents | **seed `bare`** | nom d'un agent du seed `loaded` | ⎭ 2 345 o |
 | `arm-07` | `all` | toutes les clés + seed `bare` | les 4 sentinelles absentes | — |
+
+> ⚠ **L4 est actuellement inmesurable sur la requête #1 — bloquant connu, ticket ouvert.**
+> Même serveur `✔ Connected` (étape 11b), les outils MCP **n'atteignent pas le fil avant le
+> tour 3** : les tours 1 et 2 portent `The following MCP servers are still connecting … not yet
+> available`. Or le manifeste épingle `turns: 2` et le diff de levier lit la **requête #1** —
+> donc la sentinelle L4 est absente du témoin et `arm-04` échoue à l'étape 19 (§5). Le résoudre
+> demande soit d'allonger le prompt canonique et de **re-baseliner** les octets de cette table,
+> soit de déclarer L4 inmesurable sous `-p`. Conformément à §4 (« s'il manque une donnée au banc,
+> c'est un ticket produit — pas un contournement »), aucun contournement n'est appliqué ici.
 
 **Notes de lecture obligatoires dans la table de sortie** :
 

@@ -870,35 +870,47 @@ export function parseSystemInit(stdout) {
 }
 
 /**
- * Step 11 (bench/SPEC.md §2): run `claude` against a DEAD port and read the
- * `system/init` event, which CC emits before any POST — zero tokens. Counting
- * the tools beats `claude doctor`, and running against the very config dir the
- * live run will use is what catches a settings file silently ignored under `-p`.
+ * Every zero-token probe of a config dir: `claude` pointed at the DEAD port, on
+ * the very dir the live run will use. Shared by steps 11 and 11b so the reason it
+ * is free — and the reason its exit code means nothing — is stated once.
  *
- * ⚠ The exit code is deliberately ignored. Pointed at a dead port, `claude`
- * emits `system/init`, then fails the POST and exits non-zero EVERY time — a
- * guard that checked the status would fail 100% of runs. The evidence is the
- * event, not the exit code.
+ * ⚠ The exit code is deliberately ignored. Against a dead port `claude` does its
+ * local work, then fails the POST and exits non-zero EVERY time; a guard that
+ * checked the status would fail 100% of runs. The evidence is always the stdout.
+ *
+ * @param {{ configDir: string, cwd: string, args: string[], claudeBin?: string,
+ *           spawnFn?: typeof spawnSync, timeoutMs?: number }} opts
+ * @returns {string} stdout
+ */
+function probeClaude(opts) {
+  const spawnFn = opts.spawnFn ?? spawnSync;
+  const res = spawnFn(opts.claudeBin ?? 'claude', opts.args, {
+    cwd: opts.cwd,
+    encoding: 'utf8',
+    timeout: opts.timeoutMs ?? PREFLIGHT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024 * 1024,
+    env: claudeEnv({ configDir: opts.configDir, baseUrl: `http://127.0.0.1:${DEAD_PORT}` }),
+  });
+  return res.stdout ?? '';
+}
+
+/**
+ * Step 11 (bench/SPEC.md §2): read the `system/init` event, which CC emits before
+ * any POST — zero tokens. Counting the tools beats `claude doctor`, and running
+ * against the very config dir the live run will use is what catches a settings
+ * file silently ignored under `-p`.
  *
  * @param {{ configDir: string, cwd: string, model: string, claudeBin?: string,
  *           spawnFn?: typeof spawnSync, timeoutMs?: number }} opts
  * @returns {{ toolCount: number, tools: string[], mcpServers: any[], event: any }}
  */
 export function preflightSystemInit(opts) {
-  const { configDir, cwd, model } = opts;
-  const spawnFn = opts.spawnFn ?? spawnSync;
-  const res = spawnFn(
-    opts.claudeBin ?? 'claude',
-    ['-p', 'preflight', '--model', model, '--output-format', 'stream-json', '--verbose'],
-    {
-      cwd,
-      encoding: 'utf8',
-      timeout: opts.timeoutMs ?? PREFLIGHT_TIMEOUT_MS,
-      maxBuffer: 64 * 1024 * 1024,
-      env: claudeEnv({ configDir, baseUrl: `http://127.0.0.1:${DEAD_PORT}` }),
-    },
-  );
-  const event = parseSystemInit(res.stdout ?? '');
+  const { configDir } = opts;
+  const stdout = probeClaude({
+    ...opts,
+    args: ['-p', 'preflight', '--model', opts.model, '--output-format', 'stream-json', '--verbose'],
+  });
+  const event = parseSystemInit(stdout);
   if (!event) {
     throw new BenchError(
       `system/init pre-flight emitted no init event for ${configDir} — settings rejected (bench/SPEC.md §5, step 11)`,
@@ -958,7 +970,8 @@ export function parseMcpHealth(stdout) {
 /**
  * Step 11b: every fixture-declared MCP server must be CONNECTED, except the ones
  * this arm deliberately disables — for those, connected would mean the L4 lever
- * did not take. Pure over the supplied stdout, so it fault-injects token-free.
+ * did not take. Spawns nothing (the listing is passed in), so #64 fault-injects it
+ * token-free; it does read the fixture's `.mcp.json` for the server names.
  *
  * @param {{ stdout: string, arm: any, fixtureDir?: string }} opts
  * @returns {{ connected: string[], suppressed: string[] }}
@@ -1008,19 +1021,7 @@ export function assertMcpjsonServersTook(opts) {
  * @returns {string}
  */
 export function mcpHealthList(opts) {
-  const spawnFn = opts.spawnFn ?? spawnSync;
-  const res = spawnFn(
-    opts.claudeBin ?? 'claude',
-    ['mcp', 'list'],
-    {
-      cwd: opts.cwd,
-      encoding: 'utf8',
-      timeout: opts.timeoutMs ?? PREFLIGHT_TIMEOUT_MS,
-      maxBuffer: 8 * 1024 * 1024,
-      env: claudeEnv({ configDir: opts.configDir, baseUrl: `http://127.0.0.1:${DEAD_PORT}` }),
-    },
-  );
-  return res.stdout ?? '';
+  return probeClaude({ ...opts, args: ['mcp', 'list'] });
 }
 
 // ── Step 12: the live run (SPENDS TOKENS) ────────────────────────────────────

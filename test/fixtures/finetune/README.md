@@ -10,9 +10,10 @@ tickets (T1–T7, `docs/fine-tune-spec.md`) test against.
 `session-963204f5-937b-4a13-b658-f1cbffd21421/` — **6 exchanges**, lever-complete,
 produced through the bench on a host with claude.ai OAuth (proxy route → the
 witness's isolated `CLAUDE_CONFIG_DIR`, materialized `bench/fixture/` cwd,
-`claude-haiku-4-5-20251001`, `ENABLE_TOOL_SEARCH=true`). Turn 1 carries all four
-levers; turn 6 carries none of the response-side `tool_use`, which is what makes
-the fixture exercise both branches.
+`claude-haiku-4-5-20251001`, `ENABLE_TOOL_SEARCH=true`). Turns 1–5 each decode to a
+`tool_use` response; **turn 6 has none** — that is the no-`tool_use` turn the
+response-decoding ticket (#72) needs, so the fixture exercises both branches.
+The MCP lever is present from turn 3 on (see below).
 
 The acceptance criteria (AC #1–#4) are encoded as a self-activating gate in
 `test/finetune-fixture.test.js`: it self-skips while this dir has no `session-*`

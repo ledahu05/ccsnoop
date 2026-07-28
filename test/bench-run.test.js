@@ -491,8 +491,8 @@ test('preflightSystemInit: fatal when no init event is emitted, or zero tools', 
 // silently empty lever, and only a lever ARM would ever have noticed — never the
 // witness, which is what the FT0 fixture is copied from.
 
-test('fixtureMcpServerNames: the server names come from the fixture, not a literal', () => {
-  assert.deepEqual(fixtureMcpServerNames(), ['stub']);
+test('bench/fixture/.mcp.json declares exactly one server, and step 11b reads it from there', () => {
+  assert.deepEqual(fixtureMcpServerNames(FIXTURE_DIR), ['stub']);
 });
 
 test('parseMcpHealth: name → status, tolerating URLs, headers and blank lines', () => {
@@ -539,34 +539,31 @@ test('assertMcpjsonServersTook: an L4 arm requires it NOT connected — the leve
   );
 });
 
-test('mcpHealthList + guard: zero-token, and every manifest arm satisfies the guard', () => {
+test('mcpHealthList: reads the listing from the config dir the live run will use', () => {
   const run = mkTmp('mcp-health');
   try {
     const configDir = writeArmConfig(run, { id: 'arm-00', settings: {}, seed: 'bare' });
-    const stdout = mcpHealthList({ configDir, cwd: run, claudeBin: FAKE_CLAUDE });
-    assert.match(stdout, /stub/);
-    assert.deepEqual(assertMcpjsonServersTook({ stdout, arm: { id: 'arm-00', settings: {} } }), {
-      connected: ['stub'],
-      suppressed: [],
-    });
+    assert.match(mcpHealthList({ configDir, cwd: run, claudeBin: FAKE_CLAUDE }), /stub/);
   } finally {
     fs.rmSync(run, { recursive: true, force: true });
   }
 });
 
-test('every manifest arm declares the .mcp.json server it does not deliberately disable', () => {
+test('every manifest arm enables the .mcp.json server it does not deliberately disable', () => {
   // The regime must be identical across arms (bench/SPEC.md §1: only the measured
-  // lever may differ), so every arm that is NOT the L4 arm has to enable the
-  // fixture's server — otherwise its MCP content is missing for a reason that has
-  // nothing to do with its own lever.
-  const manifest = readManifest();
-  const names = fixtureMcpServerNames();
-  for (const arm of manifest.arms) {
+  // lever may differ), so an arm that neither enables nor disables the fixture's
+  // server is missing its MCP content for a reason that has nothing to do with its
+  // own lever. That is the defect that shipped a lever-less witness.
+  //
+  // Step 11b cannot stand in for this check: it judges the OBSERVED health, and
+  // these settings are the cause of that health, not the effect. Only a run on a
+  // real `claude` would connect the two, and this file is token-free by design.
+  const names = fixtureMcpServerNames(FIXTURE_DIR);
+  for (const arm of readManifest().arms) {
     const s = arm.settings ?? {};
     const disabled = new Set(s.disabledMcpjsonServers ?? []);
     const enabled = new Set(s.enabledMcpjsonServers ?? []);
-    for (const name of names) {
-      if (disabled.has(name)) continue;
+    for (const name of names.filter((n) => !disabled.has(n))) {
       assert.ok(
         enabled.has(name),
         `${arm.id}: settings must enable the .mcp.json server '${name}' (or deliberately disable it)`,
