@@ -144,10 +144,21 @@ scope. They live in this ADR and in the code.
   "test"]`), so this code is not covered by `npm run typecheck`. Known limit, left
   as is.
 
+## Amendment — run bounds are env-overridable too
+
+`MAX_ITERATIONS` / `MAX_PARALLEL` were hardcoded at 10 / 4. They are now read from
+`SANDCASTLE_MAX_ITERATIONS` / `SANDCASTLE_MAX_PARALLEL`, same defaults, same doctrine
+as D2's profile resolution: **throw on an unparseable value, never fall back**. The
+motivation is D-specific to this ADR — `opus` multiplies the cost of every role, so a
+first run on a new profile wants a bound, and a silent fallback to ten iterations of
+all-Opus is exactly the failure the strictness exists to prevent. Both values were
+already printed by the D9 dry-run, which remains the only verification (no test seam
+was added, for the same reason D9 gives).
+
 ## References
 
 - `.sandcastle/main.ts` — `PROVIDERS` / `PROFILES` tables, profile resolution,
-  `validateTokens`, `envFor` / `modelFor`
+  `validateTokens`, `envFor` / `modelFor`, `intFromEnv` run bounds
 - [ADR-0001](0001-sandcastle-cross-provider-split.md) — invariants A2 (two
   sequential worktrees) and S1 (one auth token per sandbox), both preserved
 - `sandcastle-model-profiles.md` (repo root) — the full grilling record behind these

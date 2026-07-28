@@ -44,12 +44,18 @@ export class BenchError extends Error {}
 export const ARM_ID_RE = /^arm-\d\d$/;
 
 /** Settings keys the manifest may carry — an unknown key is a fatal pre-flight
- * error (bench/SPEC.md §2 step 1, §5). Five keys for six levers of §3: L6 is
- * carried by `seed: bare`, not by a settings key. */
+ * error (bench/SPEC.md §2 step 1, §5). Five of them carry the six levers of §3:
+ * L6 is carried by `seed: bare`, not by a settings key.
+ *
+ * `enabledMcpjsonServers` is NOT a lever — it is part of the regime, pinned
+ * identically on all 8 arms like `ENABLE_TOOL_SEARCH`. Without it a project-scoped
+ * `.mcp.json` server stays at `⏸ Pending approval` under `-p`, its tools never
+ * reach the wire, and L4 measures the removal of nothing (step 11b). */
 export const KNOWN_SETTINGS_KEYS = new Set([
   'hooks',
   'permissions',
   'claudeMdExcludes',
+  'enabledMcpjsonServers',
   'disabledMcpjsonServers',
   'disableBundledSkills',
 ]);
@@ -639,6 +645,16 @@ export async function runArmCapture(opts) {
       spawnFn: opts.spawnFn,
     });
 
+    // Step 11b — the `.mcp.json` health guard (fatal). Step 11 is blind to it:
+    // `system/init` predates the MCP handshake and `ENABLE_TOOL_SEARCH` defers the
+    // stub's tools out of `event.tools`. Without this, a witness whose MCP server
+    // was never approved captures cleanly and L4 measures nothing.
+    const mcpHealth = assertMcpjsonServersTook({
+      stdout: mcpHealthList({ configDir, cwd, claudeBin, spawnFn: opts.spawnFn }),
+      arm,
+      fixtureDir: opts.fixtureDir ?? FIXTURE_DIR,
+    });
+
     // Snapshot AFTER the reachability guard: its GET is forwarded upstream and
     // leaves a `proxy-<stamp>` session dir, which belongs in `before`.
     const before = listSessionDirs(captureRoot);
@@ -718,6 +734,7 @@ export async function runArmCapture(opts) {
       sessionId,
       turns: lines.length,
       toolCount: preflight.toolCount,
+      mcpHealth,
       claudeExit: run.code,
       record,
       provenance,
@@ -853,35 +870,47 @@ export function parseSystemInit(stdout) {
 }
 
 /**
- * Step 11 (bench/SPEC.md §2): run `claude` against a DEAD port and read the
- * `system/init` event, which CC emits before any POST — zero tokens. Counting
- * the tools beats `claude doctor`, and running against the very config dir the
- * live run will use is what catches a settings file silently ignored under `-p`.
+ * Every zero-token probe of a config dir: `claude` pointed at the DEAD port, on
+ * the very dir the live run will use. Shared by steps 11 and 11b so the reason it
+ * is free — and the reason its exit code means nothing — is stated once.
  *
- * ⚠ The exit code is deliberately ignored. Pointed at a dead port, `claude`
- * emits `system/init`, then fails the POST and exits non-zero EVERY time — a
- * guard that checked the status would fail 100% of runs. The evidence is the
- * event, not the exit code.
+ * ⚠ The exit code is deliberately ignored. Against a dead port `claude` does its
+ * local work, then fails the POST and exits non-zero EVERY time; a guard that
+ * checked the status would fail 100% of runs. The evidence is always the stdout.
+ *
+ * @param {{ configDir: string, cwd: string, args: string[], claudeBin?: string,
+ *           spawnFn?: typeof spawnSync, timeoutMs?: number }} opts
+ * @returns {string} stdout
+ */
+function probeClaude(opts) {
+  const spawnFn = opts.spawnFn ?? spawnSync;
+  const res = spawnFn(opts.claudeBin ?? 'claude', opts.args, {
+    cwd: opts.cwd,
+    encoding: 'utf8',
+    timeout: opts.timeoutMs ?? PREFLIGHT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024 * 1024,
+    env: claudeEnv({ configDir: opts.configDir, baseUrl: `http://127.0.0.1:${DEAD_PORT}` }),
+  });
+  return res.stdout ?? '';
+}
+
+/**
+ * Step 11 (bench/SPEC.md §2): read the `system/init` event, which CC emits before
+ * any POST — zero tokens. Counting the tools beats `claude doctor`, and running
+ * against the very config dir the live run will use is what catches a settings
+ * file silently ignored under `-p`.
  *
  * @param {{ configDir: string, cwd: string, model: string, claudeBin?: string,
  *           spawnFn?: typeof spawnSync, timeoutMs?: number }} opts
  * @returns {{ toolCount: number, tools: string[], mcpServers: any[], event: any }}
  */
 export function preflightSystemInit(opts) {
-  const { configDir, cwd, model } = opts;
-  const spawnFn = opts.spawnFn ?? spawnSync;
-  const res = spawnFn(
-    opts.claudeBin ?? 'claude',
-    ['-p', 'preflight', '--model', model, '--output-format', 'stream-json', '--verbose'],
-    {
-      cwd,
-      encoding: 'utf8',
-      timeout: opts.timeoutMs ?? PREFLIGHT_TIMEOUT_MS,
-      maxBuffer: 64 * 1024 * 1024,
-      env: claudeEnv({ configDir, baseUrl: `http://127.0.0.1:${DEAD_PORT}` }),
-    },
-  );
-  const event = parseSystemInit(res.stdout ?? '');
+  const { configDir } = opts;
+  const stdout = probeClaude({
+    ...opts,
+    args: ['-p', 'preflight', '--model', opts.model, '--output-format', 'stream-json', '--verbose'],
+  });
+  const event = parseSystemInit(stdout);
   if (!event) {
     throw new BenchError(
       `system/init pre-flight emitted no init event for ${configDir} — settings rejected (bench/SPEC.md §5, step 11)`,
@@ -892,6 +921,107 @@ export function preflightSystemInit(opts) {
     throw new BenchError(`system/init pre-flight counted 0 tools for ${configDir}`);
   }
   return { toolCount: tools.length, tools, mcpServers: event.mcp_servers ?? [], event };
+}
+
+// ── Step 11b: the `.mcp.json` health guard (fatal) ───────────────────────────
+//
+// Step 11 cannot see this one. `system/init` is emitted BEFORE the MCP handshake,
+// so it reports the fixture's server as `{"name":"stub","status":"pending"}`
+// whether or not it will ever connect; and under `ENABLE_TOOL_SEARCH` the stub's
+// tools are deferred, so they never appear in `event.tools` either. The witness's
+// first capture therefore shipped with ZERO stub tools on the wire — a project-
+// scoped `.mcp.json` server stays at `⏸ Pending approval` under `-p` until a
+// settings key enables it — and nothing complained: step 19's L4 sentinel only
+// runs for a lever ARM, never for the witness the FT0 fixture is copied from.
+//
+// `claude mcp list` does the handshake and reports the outcome. Zero tokens.
+
+/** MCP server names the fixture declares (the L4 lever's subject, read never guessed). */
+export function fixtureMcpServerNames(fixtureDir = FIXTURE_DIR) {
+  const file = path.join(fixtureDir, '.mcp.json');
+  const names = Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers ?? {});
+  if (names.length === 0) throw new BenchError(`${file} declares no mcpServers`);
+  return names.sort();
+}
+
+/**
+ * `claude mcp list` stdout → `{ [serverName]: statusText }`. Lines are
+ * `<name>: <target> - <status>`; the target may itself contain ` - ` and `: `,
+ * so the split is on the LAST ` - ` and the FIRST `: `. Header and blank lines
+ * carry no ` - ` and drop out.
+ * @param {string} stdout
+ * @returns {Record<string, string>}
+ */
+export function parseMcpHealth(stdout) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const line of String(stdout).split('\n')) {
+    const trimmed = line.trim();
+    const sep = trimmed.lastIndexOf(' - ');
+    if (sep === -1) continue;
+    const head = trimmed.slice(0, sep);
+    const colon = head.indexOf(': ');
+    if (colon === -1) continue;
+    out[head.slice(0, colon).trim()] = trimmed.slice(sep + 3).trim();
+  }
+  return out;
+}
+
+/**
+ * Step 11b: every fixture-declared MCP server must be CONNECTED, except the ones
+ * this arm deliberately disables — for those, connected would mean the L4 lever
+ * did not take. Spawns nothing (the listing is passed in), so #64 fault-injects it
+ * token-free; it does read the fixture's `.mcp.json` for the server names.
+ *
+ * @param {{ stdout: string, arm: any, fixtureDir?: string }} opts
+ * @returns {{ connected: string[], suppressed: string[] }}
+ */
+export function assertMcpjsonServersTook(opts) {
+  const { stdout, arm } = opts;
+  const health = parseMcpHealth(stdout);
+  const disabled = new Set(arm?.settings?.disabledMcpjsonServers ?? []);
+  /** @type {string[]} */
+  const connected = [];
+  /** @type {string[]} */
+  const suppressed = [];
+
+  for (const name of fixtureMcpServerNames(opts.fixtureDir)) {
+    const status = health[name];
+    const isConnected = status !== undefined && /Connected/i.test(status);
+    if (disabled.has(name)) {
+      if (isConnected) {
+        throw new BenchError(
+          `${arm?.id}: MCP server '${name}' is still connected despite disabledMcpjsonServers — ` +
+            `the L4 lever did not take (bench/SPEC.md §2, step 11b)`,
+        );
+      }
+      suppressed.push(name);
+      continue;
+    }
+    if (!isConnected) {
+      throw new BenchError(
+        `${arm?.id}: MCP server '${name}' is ${status ?? 'absent from `claude mcp list`'} — ` +
+          `its tools will NOT reach the wire, so the L4 lever measures nothing. ` +
+          `Add enabledMcpjsonServers: ${JSON.stringify([name])} to this arm's settings ` +
+          `(bench/SPEC.md §2, step 11b)`,
+      );
+    }
+    connected.push(name);
+  }
+  return { connected, suppressed };
+}
+
+/**
+ * Step 11b's impure half: `claude mcp list` on the very config dir the live run
+ * will use. Dead port like step 11 — the handshake is local to the stub, and no
+ * POST is made. The exit code is ignored: the listing is the evidence.
+ *
+ * @param {{ configDir: string, cwd: string, claudeBin?: string,
+ *           spawnFn?: typeof spawnSync, timeoutMs?: number }} opts
+ * @returns {string}
+ */
+export function mcpHealthList(opts) {
+  return probeClaude({ ...opts, args: ['mcp', 'list'] });
 }
 
 // ── Step 12: the live run (SPENDS TOKENS) ────────────────────────────────────
@@ -1341,9 +1471,13 @@ export function leverSentinels(arm, opts = {}) {
     out.push({ name: 'L3 CLAUDE.md', kind: 'literal', text: readFixtureSentinel(fixtureDir, 'CLAUDE.md', CLAUDEMD_SENTINEL_RE) });
   }
   if ('disabledMcpjsonServers' in s) {
-    // A single stub tool name (t00…t63). Its on-wire spelling (bare `t00` vs
-    // `mcp__stub__t00`) is pinned by #62's first paying run (§10.4).
-    out.push({ name: 'L4 MCP', kind: 'literal', text: 't00' });
+    // A single stub tool name. §10.4's open question — bare `t00` vs
+    // `mcp__stub__t00` — is CLOSED by a paying run: the wire carries
+    // `mcp__<server>__<tool>`. The bare form matches nothing in a real capture
+    // (`_` is a word char, so even /\bt00\b/ misses `mcp__stub__t00`), which is
+    // why the server name is read from the fixture rather than written here.
+    const server = fixtureMcpServerNames(fixtureDir)[0];
+    out.push({ name: 'L4 MCP', kind: 'literal', text: `mcp__${server}__t00` });
   }
   if (arm.seed === 'bare') {
     out.push({ name: 'L6 agents', kind: 'literal', text: seedAgentSentinel(fixtureDir) });
@@ -2031,6 +2165,12 @@ async function main(argv) {
       console.log(`  (--infra-only: steps 8–21 skipped, no tokens spent)`);
     } else {
       console.log(`  pre-flight tools: ${r.toolCount}`);
+      console.log(
+        `  .mcp.json: ${r.mcpHealth.connected.length} connected` +
+          (r.mcpHealth.suppressed.length
+            ? `, ${r.mcpHealth.suppressed.join(', ')} suppressed by this arm`
+            : ''),
+      );
       console.log(`  session: ${r.sessionId} (${r.turns} exchange${r.turns === 1 ? '' : 's'})`);
       console.log(`  capture: ${r.captureDir}`);
       console.log(`  arm.json: ${path.join(r.armDir, 'arm.json')}`);

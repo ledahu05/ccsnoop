@@ -149,6 +149,7 @@ que la garde 6 repasse au vert.
 | 9 | **Seeding** : copier `bench/fixture/seeds/<seed>/` dans `<run>/<id>/.claude/` (donc `agents/` pour `loaded`, rien pour `bare`) | oui | B7 |
 | 10 | **Copie du secret** : `install -m 600 ~/.claude/.credentials.json <run>/<id>/.claude/` — les creds OAuth ne survivent **pas** à l'isolation (`{"loggedIn": false}`, exit 1) | oui | B1 §2 |
 | 11 | **Pré-vol `system/init` sur le répertoire même que le run live utilisera** : `claude` avec `CLAUDE_CONFIG_DIR=<run>/<id>/.claude` et un port mort, lire l'événement `system/init` (zéro token, émis avant le POST). Compter les outils. Meilleur que `claude doctor` : il compte. Sert à attraper le settings **silencieusement ignoré** sous `-p` | oui | B1 §1, B6 |
+| 11b | **Santé du `.mcp.json`** : `claude mcp list` sur le même `CLAUDE_CONFIG_DIR` (zéro token — il fait le handshake, pas de POST). Chaque serveur déclaré par `bench/fixture/.mcp.json` doit être **`✔ Connected`**, sauf ceux que le bras désactive délibérément (L4), pour lesquels « connecté » signifierait que le levier n'a pas pris. L'étape 11 est **aveugle** ici : `system/init` précède le handshake (statut `pending` dans tous les cas) et `ENABLE_TOOL_SEARCH` diffère les outils du stub hors de `event.tools`. Sans ce garde, un serveur project-scoped resté `⏸ Pending approval` sous `-p` produit une capture propre où **L4 mesure le retrait de rien** — et seul un bras levier l'aurait vu, jamais le témoin. D'où `enabledMcpjsonServers` épinglé sur les 8 bras, comme `ENABLE_TOOL_SEARCH` | oui | #72 |
 | 12 | **`claude -p`** : `claude -p "<prompt>" --model claude-haiku-4-5-20251001 --permission-mode bypassPermissions`, avec `CLAUDE_CONFIG_DIR=<run>/<id>/.claude`, cwd `<run>/cwd`, `ANTHROPIC_BASE_URL` + `ENABLE_TOOL_SEARCH` dans l'env du process. `bypassPermissions` ne neutralise pas `deny` (B6) | non par lui-même — voir 13 | B2, B1, B6 |
 | 13 | **Preuve de session** = **au moins un exchange capturé**, jamais `exit 0`. Un lancement cassé (creds, settings malformé) sort **exit 0 sans rien capturer** | **oui** | B5 |
 | 14 | `ccsnoop status --home <run>/ccsnoop-home` : nombre de routes = 1, uptime > 0 | oui | B5 |
@@ -194,10 +195,19 @@ Chaque bras = témoin **+ une seule clé soustractive** — sauf `arm-06` qui es
 | `arm-01` | L1 tools | `permissions.deny` | diff d'ensembles de slots (noms d'outils built-in) | −35 916 o net pour 5 noms (B6) |
 | `arm-02` | L2 hooks | `hooks.SessionStart: []` | chaîne littérale de `hook-persona.txt` | ⎫ |
 | `arm-03` | L3 CLAUDE.md | `claudeMdExcludes` | chaîne littérale de `CLAUDE.md` | ⎪ ensemble dans `message#0` |
-| `arm-04` | L4 MCP | `disabledMcpjsonServers` | nom d'un outil du stub | ⎬ = 22 919 o (B2) |
+| `arm-04` | L4 MCP | `disabledMcpjsonServers` | `mcp__<serveur>__t00` (graphie du fil, §10.4) | ⎬ = 22 919 o (B2) |
 | `arm-05` | L5 skills | `disableBundledSkills` | diff d'ensembles de slots (skills bundled) | ⎪ 8 319 o |
 | `arm-06` | L6 agents | **seed `bare`** | nom d'un agent du seed `loaded` | ⎭ 2 345 o |
 | `arm-07` | `all` | toutes les clés + seed `bare` | les 4 sentinelles absentes | — |
+
+> ⚠ **L4 est actuellement inmesurable sur la requête #1 — bloquant connu, ticket ouvert.**
+> Même serveur `✔ Connected` (étape 11b), les outils MCP **n'atteignent pas le fil avant le
+> tour 3** : les tours 1 et 2 portent `The following MCP servers are still connecting … not yet
+> available`. Or le manifeste épingle `turns: 2` et le diff de levier lit la **requête #1** —
+> donc la sentinelle L4 est absente du témoin et `arm-04` échoue à l'étape 19 (§5). Le résoudre
+> demande soit d'allonger le prompt canonique et de **re-baseliner** les octets de cette table,
+> soit de déclarer L4 inmesurable sous `-p`. Conformément à §4 (« s'il manque une donnée au banc,
+> c'est un ticket produit — pas un contournement »), aucun contournement n'est appliqué ici.
 
 **Notes de lecture obligatoires dans la table de sortie** :
 
@@ -350,6 +360,7 @@ sur le chiffre.
 | ≠ 0 | un ancêtre du cwd porte `CLAUDE.md` ou `.claude/` | 3 | B7 |
 | ≠ 0 | daemon injoignable depuis un **enfant spawné** (le 502 de B6) | 6 | B6 |
 | ≠ 0 | settings rejeté au pré-vol `system/init` | 11 | B1 |
+| ≠ 0 | serveur `.mcp.json` non connecté (ou connecté alors que le bras le désactive) | 11b | #72 |
 | ≠ 0 | **zéro exchange capturé** (jamais `exit 0` de `claude -p` comme preuve) | 13 | B5 |
 | ≠ 0 | capture absente / extraction impossible | 15 | B4 |
 | ≠ 0 | **gzip non observé** sur le blob de réponse | 18 | B5 |

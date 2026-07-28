@@ -57,6 +57,15 @@ Which model each role runs is not hardcoded: a **model profile** assigns a provi
 
 `npm run sandcastle` runs `split`, `npm run sandcastle:opus` runs `opus`; prefix either with `SANDCASTLE_DRYRUN=1` to print the wiring without launching an agent. `split` is the nominal regime — its reviewer runs a different model than the implementer, so it does not share the author model's blind spots. `opus` gives that guarantee up deliberately, for high-stakes tickets. See `docs/adr/0002-sandcastle-model-profiles.md`.
 
+Two more env vars bound the run: **`SANDCASTLE_MAX_ITERATIONS`** (default 10) and **`SANDCASTLE_MAX_PARALLEL`** (default 4). They compose with the two above, and an unparseable value throws rather than falling back — a silent fallback to 10 iterations of all-Opus is precisely the expensive mistake. A first exploratory run on a profile is worth bounding:
+
+```bash
+SANDCASTLE_PROFILE=opus SANDCASTLE_MAX_ITERATIONS=1 SANDCASTLE_MAX_PARALLEL=1 \
+  npx tsx .sandcastle/main.ts 2>&1 | tee .sandcastle/logs/run-opus-<n>.log
+```
+
+Note the Planner selects by the `ready-for-agent` label alone, so `MAX_PARALLEL` only serialises work — it does not narrow *which* tickets get picked up. To scope a run to one ticket, take the label off the others.
+
 ```
 ┌─ Iteration (×10 max) ───────────────────────────────────────┐
 │                                                              │

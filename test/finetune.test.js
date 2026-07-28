@@ -323,9 +323,14 @@ const fixtureOpts = fixtureDirs.length === 0
 
 test('fineTune runs against the committed FT0 fixture (AC #1)', fixtureOpts, () => {
   for (const id of fixtureDirs) {
+    // `root` is FIXTURES_DIR itself, not its parent: listSessions(root) scans
+    // `<root>/sessions/*` and `<root>/*`, and the manifests live one level down at
+    // `finetune/session-*/manifest.jsonl`. Passing `test/fixtures` made the session
+    // dirs grandchildren, so discovery found nothing and this gate could never pass
+    // whatever fixture landed.
     const res = fineTune({
       cwd: '/nonexistent',
-      root: path.join(FIXTURES_DIR, '..'),
+      root: FIXTURES_DIR,
       session: id,
     });
     // The block is valid JSON and permissions.deny is exactly the intersection
