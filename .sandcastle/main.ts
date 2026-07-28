@@ -167,8 +167,23 @@ const envFor = (role: Role): Record<string, string> => {
 
 const modelFor = (role: Role): string => providerFor(role).model;
 
-const MAX_ITERATIONS = 10;
-const MAX_PARALLEL = 4;
+// --- Run bounds. --------------------------------------------------------------
+// Overridable per run, same doctrine as the profile above: an unparseable value
+// throws rather than falling back, because a silent fallback to 10 iterations of
+// all-Opus is exactly the mistake that costs money. Defaults unchanged, so
+// `npm run sandcastle` behaves as before. The dry-run prints both.
+const intFromEnv = (key: string, fallback: number): number => {
+  const raw = process.env[key];
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${key} must be a positive integer, got ${JSON.stringify(raw)}.`);
+  }
+  return n;
+};
+
+const MAX_ITERATIONS = intFromEnv("SANDCASTLE_MAX_ITERATIONS", 10);
+const MAX_PARALLEL = intFromEnv("SANDCASTLE_MAX_PARALLEL", 4);
 
 // --- Dry-run: validate wiring without launching any agent. --------------------
 // Runs BEFORE validateTokens() so a missing token is *reported* as <MISSING>
