@@ -54,7 +54,7 @@ export const HOOK_INTENT_CAVEAT = 'intent unknown — injected every session; re
  * byte, so this file stays text (a raw NUL makes git treat it as binary and the
  * module undiffable).
  */
-const NULL_SOURCE = '\u0000';
+export const NULL_SOURCE = '\u0000';
 
 /**
  * @typedef {object} ClaudeMdBlock

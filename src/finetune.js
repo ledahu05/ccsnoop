@@ -48,6 +48,35 @@ function fmtBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}M`;
 }
 
+/**
+ * Column widths of the FT6 diagnostic table. The header and every data row are
+ * formatted through {@link tableRow} with these widths, so a column label can never
+ * drift out of alignment with the figures printed under it.
+ */
+const COL = { lever: 18, entry: 28, bytes: 7 };
+
+/** Width of the table's horizontal rules — the full formatted row width. */
+const TABLE_WIDTH = COL.lever + 1 + COL.entry + 1 + COL.bytes + 2 + COL.bytes + 4 + 6;
+
+/**
+ * One line of the diagnostic table in the shared columns: lever, entry, then the
+ * right-aligned `shipped` / `waste` cells and the action. Cells are pre-rendered
+ * strings so the same formatter lays out the header, the byte rows and the dash the
+ * harness floor prints for its unmodelled waste.
+ * @param {string} lever
+ * @param {string} entry
+ * @param {string} shippedCell
+ * @param {string} wasteCell
+ * @param {string} action
+ * @returns {string}
+ */
+function tableRow(lever, entry, shippedCell, wasteCell, action) {
+  return (
+    `${lever.padEnd(COL.lever)} ${entry.padEnd(COL.entry)} ` +
+    `${shippedCell.padStart(COL.bytes)}  ${wasteCell.padStart(COL.bytes)}    ${action}`
+  ).trimEnd();
+}
+
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Default location of the versioned built-in denylist (spec Part 4). */
@@ -167,13 +196,12 @@ export function denyIntersection(shipped, denylist) {
  * (zeros) so the renderer is callable without a session model.
  *
  * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[],
- *   denylist: DenylistEntry[], mcp: import('./finetune-mcp.js').McpCorpus,
+ *   mcp: import('./finetune-mcp.js').McpCorpus,
  *   levers?: import('./finetune-levers.js').LeverVerdicts,
  *   gain?: import('./finetune-gain.js').GainModel }} ctx
  * @returns {{ lines: string[], settingsJson: string }}
  */
-export function renderFineTune({ sessionId, requests, shipped, deny, denylist, mcp, levers = EMPTY_LEVER_VERDICTS, gain = EMPTY_GAIN }) {
-  void shipped; // retained on the API for callers/tests; the table draws bytes from `gain`.
+export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers = EMPTY_LEVER_VERDICTS, gain = EMPTY_GAIN }) {
   const hook = levers.hook;
   const mcpDeny = mcp.servers.filter((s) => s.deny).map((s) => s.name);
   const claudeMdExclude = levers.claudeMd.filter((c) => c.deny).map((c) => /** @type {string} */ (c.source));
@@ -242,16 +270,13 @@ export function renderFineTune({ sessionId, requests, shipped, deny, denylist, m
   const lines = [];
   lines.push(`ccsnoop fine-tune — session ${sessionId} (${requests} request${requests === 1 ? '' : 's'})`);
   lines.push('');
-  lines.push('Lever               entry                          shipped    waste    action');
-  lines.push('─'.repeat(78));
-  if (rows.length === 0) {
-    lines.push('  (no lever content seen in this session)');
-  }
+  lines.push(tableRow('Lever', 'entry', 'shipped', 'waste', 'action'));
+  lines.push('─'.repeat(TABLE_WIDTH));
   for (const r of rows) {
-    const wasteStr = r.waste === null ? '      —' : fmtBytes(r.waste).padStart(7);
-    lines.push(
-      `${r.lever.padEnd(18)} ${r.label.padEnd(28)} ${fmtBytes(r.shipped).padStart(7)}  ${wasteStr}    ${r.action}`,
-    );
+    // The harness floor prints a dash: its waste is real but never recoverable, so
+    // there is no figure to show in a column that means "what you'd stop re-paying".
+    const wasteCell = r.waste === null ? '—' : fmtBytes(r.waste);
+    lines.push(tableRow(r.lever, r.label, fmtBytes(r.shipped), wasteCell, r.action));
     // Per-server MCP detail (deny ✓ / flag calledCount/sessionCount) under the MCP row.
     if (r.lever === 'MCP') {
       for (const s of mcp.servers) {
@@ -260,13 +285,20 @@ export function renderFineTune({ sessionId, requests, shipped, deny, denylist, m
       }
     }
   }
-  // No SessionStart hook output → a one-line note (not a row): the hooks lever is
-  // absent, so there is nothing to cost or emit. Kept verbatim for callers/tests.
+  // A lever with nothing to cost gets a one-line note instead of a row.
+  //
+  // The tools note reports the SCAN, not the table: a session can ship dozens of tools
+  // and still produce no tools row, because only the denylist intersection is
+  // recoverable. Saying nothing there would let a table with no rows read as "this
+  // session shipped no tool context", which is false — hence the shipped count.
+  if (deny.length === 0) {
+    lines.push(`Tools: ${shipped.length} shipped, none intersect the built-in denylist`);
+  }
   if (hook.bytes === 0) {
     lines.push('Hooks: (no SessionStart hook output seen)');
   }
-  lines.push('─'.repeat(78));
-  lines.push(`${'Total'.padEnd(18)} ${''.padEnd(28)} ${fmtBytes(totalShipped).padStart(7)}  ${fmtBytes(recoverable).padStart(7)}`);
+  lines.push('─'.repeat(TABLE_WIDTH));
+  lines.push(tableRow('Total', '', fmtBytes(totalShipped), fmtBytes(recoverable), ''));
 
   lines.push('');
   lines.push(`Recoverable (waste, conservative): ~${fmtBytes(recoverable)} bytes — Σ reused-uncached over the actionable levers.`);
@@ -376,7 +408,6 @@ export function fineTune(opts = {}) {
     requests: model.exchanges.length,
     shipped,
     deny,
-    denylist,
     mcp,
     levers,
     gain,

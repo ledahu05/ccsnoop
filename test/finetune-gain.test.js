@@ -24,7 +24,7 @@ import { chargeExchange, computeGain, EMPTY_GAIN, NULL_SOURCE } from '../src/fin
 import { canonicalize } from '../src/waste.js';
 import { buildRequestBlob } from '../src/capture.js';
 import { fineTune, renderFineTune } from '../src/finetune.js';
-import { buildLeverVerdicts } from '../src/finetune-levers.js';
+import { buildLeverVerdicts, NULL_SOURCE as LEVERS_NULL_SOURCE } from '../src/finetune-levers.js';
 
 const FIXTURES_DIR = fileURLToPath(new URL('./fixtures/finetune', import.meta.url));
 
@@ -213,7 +213,6 @@ test('the headline sums waste only over actionable levers; non-actionable rows a
     requests: 3,
     shipped: ['Workflow'],
     deny: ['Workflow'],
-    denylist: [{ name: 'Workflow', category: 'orchestration', note: 'x' }],
     mcp: { sessionCount: 1, singleSession: true, servers: [{ name: 'stub', shippedSessions: 1, calledCount: 0, deny: false }] },
     levers,
     gain,
@@ -402,4 +401,99 @@ function withKind(segs, kind) {
 test('EMPTY_GAIN is the all-zero no-op gain', () => {
   assert.equal(EMPTY_GAIN.hook.shipped, 0);
   assert.equal(EMPTY_GAIN.tool.size, 0);
+});
+
+// ── review regressions ────────────────────────────────────────────────────────
+
+test('a session that ships tools with NO denylist intersection says so — never "no lever content"', () => {
+  // The table only rows the DENIED tools, so a session shipping only primitives has no
+  // tools row. The diagnostic must still report the scan: claiming the session shipped
+  // no lever content would be false, and it is the one line telling the reader the
+  // denylist was actually checked.
+  const { lines } = renderFineTune({
+    sessionId: 's',
+    requests: 2,
+    shipped: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+  });
+  const joined = lines.join('\n');
+  assert.ok(/6 shipped, none intersect the built-in denylist/.test(joined), joined);
+  assert.ok(!/no lever content/.test(joined), 'must not claim the session shipped no lever content');
+});
+
+test('the tools scan note is absent once a tool IS denied — the row carries the story instead', () => {
+  const { lines } = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: ['Workflow', 'Bash'],
+    deny: ['Workflow'],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    gain: { ...EMPTY_GAIN, tool: new Map([['Workflow', { shipped: 5120, waste: 1024 }]]) },
+  });
+  const joined = lines.join('\n');
+  assert.ok(!/none intersect the built-in denylist/.test(joined));
+  assert.ok(/tools\s+Workflow\s+5\.0K\s+1\.0K\s+deny ✓/.test(joined), joined);
+});
+
+test('the table header aligns with the byte columns under it', () => {
+  // The header used to be a hand-typed string that had drifted out of alignment with
+  // the padded rows; both now come from one formatter, so the labels sit over the cells.
+  const { lines } = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: ['Workflow'],
+    deny: ['Workflow'],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    gain: { ...EMPTY_GAIN, tool: new Map([['Workflow', { shipped: 5120, waste: 1024 }]]) },
+  });
+  const header = lines.find((l) => /shipped\s+waste\s+action/.test(l));
+  const row = lines.find((l) => /^tools\s/.test(l));
+  assert.ok(header && row, 'header + a data row are present');
+  // Right-aligned cells: each label's right edge is its column's right edge.
+  assert.equal(
+    header.indexOf('shipped') + 'shipped'.length,
+    row.indexOf('5.0K') + '5.0K'.length,
+    'shipped column',
+  );
+  assert.equal(header.indexOf('waste') + 'waste'.length, row.indexOf('1.0K') + '1.0K'.length, 'waste column');
+  assert.equal(header.indexOf('action'), row.indexOf('deny ✓'), 'action column');
+});
+
+test('the gain model and the lever verdicts share ONE managed-source placeholder', () => {
+  // The renderer looks a verdict whose `source` is null up in gain.claudeMd under this
+  // key. Two independently declared placeholders would silently miss and fall back to
+  // a 0-byte waste, so the constant must be the same byte in both modules.
+  assert.equal(NULL_SOURCE, LEVERS_NULL_SOURCE);
+});
+
+test('a managed CLAUDE.md source renders its gain bytes, not a zero fallback', () => {
+  // Behavioural proof of the shared placeholder: source null keys under NULL_SOURCE.
+  const { lines } = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: {
+      systemBytes: 50_000,
+      hook: { bytes: 0, aboveFloor: false, deny: false },
+      claudeMd: [{ source: null, bytes: 4096, pct: 8, excludable: false, deny: false }],
+    },
+    gain: { ...EMPTY_GAIN, claudeMd: new Map([[NULL_SOURCE, { shipped: 4096, waste: 2048 }]]) },
+  });
+  assert.ok(
+    lines.some((l) => /CLAUDE\.md\s+\(managed\)\s+4\.0K\s+2\.0K\s+advice \(managed\)/.test(l)),
+    lines.join('\n'),
+  );
+});
+
+test('no source file carries a raw NUL byte — git would treat the module as binary', () => {
+  // NULL_SOURCE must be written as a unicode escape, never a literal control byte: one
+  // raw NUL makes the whole file binary to git (no diff, no blame, unreviewable).
+  const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+  for (const name of fs.readdirSync(srcDir).filter((n) => n.endsWith('.js'))) {
+    const buf = fs.readFileSync(path.join(srcDir, name));
+    assert.ok(!buf.includes(0), `src/${name} contains a raw NUL byte`);
+  }
 });

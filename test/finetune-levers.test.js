@@ -175,7 +175,6 @@ test('a zero-floor run does not put a never-seen lever into the settings block',
     requests: 1,
     shipped: [],
     deny: [],
-    denylist: [],
     mcp: { sessionCount: 0, servers: [], singleSession: true },
     levers: v,
   });

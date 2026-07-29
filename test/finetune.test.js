@@ -193,7 +193,6 @@ test('renderFineTune emits a parseable pure-JSON block with permissions.deny', (
     requests: 3,
     shipped: ['Bash', 'Workflow', 'Artifact'],
     deny: ['Workflow', 'Artifact'],
-    denylist: loadBuiltinDenylist(),
     mcp: EMPTY_MCP_CORPUS,
   });
   // The block is valid JSON, no comments.
@@ -213,7 +212,6 @@ test('renderFineTune omits the cache warning when there is nothing to deny', () 
     requests: 1,
     shipped: ['Bash'],
     deny: [],
-    denylist: loadBuiltinDenylist(),
     mcp: EMPTY_MCP_CORPUS,
   });
   assert.deepEqual(JSON.parse(settingsJson), { permissions: { deny: [] } });
