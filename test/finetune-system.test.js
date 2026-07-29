@@ -168,6 +168,19 @@ test('the Contents-of marker reads the scope (project / user / local) and a path
   );
 });
 
+test('the Contents-of path never spans a newline — prose is not spliced into the path', () => {
+  // Regression: the path group used to match across lines, so a memory file whose
+  // body happened to mention "(project instructions)" on a LATER line produced a
+  // multi-line path — which the FT5 CLAUDE.md lever pastes verbatim into
+  // `claudeMdExcludes`, yielding a settings.json with a bogus exclude. A real
+  // injection keeps path + scope on one line; anything else is unattributable.
+  const spliced = classifySystemBlock(
+    text(`Contents of ./notes.md\nSee the docs (project instructions) for details.\nSENTINEL: ${CLAUDEMD}`),
+  );
+  assert.equal(spliced.lever, 'claude-md');
+  assert.equal(spliced.source, null, 'no single-line marker → managed, cost only');
+});
+
 test('without either path marker the CLAUDE.md block is still source = null', () => {
   // A managed/policy CLAUDE.md block with no file path stays unattributable — FT5
   // treats that as inexcludable (cost only, no claudeMdExcludes).

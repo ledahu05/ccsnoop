@@ -30,7 +30,7 @@ import {
 } from '../src/finetune-levers.js';
 import { DEFAULT_WASTE_CONFIG } from '../src/waste.js';
 import { buildRequestBlob } from '../src/capture.js';
-import { fineTune } from '../src/finetune.js';
+import { fineTune, renderFineTune } from '../src/finetune.js';
 
 const FIXTURES_DIR = fileURLToPath(new URL('./fixtures/finetune', import.meta.url));
 const FLOOR = DEFAULT_WASTE_CONFIG.bloatFloorBytes;
@@ -149,6 +149,41 @@ test('the floor is overridable and defaults to the waste.js bloatFloorBytes', ()
     { floorBytes: FLOOR + 1 },
   );
   assert.equal(raised.hook.deny, false);
+});
+
+test('a lever that shipped NOTHING never emits, even at a floor of 0', () => {
+  // Regression: `bytes >= floor` alone is satisfied by 0 >= 0, so a floor override
+  // of 0 made a session with no hook output and a 0-byte source emit a removal for
+  // a hook that was never seen — while the diagnostic said "no SessionStart hook
+  // output seen". Nothing observed → nothing to emit, at every floor.
+  const v = buildLeverVerdicts(
+    { sessionId: 's', hookBytes: 0, systemBytes: 0, claudeMd: [{ source: './A.md', bytes: 0 }] },
+    { floorBytes: 0 },
+  );
+  assert.equal(v.hook.deny, false, 'no hook output → no hooks.SessionStart removal');
+  assert.equal(v.hook.aboveFloor, false);
+  assert.equal(v.claudeMd[0].deny, false, 'a 0-byte source is never worth excluding');
+});
+
+test('a zero-floor run does not put a never-seen lever into the settings block', () => {
+  const v = buildLeverVerdicts(
+    { sessionId: 's', hookBytes: 0, systemBytes: 0, claudeMd: [{ source: './A.md', bytes: 0 }] },
+    { floorBytes: 0 },
+  );
+  const { lines, settingsJson } = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: [],
+    deny: [],
+    denylist: [],
+    mcp: { sessionCount: 0, servers: [], singleSession: true },
+    levers: v,
+  });
+  const block = JSON.parse(settingsJson);
+  assert.equal(block.hooks, undefined, 'no hook seen → no hooks key');
+  assert.equal(block.claudeMdExcludes, undefined, 'no CLAUDE.md bytes → no excludes key');
+  // The diagnostic and the block agree: both say nothing shipped.
+  assert.ok(lines.some((l) => /^Hooks: \(no SessionStart hook output seen\)/.test(l)));
 });
 
 // ── scanRequestLeverBlocks: find the blocks wherever CC injects them ───────────

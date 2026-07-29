@@ -80,7 +80,13 @@ const MCP_STUB_TOOL = /\bt00\b/;
 // keys on the `SessionStart:<event> hook <status>` line so a CLAUDE.md file that
 // merely *mentions* "SessionStart hook" (no colon, no status) is not swallowed.
 const SESSIONSTART_HOOK = /SessionStart:\S+\s+hook\s+(?:success|error|output)/i;
-const CONTENTS_OF_PATH = /Contents of (\S[^()]*?)\s+\((?:project|user|local)\s+instructions/i;
+// The path group excludes newlines: a real injection puts path and `(<scope>
+// instructions` on ONE line, and letting the group span lines would splice prose
+// from the file's body into the "path" — which the CLAUDE.md lever then pastes
+// verbatim into `claudeMdExcludes`. A body that merely mentions
+// "(project instructions)" on a later line now yields no path (→ managed, cost
+// only) instead of a multi-line bogus one.
+const CONTENTS_OF_PATH = /Contents of (\S[^()\n]*?)\s+\((?:project|user|local)\s+instructions/i;
 
 /**
  * The text payload of a `system` block — a bare string, or the `text` field of a
