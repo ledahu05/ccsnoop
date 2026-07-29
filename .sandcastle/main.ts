@@ -5,9 +5,10 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 // --- Model profiles. ----------------------------------------------------------
-// A *provider* is the triplet {model id, base URL, token}; that triplet is what
-// gets baked into a docker({env}). A *profile* assigns one provider to each of the
-// four roles. Picked per run via SANDCASTLE_PROFILE, `split` by default.
+// A *provider* is the quadruplet {model id, base URL, token, effort}; that
+// quadruplet is what gets baked into a docker({env}). A *profile* assigns one
+// provider to each of the four roles. Picked per run via SANDCASTLE_PROFILE,
+// `split` by default.
 //
 //   split — planner/implementer/merger on GLM via z.ai, reviewer on Opus via
 //           Anthropic. Nominal regime: the reviewer runs a different model than
@@ -21,6 +22,14 @@ const OPUS_MODEL = "claude-opus-5";
 const GLM_MODEL = "glm-5.2[1m]";
 const ZAI_BASE_URL = "https://api.z.ai/api/anthropic";
 
+// Reasoning effort, passed by sandcastle as `claude --effort <level>`, which
+// claude-code serializes as `output_config.effort`. z.ai maps that to its own
+// `reasoning_effort` (server values: none, minimal, low, medium, high, xhigh,
+// max) — an invalid effort 400s at z.ai, so it is NOT ignored. Without the flag
+// claude-code sends `medium` explicitly: not setting it pins GLM under its
+// native default rather than leaving it alone.
+type Effort = NonNullable<Parameters<typeof sandcastle.claudeCode>[1]>["effort"];
+
 // baseUrl null → omit ANTHROPIC_BASE_URL entirely; that absence is what makes
 // claude-code hit api.anthropic.com.
 const PROVIDERS = {
@@ -28,13 +37,18 @@ const PROVIDERS = {
     model: GLM_MODEL,
     tokenKey: "ANTHROPIC_AUTH_TOKEN",
     baseUrl: ZAI_BASE_URL,
+    effort: "max", // systematic: GLM reasons at the ceiling, all roles
   },
   anthropic: {
     model: OPUS_MODEL,
     tokenKey: "CLAUDE_CODE_OAUTH_TOKEN",
     baseUrl: null,
+    effort: "medium", // current de-facto value, made explicit
   },
-} as const;
+} as const satisfies Record<
+  string,
+  { model: string; tokenKey: string; baseUrl: string | null; effort: Effort }
+>;
 
 const PROFILES = {
   split: {
@@ -166,6 +180,10 @@ const envFor = (role: Role): Record<string, string> => {
 };
 
 const modelFor = (role: Role): string => providerFor(role).model;
+// Override per role if one day planner ≠ implementer: ROLE_EFFORT[role] ?? …
+const effortFor = (role: Role): Effort => providerFor(role).effort;
+const agentFor = (role: Role) =>
+  sandcastle.claudeCode(modelFor(role), { effort: effortFor(role) });
 
 // --- Run bounds. --------------------------------------------------------------
 // Overridable per run, same doctrine as the profile above: an unparseable value
@@ -201,6 +219,7 @@ if (process.env.SANDCASTLE_DRYRUN) {
           {
             provider: PROFILE[role],
             model: provider.model,
+            effort: provider.effort,
             // The env actually baked into this role's sandbox, secret masked.
             env: buildEnv(
               provider,
@@ -231,7 +250,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   const plan = await sandcastle.run({
     sandbox: docker({ env: envFor("planner") }),
     name: "Planner",
-    agent: sandcastle.claudeCode(modelFor("planner")),
+    agent: agentFor("planner"),
     promptFile: "./.sandcastle/plan-prompt.md",
   });
 
@@ -296,7 +315,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         try {
           result = await implSandbox.run({
             name: "Implementer #" + issue.number,
-            agent: sandcastle.claudeCode(modelFor("implementer")),
+            agent: agentFor("implementer"),
             promptFile: "./.sandcastle/implement-prompt.md",
             promptArgs: {
               ISSUE_NUMBER: String(issue.number),
@@ -328,7 +347,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         try {
           await reviewSandbox.run({
             name: "Reviewer #" + issue.number,
-            agent: sandcastle.claudeCode(modelFor("reviewer")),
+            agent: agentFor("reviewer"),
             promptFile: "./.sandcastle/review-prompt.md",
             promptArgs: {
               ISSUE_NUMBER: String(issue.number),
@@ -396,7 +415,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     sandbox: docker({ env: envFor("merger") }),
     name: "Merger",
     maxIterations: 10,
-    agent: sandcastle.claudeCode(modelFor("merger")),
+    agent: agentFor("merger"),
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
