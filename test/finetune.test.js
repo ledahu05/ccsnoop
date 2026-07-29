@@ -339,10 +339,12 @@ test('fineTune runs against the committed FT0 fixture (AC #1)', fixtureOpts, () 
       session: id,
     });
     // The block is valid JSON and permissions.deny is exactly the intersection
-    // of the fixture's tools[] names with the denylist (bare names, AC #2).
+    // of the fixture's tools[] names with the denylist (bare names, AC #2). The
+    // fixture also carries hook + CLAUDE.md levers (FT5), so those keys join the
+    // block — only permissions.deny is asserted here (FT1's slice).
     assert.doesNotThrow(() => JSON.parse(res.settingsJson), `${id}: block must be parseable`);
     const expected = denyIntersection(res.shipped, loadBuiltinDenylist());
     assert.deepEqual(res.deny, expected, `${id}: deny must equal the bare-name intersection`);
-    assert.deepEqual(JSON.parse(res.settingsJson), { permissions: { deny: expected } });
+    assert.deepEqual(JSON.parse(res.settingsJson).permissions, { deny: expected });
   }
 });

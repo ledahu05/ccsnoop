@@ -28,11 +28,14 @@
 // regardless of position; everything unmatched falls to `harness` (the floor).
 //
 // Assumed CC build: v2.1.220 linux-x64 sdk-cli, model claude-haiku-4-5-20251001,
-// ENABLE_TOOL_SEARCH=true (bench/SPEC.md §0). The conservative textual markers
-// (`<file path=…>` for CLAUDE.md, `<session-start-hook`, "deferred tool(s)") are
-// best-effort aids for real-CC blocks that carry no bench sentinel; they are
-// CONFIRMED/REFINED against the real FT0 capture the instant it lands — see the
-// self-activating gate in test/finetune-system.test.js (AC #1–#2). The `opts`
+// ENABLE_TOOL_SEARCH=true (bench/SPEC.md §0). The textual markers (`<file path=…>`
+// AND the real-capture `Contents of <path> (<scope> instructions)` for CLAUDE.md;
+// `<session-start-hook` AND the real `SessionStart:<event> hook <status>` line;
+// "deferred tool(s)") match a REAL session's blocks, which carry no bench sentinel.
+// They were CONFIRMED against the committed FT0 capture (issue #75 / FT5 refined
+// them: a real CLAUDE.md block carries only the Contents-of line, a real hook only
+// the SessionStart line) — see the self-activating gate in
+// test/finetune-system.test.js (AC #1–#2). The `opts`
 // seam on `classifySystemBlock` reserves ORDER as a version-specific tie-breaker
 // for that refinement pass; v1 never needs it (sentinels + floor-fallback are
 // unambiguous), so it is accepted but not yet decisive.
@@ -69,6 +72,16 @@ const PERSONA_SENTINEL = /CCSNOOP-BENCH-SENTINEL-PERSONA-[0-9a-f]+/;
 // (and FT0) assert on. A bare-word match is unambiguous for these stub names.
 const MCP_STUB_TOOL = /\bt00\b/;
 
+// Real-capture markers (CC v2.1.220, the FT0 fixture's format). The sentinels
+// above prove each lever in the bench; these match a REAL session's blocks, which
+// carry no bench sentinel. `extractSourcePath` / the hook branch consume them; the
+// module header promised they would be refined against the capture the instant it
+// landed — it has (test/fixtures/finetune/session-963204f5…). The hook envelope
+// keys on the `SessionStart:<event> hook <status>` line so a CLAUDE.md file that
+// merely *mentions* "SessionStart hook" (no colon, no status) is not swallowed.
+const SESSIONSTART_HOOK = /SessionStart:\S+\s+hook\s+(?:success|error|output)/i;
+const CONTENTS_OF_PATH = /Contents of (\S[^()]*?)\s+\((?:project|user|local)\s+instructions/i;
+
 /**
  * The text payload of a `system` block — a bare string, or the `text` field of a
  * `{ type: 'text', text, cache_control? }` content block. Never throws.
@@ -82,15 +95,20 @@ function blockText(block) {
 }
 
 /**
- * Extract a per-file source path from a CLAUDE.md block when CC injects one (the
- * `<file path="…">` convention). Best-effort — returns null when no marker is
- * present, in which case the block is attributed as a whole (spec §2.3).
+ * Extract a per-file source path from a CLAUDE.md block when CC injects one. Two
+ * shapes: the interactive `<file path="…">` convention, and the real CC v2.1.220
+ * `Contents of <path> (<scope> instructions, …)` line (the FT0 fixture's format).
+ * Best-effort — returns null when neither marker is present (a managed/policy
+ * block, or an unattributable whole), in which case the block is attributed as a
+ * whole (spec §2.3) and the downstream CLAUDE.md lever treats it as inexcludable.
  * @param {string} t
  * @returns {string | null}
  */
 function extractSourcePath(t) {
-  const m = t.match(/<file\s+path=["']?([^"'>\s]+)["']?/i);
-  return m ? m[1] : null;
+  const file = t.match(/<file\s+path=["']?([^"'>\s]+)["']?/i);
+  if (file) return file[1];
+  const contents = t.match(CONTENTS_OF_PATH);
+  return contents ? contents[1].trim() : null;
 }
 
 /**
@@ -107,12 +125,16 @@ export function classifySystemBlock(block, opts = {}) {
   void opts; // order seam — see module header; sentinels + floor-fallback decide v1.
   const t = blockText(block);
 
-  // CLAUDE.md — bench sentinel, or an injectable memory-file path marker.
-  if (CLAUDEMD_SENTINEL.test(t) || /<file\s+path=/i.test(t)) {
+  // CLAUDE.md — bench sentinel, an injectable `<file path=…>` marker, or the real
+  // CC `Contents of <path> (<scope> instructions)` injection (the FT0 capture's
+  // format — a real CLAUDE.md block carries no bench sentinel, so the Contents-of
+  // line is what detects it).
+  if (CLAUDEMD_SENTINEL.test(t) || /<file\s+path=/i.test(t) || CONTENTS_OF_PATH.test(t)) {
     return { lever: 'claude-md', floor: false, source: extractSourcePath(t) };
   }
-  // SessionStart hook — bench persona sentinel, or a hook-output envelope.
-  if (PERSONA_SENTINEL.test(t) || /<session-start-hook/i.test(t)) {
+  // SessionStart hook — bench persona sentinel, a `<session-start-hook` envelope,
+  // or the real CC `SessionStart:<event> hook <status>` output line.
+  if (PERSONA_SENTINEL.test(t) || /<session-start-hook/i.test(t) || SESSIONSTART_HOOK.test(t)) {
     return { lever: 'hook', floor: false, source: null };
   }
   // MCP deferred listing — the L4 stub tool name, or a deferred-tools listing phrase.

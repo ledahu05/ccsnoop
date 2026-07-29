@@ -113,6 +113,80 @@ test('non-CLAUDE.md levers never carry a source', () => {
   assert.equal(classifySystemBlock(text('harness boilerplate')).source, null);
 });
 
+// ── real-capture marker refinement (CC v2.1.220 — the FT0 capture's format) ────
+//
+// The conservative markers above are sentinel-grounded for the bench. The real
+// FT0 capture (now committed) injects a SessionStart hook as
+// `SessionStart:startup hook success: …` inside a <system-reminder>, and a
+// CLAUDE.md file as `Contents of <path> (<scope> instructions, …)`. FT3's module
+// header promised these markers are refined against the capture the instant it
+// lands — these tests pin that refinement (the hooks/CLAUDE.md levers, FT5/#75,
+// rely on it to find their blocks without a bench sentinel).
+
+test('classifySystemBlock maps a real SessionStart hook envelope to the hook lever', () => {
+  // The on-wire shape CC v2.1.220 uses (no bench sentinel): the SessionStart hook
+  // output rides a <system-reminder> with a `SessionStart:<event> hook success` line.
+  const realHook = classifySystemBlock(
+    text('<system-reminder>\nSessionStart:startup hook success: # my persona\n…output…\n</system-reminder>'),
+  );
+  assert.equal(realHook.lever, 'hook');
+  assert.equal(realHook.floor, false);
+});
+
+test('classifySystemBlock maps a SessionStart hook ERROR envelope to the hook lever too', () => {
+  // A failing hook surfaces as `SessionStart:startup hook error:` — still the hook
+  // lever (its output is injected every session regardless of exit status).
+  assert.equal(
+    classifySystemBlock(text('<system-reminder>\nSessionStart:startup hook error: boom\n</system-reminder>')).lever,
+    'hook',
+  );
+});
+
+test('the real hook marker does not swallow a CLAUDE.md block that merely mentions SessionStart', () => {
+  // A CLAUDE.md file that talks about hooks must still map to claude-md, not hook —
+  // the marker keys on the hook-envelope shape, not the bare word.
+  const block = classifySystemBlock(text(`Contents of ./CLAUDE.md (project instructions):\n# Notes\nWe use a SessionStart hook.\nSENTINEL: ${CLAUDEMD}`));
+  assert.equal(block.lever, 'claude-md');
+  assert.equal(block.source, './CLAUDE.md');
+});
+
+test('classifySystemBlock extracts the source path from the real `Contents of <path>` marker', () => {
+  // The on-wire CLAUDE.md injection (CC v2.1.220): `Contents of <abs path> (<scope>
+  // instructions, checked into the codebase):`. FT5's CLAUDE.md lever needs the path
+  // to attribute cost per source file and to emit `claudeMdExcludes`.
+  const real = classifySystemBlock(
+    text(`As you answer the user's questions, you can use the following context:\nContents of /home/me/proj/CLAUDE.md (project instructions, checked into the codebase):\n# Project memory\nSENTINEL: ${CLAUDEMD}`),
+  );
+  assert.equal(real.lever, 'claude-md');
+  assert.equal(real.source, '/home/me/proj/CLAUDE.md');
+});
+
+test('the Contents-of marker reads the scope (project / user / local) and a path with spaces', () => {
+  assert.equal(
+    classifySystemBlock(text(`Contents of ~/My Project/CLAUDE.md (user instructions):\nSENTINEL: ${CLAUDEMD}`)).source,
+    '~/My Project/CLAUDE.md',
+  );
+});
+
+test('without either path marker the CLAUDE.md block is still source = null', () => {
+  // A managed/policy CLAUDE.md block with no file path stays unattributable — FT5
+  // treats that as inexcludable (cost only, no claudeMdExcludes).
+  const managed = classifySystemBlock(text(`policy memory\nSENTINEL: ${CLAUDEMD}`));
+  assert.equal(managed.lever, 'claude-md');
+  assert.equal(managed.source, null);
+});
+
+test('a real CLAUDE.md block with ONLY the Contents-of line (no bench sentinel) still maps to claude-md', () => {
+  // A real capture carries no bench sentinel — the `Contents of <path> (<scope>
+  // instructions)` line is what detects a CLAUDE.md block. Without it the FT5
+  // lever would miss every real CLAUDE.md source.
+  const real = classifySystemBlock(
+    text('As you answer the user\'s questions, you can use the following context:\nContents of /home/me/proj/CLAUDE.md (project instructions, checked into the codebase):\n# Project memory'),
+  );
+  assert.equal(real.lever, 'claude-md');
+  assert.equal(real.source, '/home/me/proj/CLAUDE.md');
+});
+
 // ── composition over a whole request body ─────────────────────────────────────
 
 test('attributeSystemBlocks attributes every system block in order with byte-aligned slots', () => {

@@ -168,7 +168,10 @@ function runReport(args) {
  * `fine-tune` — print a CLI diagnostic + a paste-ready settings.json block
  * (fine-tune-spec.md). Built-in tools (FT1, issue #71) emit `permissions.deny`;
  * the MCP lever (FT4, issue #74) aggregates the corpus and emits
- * `disabledMcpjsonServers` under the T4 guard. Default scope = corpus;
+ * `disabledMcpjsonServers` under the T4 guard; the hooks + CLAUDE.md levers
+ * (FT5, issue #75) emit `hooks.SessionStart` (only above the floor, with the
+ * "intent unknown" caveat) and `claudeMdExcludes` (excludable sources only) —
+ * neither ever says "unused", only "costs N bytes". Default scope = corpus;
  * `--session` / `--latest` drop to single-session mode (no MCP deny).
  * Flags/dispatch mirror {@link runReport}.
  * @param {string[]} args

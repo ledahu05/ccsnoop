@@ -6,8 +6,11 @@
 // (bare names). The MCP lever (FT4, issue #74) aggregates shipped/called across
 // the corpus and emits `disabledMcpjsonServers` under the T4 guard
 // (`sessionCount>=3 AND calledCount==0`); the MCP corpus + guard live in
-// `./finetune-mcp.js`. Bytes/per-lever shipped-waste tables and the hooks /
-// CLAUDE.md levers are later tickets (T5/T6).
+// `./finetune-mcp.js`. The two no-dynamic-proof levers (FT5, issue #75) — hooks
+// and CLAUDE.md — emit only "costs N bytes", never "unused": hooks emit
+// `hooks.SessionStart` removal above the floor (with the "intent unknown" caveat),
+// CLAUDE.md emits `claudeMdExcludes` for excludable sources above the floor; both
+// live in `./finetune-levers.js`. Per-lever shipped/waste byte tables are T6.
 //
 // Non-negotiables inherited from the spec: bytes never tokens (the diagnostic
 // figures come from Segment.bytes); output is advice-to-copy, never auto-applied.
@@ -20,6 +23,29 @@ import { fileURLToPath } from 'node:url';
 
 import { loadSession, resolveRoots, listSessions, pickLatestSession } from './report.js';
 import { sessionMcpProfile, aggregateMcpCorpus } from './finetune-mcp.js';
+import {
+  sessionLeverProfile,
+  buildLeverVerdicts,
+  EMPTY_LEVER_VERDICTS,
+  HOOK_INTENT_CAVEAT,
+} from './finetune-levers.js';
+import { DEFAULT_WASTE_CONFIG } from './waste.js';
+
+/** The single reused cost floor (spec §3.5) gating the hooks + CLAUDE.md levers. */
+const BLOAT_FLOOR = DEFAULT_WASTE_CONFIG.bloatFloorBytes;
+
+/**
+ * A byte count as a compact human string (e.g. 8192 → "8.0K"). The diagnostic's
+ * size context only — never re-tokenized; this just renders an already-computed
+ * byte length.
+ * @param {number} bytes
+ * @returns {string}
+ */
+function fmtBytes(bytes) {
+  if (bytes < 1024) return `${bytes}`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}K`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}M`;
+}
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -123,20 +149,23 @@ export function denyIntersection(shipped, denylist) {
  * Built-in tools (FT1) always emit `permissions.deny`. The MCP lever (FT4) emits
  * `disabledMcpjsonServers` — the denied server names — **only under the T4 guard**
  * (`sessionCount>=3 AND calledCount==0`, never in single-session mode); every
- * other server seen is shown flag-only with its `calledCount`. The settings block
- * stays pure, comment-free JSON; `disabledMcpjsonServers` is OMITTED entirely when
- * no server is denied, so a corpus with no MCP action keeps the FT1 block shape
- * (`{ permissions: { deny } }`). The per-lever shipped/waste byte table arrives
- * with the later lever tickets (T5/T6).
+ * other server seen is shown flag-only with its `calledCount`. The two
+ * no-dynamic-proof levers (FT5): the **hooks** lever emits `hooks.SessionStart`
+ * removal only when the injected output ≥ the floor, carrying the "intent unknown"
+ * caveat; the **CLAUDE.md** lever emits `claudeMdExcludes` only for excludable
+ * (non-managed) sources above the floor. Neither ever says "unused" — only "costs
+ * N bytes". The settings block stays pure, comment-free JSON; every lever key is
+ * OMITTED when it has no action, so a corpus with only tools keeps the FT1 shape.
  *
- * `mcp` is required: every run computes a corpus (an empty one when nothing was
+ * `mcp` and `levers` are required: every run computes both (empty when nothing was
  * captured), so one diagnostic shape covers every case.
  *
  * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[],
- *   denylist: DenylistEntry[], mcp: import('./finetune-mcp.js').McpCorpus }} ctx
+ *   denylist: DenylistEntry[], mcp: import('./finetune-mcp.js').McpCorpus,
+ *   levers?: import('./finetune-levers.js').LeverVerdicts }} ctx
  * @returns {{ lines: string[], settingsJson: string }}
  */
-export function renderFineTune({ sessionId, requests, shipped, deny, denylist, mcp }) {
+export function renderFineTune({ sessionId, requests, shipped, deny, denylist, mcp, levers = EMPTY_LEVER_VERDICTS }) {
   const byName = new Map(denylist.map((e) => [e.name, e]));
   /** @type {string[]} */
   const lines = [];
@@ -168,16 +197,51 @@ export function renderFineTune({ sessionId, requests, shipped, deny, denylist, m
     lines.push('  (no MCP server seen in the corpus)');
   }
 
+  // Hooks lever (FT5, spec §3.3) — costs N bytes, NEVER "unused". Emit the
+  // hooks.SessionStart removal only when the injected output ≥ the floor; below
+  // the floor it is diagnostic-only. Every emitted removal carries the
+  // "intent unknown" caveat on the same line (a guard in words, not a confidence
+  // score) so the caveat can never be separated from the hook it qualifies.
+  const hook = levers.hook;
   lines.push('');
-  // Cache-invalidation warning above any block that changes `tools[]` / MCP load.
-  if (deny.length > 0 || mcpDeny.length > 0) {
-    lines.push('⚠ Applying this block invalidates the cache (tools[] changes → prefix broken).');
+  if (hook.bytes > 0) {
+    const action = hook.deny
+      ? `→ remove ⚠ ${HOOK_INTENT_CAVEAT}`
+      : `(below ${fmtBytes(BLOAT_FLOOR)} floor — shown, not emitted)`;
+    lines.push(`Hooks: SessionStart output costs ${fmtBytes(hook.bytes)}  ${action}`);
+  } else {
+    lines.push('Hooks: (no SessionStart hook output seen)');
+  }
+
+  // CLAUDE.md lever (FT5, spec §3.4) — advice-only, costs N bytes, NEVER "unused".
+  // Per source: byte cost + % of system; claudeMdExcludes only for excludable
+  // (non-managed) sources above the floor. Managed sources → cost only.
+  const claudeMdExclude = levers.claudeMd.filter((c) => c.deny).map((c) => /** @type {string} */ (c.source));
+  lines.push('');
+  lines.push(`CLAUDE.md: ${levers.claudeMd.length} source${levers.claudeMd.length === 1 ? '' : 's'}`);
+  for (const c of levers.claudeMd) {
+    const kind = c.excludable ? 'excludable' : 'managed';
+    const action = c.deny ? '→ claudeMdExcludes' : c.excludable ? 'advice (below floor)' : 'advice (managed)';
+    const label = c.source ?? '(unattributable)';
+    lines.push(`  ${label.padEnd(28)} costs ${fmtBytes(c.bytes).padStart(7)}  ${String(c.pct).padStart(3)}% of system  ${kind}  ${action}`);
+  }
+  if (levers.claudeMd.length === 0) {
+    lines.push('  (no CLAUDE.md source seen)');
+  }
+
+  lines.push('');
+  // Cache-invalidation warning above any block that changes the prompt prefix —
+  // tools[], MCP load, the hook output, or an excluded CLAUDE.md file all do.
+  if (deny.length > 0 || mcpDeny.length > 0 || hook.deny || claudeMdExclude.length > 0) {
+    lines.push('⚠ Applying this block invalidates the cache (tools[] / system content changes → prefix broken).');
   }
   // Pure, comment-free, paste-ready JSON. permissions.deny is always present
-  // (spec §3.1 — unconditional); disabledMcpjsonServers joins ONLY when the T4
-  // guard denies ≥1 server (omitted otherwise, so the FT1 shape is preserved).
+  // (spec §3.1 — unconditional); each downstream key joins ONLY when its lever
+  // acts (omitted otherwise, so the block keeps the minimal shape).
   const block = { permissions: { deny } };
   if (mcpDeny.length > 0) block.disabledMcpjsonServers = mcpDeny;
+  if (hook.deny) block.hooks = { SessionStart: [] };
+  if (claudeMdExclude.length > 0) block.claudeMdExcludes = claudeMdExclude;
   const settingsJson = JSON.stringify(block, null, 2);
   lines.push('settings.json (paste-ready):');
   lines.push(settingsJson);
@@ -216,7 +280,8 @@ function uniqueById(sessions) {
  *
  * @param {{ cwd?: string, root?: string, session?: string, latest?: boolean, all?: boolean, denylistPath?: string }} [opts]
  * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[],
- *   mcp: import('./finetune-mcp.js').McpCorpus, lines: string[], settingsJson: string }}
+ *   mcp: import('./finetune-mcp.js').McpCorpus, levers: import('./finetune-levers.js').LeverVerdicts,
+ *   lines: string[], settingsJson: string }}
  */
 export function fineTune(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
@@ -252,6 +317,11 @@ export function fineTune(opts = {}) {
   const profiles = mcpSessions.map((s) => sessionMcpProfile(s.dir, s.id));
   const mcp = aggregateMcpCorpus(profiles, { singleSession });
 
+  // Hooks + CLAUDE.md levers (FT5) — static by construction (injected every
+  // session), so profiled on the chosen (primary) session, the same single-session
+  // story the built-in tools deny uses. The floor gates both; never "unused".
+  const levers = buildLeverVerdicts(sessionLeverProfile(chosen.dir, chosen.id));
+
   const { lines, settingsJson } = renderFineTune({
     sessionId: model.sessionId,
     requests: model.exchanges.length,
@@ -259,7 +329,17 @@ export function fineTune(opts = {}) {
     deny,
     denylist,
     mcp,
+    levers,
   });
 
-  return { sessionId: model.sessionId, requests: model.exchanges.length, shipped, deny, mcp, lines, settingsJson };
+  return {
+    sessionId: model.sessionId,
+    requests: model.exchanges.length,
+    shipped,
+    deny,
+    mcp,
+    levers,
+    lines,
+    settingsJson,
+  };
 }
