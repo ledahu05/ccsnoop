@@ -227,7 +227,7 @@ Commands:
              --out <path>         output file (default <session-dir>/report.html)
              --bloat-floor <n>    bloat: absolute byte floor (default 4096)
              --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
-  fine-tune  Print a byte diagnostic + paste-ready settings.json for one session
+  fine-tune  Print a byte diagnostic + paste-ready settings.json (all sessions by default)
              --root <path>        capture root (default ./.ccsnoop)
              --session <id>       one session (weak-evidence: no MCP deny)
              --latest             most-recent session (weak-evidence: no MCP deny)

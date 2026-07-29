@@ -95,6 +95,22 @@ test('parseDeferredMcpServers returns [] when the header lists no servers', () =
   assert.deepEqual(parseDeferredMcpServers(deferredListing([])), []);
 });
 
+test('parseDeferredMcpServers never reads the header line tail as a server name', () => {
+  // The names start on the line AFTER the header. A reworded header whose tail is
+  // a single token (":" alone, "…shortly:") must not become a phantom server —
+  // that name would land verbatim in a settings.json the user pastes.
+  assert.deepEqual(parseDeferredMcpServers('The following MCP servers are still connecting:\nstub\n'), ['stub']);
+  assert.deepEqual(parseDeferredMcpServers('MCP servers are still connecting shortly:\n\nprose\n'), []);
+});
+
+test('parseDeferredMcpServers stops at a reminder boundary tag, not just the exact closing tag', () => {
+  // Two reminders back to back with no blank line between them: the second one's
+  // opening tag and its prose must not read as servers.
+  assert.deepEqual(parseDeferredMcpServers('MCP servers are still connecting:\nstub\n<system-reminder>\nfoo\n'), [
+    'stub',
+  ]);
+});
+
 // ── mcpServerOf: wire name → server ────────────────────────────────────────────
 
 test('mcpServerOf maps an mcp__<server>__<tool> call name to its server', () => {
@@ -102,6 +118,14 @@ test('mcpServerOf maps an mcp__<server>__<tool> call name to its server', () => 
   assert.equal(mcpServerOf('mcp__github__create_issue'), 'github');
   // A server name with hyphens / dots is still one token between the mcp__ / __ pair.
   assert.equal(mcpServerOf('mcp__my-server__tool'), 'my-server');
+});
+
+test('mcpServerOf splits at the FIRST delimiter — a tool name may itself contain __', () => {
+  // `mcp__<server>__<tool>`: the server is the first segment. Reading up to the
+  // LAST `__` would strand the server (`stub__do`), so the shipped name `stub`
+  // would never match a call — and a used server would be denied.
+  assert.equal(mcpServerOf('mcp__stub__do__thing'), 'stub');
+  assert.equal(mcpServerOf('mcp__github__list__all'), 'github');
 });
 
 test('mcpServerOf returns null for a non-MCP (built-in) tool name', () => {
@@ -221,6 +245,48 @@ test('sessionMcpProfile finds the listing where real CC injects it — a USER me
   assert.deepEqual([...profile.called], ['stub']);
 });
 
+test('sessionMcpProfile degrades on a corrupt capture — a broken turn costs only itself', () => {
+  // A capture cut mid-write must not take the verdict down: a half-written manifest
+  // line, a request blob that never landed, and a non-JSON body each contribute
+  // nothing while the turns around them still report. Losing the whole session
+  // instead would read as "shipped nothing" — i.e. hide a server from the lever.
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'sess-torn');
+  fs.mkdirSync(dir, { recursive: true });
+  const blob = (body) =>
+    buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(body),
+    });
+  fs.writeFileSync(
+    path.join(dir, '0001.request.http'),
+    blob(JSON.stringify({ model: 'claude-x', system: [{ type: 'text', text: deferredListing(['stub']) }], messages: [] }))
+  );
+  fs.writeFileSync(path.join(dir, '0003.request.http'), blob('not json at all'));
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    [
+      JSON.stringify({ turn: 1, request_blob: '0001.request.http', response_blob: '0001.response.sse' }),
+      '{"turn": 2, "request_blob": "000', // manifest cut mid-append
+      JSON.stringify({ turn: 3, request_blob: '0003.request.http' }), // body is not JSON
+      JSON.stringify({ turn: 4, request_blob: '0004.request.http' }), // blob never landed
+      '',
+    ].join('\n')
+  );
+
+  const profile = sessionMcpProfile(dir);
+  assert.deepEqual([...profile.shipped], ['stub'], 'the readable turn still reports its server');
+  assert.equal(profile.called.size, 0);
+});
+
+test('sessionMcpProfile throws on a session dir with no manifest (a caller mistake)', () => {
+  const dir = path.join(mkTmpDir(), 'nothing-here');
+  fs.mkdirSync(dir, { recursive: true });
+  assert.throws(() => sessionMcpProfile(dir), /could not read manifest\.jsonl/);
+});
+
 // ── aggregateMcpCorpus + the T4 guard (the AC) ────────────────────────────────
 //
 // Pure synthetic inputs — each profile is { shipped: string[], called: string[] }.
@@ -322,6 +388,29 @@ test('aggregateMcpCorpus is null-safe on empty / missing profiles', () => {
   assert.equal(aggregateMcpCorpus([{ shipped: [], called: [] }]).servers.length, 0);
 });
 
+test('a missing profile is not counted as a session — the guard needs 3 REAL sessions', () => {
+  // sessionCount is the guard's denominator. Counting a hole in the list would let
+  // the deny fire on two sessions of evidence.
+  const corpus = aggregateMcpCorpus([null, { shipped: ['stub'], called: [] }, { shipped: ['stub'], called: [] }]);
+  assert.equal(corpus.sessionCount, 2);
+  assert.equal(corpus.servers.find((s) => s.name === 'stub').deny, false);
+});
+
+test('a server called but never seen in a listing is flag-only, never denied', () => {
+  // The deferred listing only appears while a server is *connecting* — a session
+  // whose servers were already connected calls tools with no listing at all. Such
+  // a server is used by definition, so it must never reach the deny block.
+  const corpus = aggregateMcpCorpus([
+    { shipped: [], called: ['github'] },
+    { shipped: ['stub'], called: [] },
+    { shipped: ['stub'], called: [] },
+  ]);
+  const github = corpus.servers.find((s) => s.name === 'github');
+  assert.equal(github.shippedSessions, 0);
+  assert.equal(github.calledCount, 1);
+  assert.equal(github.deny, false);
+});
+
 // ── fineTune() end-to-end: corpus vs single-session ───────────────────────────
 
 test('fineTune corpus mode (≥3 sessions): an uncalled MCP server lands in disabledMcpjsonServers', () => {
@@ -370,6 +459,38 @@ test('fineTune corpus: a called MCP server is flag-only, absent from the deny ke
   assert.equal(byName.get('stub').deny, false, 'called → used');
   assert.equal(byName.get('github').deny, true, 'never called across ≥3 → deny');
   assert.deepEqual(JSON.parse(res.settingsJson).disabledMcpjsonServers, ['github']);
+});
+
+test('fineTune corpus: a server whose called tool name contains __ still reads as used', () => {
+  // `mcp__stub__do__thing` is one call on server `stub`. Mis-splitting the wire
+  // name would leave stub with calledCount 0 across 3 sessions → a deny for a
+  // server the user actually uses.
+  const root = mkTmpDir();
+  writeMcpSession(root, 's1', ['stub'], ['mcp__stub__do__thing']);
+  writeMcpSession(root, 's2', ['stub'], ['Read']);
+  writeMcpSession(root, 's3', ['stub'], ['Read']);
+  const res = fineTune({ cwd: '/nonexistent', root });
+  const stub = res.mcp.servers.find((s) => s.name === 'stub');
+  assert.equal(stub.calledCount, 1, 'the call is attributed to `stub`');
+  assert.equal(stub.deny, false, 'called → used → never denied');
+  assert.equal(JSON.parse(res.settingsJson).disabledMcpjsonServers, undefined);
+});
+
+test('fineTune counts a session once even when discovery finds it twice', () => {
+  // `listSessions` scans `<root>/sessions/` AND `<root>/` itself, and `--all` can
+  // add a route root that is already the cwd root — the same session id can surface
+  // twice. Counting it twice would hand the T4 guard evidence it does not have.
+  const root = mkTmpDir();
+  writeMcpSession(root, 's1', ['stub'], ['Read']);
+  writeMcpSession(root, 's2', ['stub'], ['Read']);
+  // The same two sessions again, under the alternate (un-nested) layout.
+  for (const id of ['s1', 's2']) {
+    fs.cpSync(path.join(root, 'sessions', id), path.join(root, id), { recursive: true });
+  }
+
+  const res = fineTune({ cwd: '/nonexistent', root });
+  assert.equal(res.mcp.sessionCount, 2, 'two distinct session ids, not four');
+  assert.equal(res.mcp.servers.find((s) => s.name === 'stub').deny, false, 'two sessions is below the guard');
 });
 
 test('fineTune omits the MCP key entirely when no server is denied (preserves the FT1 block shape)', () => {

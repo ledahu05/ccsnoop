@@ -123,14 +123,17 @@ export function denyIntersection(shipped, denylist) {
  * Built-in tools (FT1) always emit `permissions.deny`. The MCP lever (FT4) emits
  * `disabledMcpjsonServers` — the denied server names — **only under the T4 guard**
  * (`sessionCount>=3 AND calledCount==0`, never in single-session mode); every
- * shipped server is otherwise shown flag-only with its `calledCount`. The
- * settings block stays pure, comment-free JSON; `disabledMcpjsonServers` is OMITTED
- * entirely when no server is denied, so a corpus with no MCP action keeps the FT1
- * block shape (`{ permissions: { deny } }`). The per-lever shipped/waste byte
- * table arrives with the later lever tickets (T5/T6).
+ * other server seen is shown flag-only with its `calledCount`. The settings block
+ * stays pure, comment-free JSON; `disabledMcpjsonServers` is OMITTED entirely when
+ * no server is denied, so a corpus with no MCP action keeps the FT1 block shape
+ * (`{ permissions: { deny } }`). The per-lever shipped/waste byte table arrives
+ * with the later lever tickets (T5/T6).
+ *
+ * `mcp` is required: every run computes a corpus (an empty one when nothing was
+ * captured), so one diagnostic shape covers every case.
  *
  * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[],
- *   denylist: DenylistEntry[], mcp?: import('./finetune-mcp.js').McpCorpus }} ctx
+ *   denylist: DenylistEntry[], mcp: import('./finetune-mcp.js').McpCorpus }} ctx
  * @returns {{ lines: string[], settingsJson: string }}
  */
 export function renderFineTune({ sessionId, requests, shipped, deny, denylist, mcp }) {
@@ -149,21 +152,20 @@ export function renderFineTune({ sessionId, requests, shipped, deny, denylist, m
   }
 
   // MCP lever (FT4) — deny only under the T4 guard, else flag-only with counts.
-  const mcpServers = mcp?.servers ?? [];
-  const mcpDeny = mcpServers.filter((s) => s.deny).map((s) => s.name);
-  if (mcp) {
-    const scope = mcp.singleSession
-      ? 'single-session — flag-only'
-      : `corpus, ${mcp.sessionCount} session${mcp.sessionCount === 1 ? '' : 's'}`;
-    lines.push('');
-    lines.push(`MCP servers: ${mcpServers.length} shipped (${scope})`);
-    for (const s of mcpServers) {
-      const action = s.deny ? 'deny ✓' : `flag (called ${s.calledCount}/${mcp.sessionCount})`;
-      lines.push(`  ${s.name.padEnd(18)} ${action}`);
-    }
-    if (mcpServers.length === 0) {
-      lines.push('  (no MCP server shipped in the corpus)');
-    }
+  // "seen", not "shipped": a server that was called with no deferred listing in the
+  // capture is in the corpus too (see McpServerVerdict.shippedSessions).
+  const mcpDeny = mcp.servers.filter((s) => s.deny).map((s) => s.name);
+  const scope = mcp.singleSession
+    ? 'single-session — flag-only'
+    : `corpus, ${mcp.sessionCount} session${mcp.sessionCount === 1 ? '' : 's'}`;
+  lines.push('');
+  lines.push(`MCP servers: ${mcp.servers.length} seen (${scope})`);
+  for (const s of mcp.servers) {
+    const action = s.deny ? 'deny ✓' : `flag (called ${s.calledCount}/${mcp.sessionCount})`;
+    lines.push(`  ${s.name.padEnd(18)} ${action}`);
+  }
+  if (mcp.servers.length === 0) {
+    lines.push('  (no MCP server seen in the corpus)');
   }
 
   lines.push('');
@@ -180,6 +182,24 @@ export function renderFineTune({ sessionId, requests, shipped, deny, denylist, m
   lines.push('settings.json (paste-ready):');
   lines.push(settingsJson);
   return { lines, settingsJson };
+}
+
+/**
+ * Sessions with a repeated id collapsed to their first occurrence. Discovery can
+ * surface one session twice — `listSessions` scans `<root>/sessions/` *and*
+ * `<root>/` itself, and `--all` may add a route root that is already the cwd root.
+ * The MCP guard counts sessions as evidence (`sessionCount>=3`), so a session
+ * counted twice would let a deny fire on evidence the corpus does not have.
+ *
+ * @template {{ id: string }} T
+ * @param {T[]} sessions
+ * @returns {T[]}
+ */
+function uniqueById(sessions) {
+  /** @type {Map<string, T>} */
+  const byId = new Map();
+  for (const s of sessions) if (!byId.has(s.id)) byId.set(s.id, s);
+  return [...byId.values()];
 }
 
 /**
@@ -228,7 +248,7 @@ export function fineTune(opts = {}) {
 
   // MCP corpus (FT4) — over the chosen session in single-session mode, over the
   // whole corpus otherwise. On the fly each run; nothing persisted.
-  const mcpSessions = singleSession ? [chosen] : sessions;
+  const mcpSessions = singleSession ? [chosen] : uniqueById(sessions);
   const profiles = mcpSessions.map((s) => sessionMcpProfile(s.dir, s.id));
   const mcp = aggregateMcpCorpus(profiles, { singleSession });
 

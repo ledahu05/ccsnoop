@@ -44,8 +44,12 @@ export const MCP_GUARD_MIN_SESSIONS = 3;
 
 /**
  * @typedef {object} McpServerVerdict
- * @property {string} name            Server name (from the deferred listing).
- * @property {number} shippedSessions Sessions whose deferred listing named this server.
+ * @property {string} name            Server name (from the deferred listing, or a call name).
+ * @property {number} shippedSessions Sessions whose deferred listing named this server. May be 0:
+ *                                    the listing only appears while a server is *connecting*, so a
+ *                                    session whose servers were already up calls tools with no
+ *                                    listing at all. Such a server is used by definition, hence
+ *                                    never denied.
  * @property {number} calledCount     Number of SESSIONS that called this server (≥1 tool_use).
  * @property {boolean} deny           True iff `sessionCount>=3 AND calledCount===0` (and not single-session).
  */
@@ -54,13 +58,21 @@ export const MCP_GUARD_MIN_SESSIONS = 3;
  * @typedef {object} McpCorpus
  * @property {number} sessionCount        Number of sessions aggregated.
  * @property {boolean} singleSession      True iff the run is single-session (deny forced off).
- * @property {McpServerVerdict[]} servers Every shipped server, in sorted name order.
+ * @property {McpServerVerdict[]} servers Every server the corpus shipped and/or called, in sorted
+ *                                        name order.
  */
 
 // The CC deferred-listing header that precedes the connecting-server names. Pinned
 // to the FT0 capture's real phrasing (bench/SPEC.md §0, CC v2.1.220) — the server
-// names follow this line, one per line, until a blank line ends the list.
+// names follow on the NEXT lines, one per line, until a blank line ends the list.
 const MCP_CONNECTING_HEADER = /MCP servers are still connecting/i;
+
+// A server name is a bare token — the shape a `.mcp.json` key takes. Both halves
+// of the lever agree on this charset: the listing accepts only lines matching it,
+// and `mcpServerOf` reads the same shape back out of a call name, so a shipped
+// name and a called name can never fail to meet.
+const MCP_SERVER_NAME = /^[A-Za-z0-9_.-]+$/;
+const MCP_CALL_NAME = /^mcp__([A-Za-z0-9_.-]+?)__/;
 
 /**
  * Parse the **deferred MCP listing** from a system-reminder text — the server
@@ -68,10 +80,13 @@ const MCP_CONNECTING_HEADER = /MCP servers are still connecting/i;
  *
  * The same `<system-reminder>` also lists deferred *built-in tools* (CronCreate,
  * WebSearch, …) one paragraph ABOVE the server list; those are NOT servers and
- * must not leak into the shipped-MCP set. The parser keys on the connecting-header
- * phrase and reads only the single-token names that follow it, stopping at the
- * first blank line (the trailing "If the user's request…" prose) — so a server
- * name is always a bare token with no spaces, the shape `.mcp.json` keys take.
+ * must not leak into the shipped-MCP set. So the parser keys on the
+ * connecting-header phrase and reads the lines BELOW it, taking bare-token names
+ * only and stopping at the first line that is not one — the blank line before the
+ * trailing "If the user's request…" caveat, a `<…system-reminder>` boundary, or any
+ * prose. Stopping (rather than skipping ahead) keeps a reworded or wrapped header
+ * from pulling an unrelated token into a `settings.json` the user will paste: a
+ * phantom deny is worse than a missed one.
  *
  * @param {string} text  The text of a system block (may span multiple reminders).
  * @returns {string[]}   Distinct server names, in first-seen order.
@@ -90,22 +105,14 @@ export function parseDeferredMcpServers(text) {
   for (;;) {
     const m = text.slice(cursor).match(MCP_CONNECTING_HEADER);
     if (!m) break;
-    const base = cursor + m.index + m[0].length;
-    cursor = base; // advance past this header so the next iteration finds the next one
-    // The rest of the header line ("…will appear shortly:") and the names follow.
-    // A name is a single token; a line with spaces is prose and ends the list.
-    let started = false;
-    for (const rawLine of text.slice(base).split('\n')) {
+    // Names start on the line AFTER the header; the rest of the header line is its
+    // own tail ("… will appear shortly:"), never a name.
+    const eol = text.indexOf('\n', cursor + m.index + m[0].length);
+    if (eol < 0) break; // header with no line below it — nothing is listed
+    cursor = eol + 1; // also where the search for the next listing resumes
+    for (const rawLine of text.slice(cursor).split('\n')) {
       const line = rawLine.trim();
-      if (line.length === 0) break; // a blank line ends this listing
-      if (line === '</system-reminder>') break;
-      if (/\s/.test(line)) {
-        // Prose before any name = header continuation (skip); prose after a name
-        // cannot occur (a blank line separates the list from the caveat) — stop.
-        if (started) break;
-        continue;
-      }
-      started = true;
+      if (!MCP_SERVER_NAME.test(line)) break; // blank, tag or prose — the list ends here
       if (!seen.has(line)) {
         seen.add(line);
         names.push(line);
@@ -121,12 +128,17 @@ export function parseDeferredMcpServers(text) {
  * (`Read`, `Bash`, …) has no such prefix and must never be attributed to a
  * server — otherwise a built-in tool could mark a same-named server as used.
  *
+ * The split is at the FIRST `__` after the prefix, because the SERVER is the first
+ * segment and a tool name may itself contain `__` (`mcp__stub__do__thing` is one
+ * call on `stub`). Splitting at the last would strand the server as `stub__do`,
+ * which matches no shipped name — and a used server would then be denied.
+ *
  * @param {string} toolName
  * @returns {string | null}
  */
 export function mcpServerOf(toolName) {
   if (typeof toolName !== 'string') return null;
-  const m = toolName.match(/^mcp__([A-Za-z0-9_.-]+)__/);
+  const m = toolName.match(MCP_CALL_NAME);
   return m ? m[1] : null;
 }
 
@@ -266,7 +278,9 @@ export function sessionMcpProfile(dir, id = path.basename(dir)) {
  */
 export function aggregateMcpCorpus(profiles, opts = {}) {
   const singleSession = Boolean(opts.singleSession);
-  const list = Array.isArray(profiles) ? profiles : [];
+  // A hole in the list is not a session: `sessionCount` is the guard's denominator,
+  // so counting one would let the deny fire on less evidence than it requires.
+  const list = (Array.isArray(profiles) ? profiles : []).filter(Boolean);
   const sessionCount = list.length;
 
   // shippedSessions + calledCount per server, accumulated in one pass.
@@ -281,7 +295,6 @@ export function aggregateMcpCorpus(profiles, opts = {}) {
     return e;
   };
   for (const profile of list) {
-    if (!profile) continue;
     for (const name of profile.shipped ?? []) touch(name).shippedSessions += 1;
     for (const name of profile.called ?? []) touch(name).calledCount += 1;
   }
