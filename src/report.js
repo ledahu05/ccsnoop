@@ -387,10 +387,16 @@ export function pickLatestSession(sessions) {
 
 /**
  * Roots to search for sessions (spec §3.5). Default = `<cwd>/.ccsnoop/`;
- * `--root` overrides; `--sessions-dir` pins the dir that directly holds session
- * subdirs (mirrors `start --sessions-dir`) and takes precedence over `--root`;
- * `--all` widens across every root in `~/.ccsnoop/routes.json`. `fine-tune` shares
- * this resolver so its discovery matches `report` exactly (fine-tune-spec Part 1).
+ * `--root` overrides; `--sessions-dir` names the same dir under the flag `start`
+ * uses (so a capture pinned with `start --sessions-dir <p>` is read back with the
+ * same `<p>`) and takes precedence over `--root`; `--all` widens across every root
+ * in `~/.ccsnoop/routes.json`. Either flag resolves to a search root, and
+ * {@link listSessions} scans both `<root>/sessions/*` and `<root>/*`, so both
+ * capture shapes are found under either flag — the flags differ only in precedence
+ * and in which command's vocabulary they echo. An explicit dir also skips `--all`:
+ * pinning one location and widening across every route are contradictory asks.
+ * `fine-tune` shares this resolver so its discovery matches `report` exactly
+ * (fine-tune-spec Part 1).
  *
  * @param {{ cwd: string, root?: string, sessionsDir?: string, all?: boolean }} opts
  * @returns {string[]}

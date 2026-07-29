@@ -174,12 +174,26 @@ export function denyIntersection(shipped, denylist) {
 }
 
 /**
- * Category + note stamped onto a name added via `--deny-extra` (spec Part 4). The
- * override is a one-run addition with no curated reason, so the diagnostic shows a
- * generic marker — the name is still emitted bare, like every other deny entry.
+ * Category + note stamped onto a name added via `--deny-extra` (spec Part 4). A
+ * one-run addition has no curated reason, so it gets a generic marker — enough to
+ * satisfy the {@link DenylistEntry} triple. The name is still emitted bare, like
+ * every other deny entry.
  */
-export const DENY_EXTRA_CATEGORY = 'override';
-export const DENY_EXTRA_NOTE = 'added via --deny-extra (one-run override)';
+const DENY_EXTRA_CATEGORY = 'override';
+const DENY_EXTRA_NOTE = 'added via --deny-extra (one-run override)';
+
+/**
+ * Normalise a raw override flag value into bare names: trimmed, empties dropped.
+ * A non-array (or absent) value is a no-op `[]` — never iterated, so a stray
+ * string can't explode into one single-character deny entry per letter.
+ *
+ * @param {unknown} values
+ * @returns {string[]}
+ */
+function bareNames(values) {
+  if (!Array.isArray(values)) return [];
+  return values.map((n) => (typeof n === 'string' ? n.trim() : '')).filter((n) => n.length > 0);
+}
 
 /**
  * Apply the T7 one-run denylist override (spec Part 4 — one of two override paths,
@@ -201,19 +215,12 @@ export const DENY_EXTRA_NOTE = 'added via --deny-extra (one-run override)';
  * @param {{ extra?: string[], allow?: string[] }} [override]
  * @returns {DenylistEntry[]}
  */
-export function applyDenylistOverride(denylist, { extra = [], allow = [] } = {}) {
-  /** Bare, trimmed, non-empty allowed names. */
-  const allowSet = new Set(
-    allow
-      .map((n) => (typeof n === 'string' ? n.trim() : ''))
-      .filter((n) => n.length > 0)
-  );
+export function applyDenylistOverride(denylist, { extra, allow } = {}) {
+  const allowSet = new Set(bareNames(allow));
   const out = denylist.filter((e) => !allowSet.has(e.name));
   /** @type {Set<string>} */
   const have = new Set(out.map((e) => e.name));
-  for (const raw of extra) {
-    const name = typeof raw === 'string' ? raw.trim() : '';
-    if (name.length === 0) continue;
+  for (const name of bareNames(extra)) {
     if (allowSet.has(name)) continue; // allow wins over extra for the same name
     if (have.has(name)) continue; // base entry kept as-is — no rewrite, no duplicate
     out.push({ name, category: DENY_EXTRA_CATEGORY, note: DENY_EXTRA_NOTE });
@@ -244,13 +251,19 @@ export function applyDenylistOverride(denylist, { extra = [], allow = [] } = {})
  * captured), so one diagnostic shape covers every case. `gain` defaults to empty
  * (zeros) so the renderer is callable without a session model.
  *
+ * `denyAllowed` names the shipped denylist entries that the one-run `--deny-allow`
+ * dropped (T7). They produce no row and no key, but they are reported so the
+ * "none intersect the built-in denylist" note never claims a name did not match
+ * when it matched and was allowed away for the run.
+ *
  * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus,
  *   levers?: import('./finetune-levers.js').LeverVerdicts,
- *   gain?: import('./finetune-gain.js').GainModel }} ctx
+ *   gain?: import('./finetune-gain.js').GainModel,
+ *   denyAllowed?: string[] }} ctx
  * @returns {{ lines: string[], settingsJson: string }}
  */
-export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers = EMPTY_LEVER_VERDICTS, gain = EMPTY_GAIN }) {
+export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers = EMPTY_LEVER_VERDICTS, gain = EMPTY_GAIN, denyAllowed = [] }) {
   const hook = levers.hook;
   const mcpDeny = mcp.servers.filter((s) => s.deny).map((s) => s.name);
   const claudeMdExclude = levers.claudeMd.filter((c) => c.deny).map((c) => /** @type {string} */ (c.source));
@@ -340,7 +353,14 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   // and still produce no tools row, because only the denylist intersection is
   // recoverable. Saying nothing there would let a table with no rows read as "this
   // session shipped no tool context", which is false — hence the shipped count.
-  if (deny.length === 0) {
+  // A name the one-run `--deny-allow` dropped WOULD have been denied, so the
+  // built-in-denylist note below would be a false statement about it. Report the
+  // override instead — the reader needs to know the missing row is their own doing.
+  if (denyAllowed.length > 0) {
+    lines.push(
+      `Tools: ${shipped.length} shipped, ${denyAllowed.length} allowed for this run via --deny-allow (${denyAllowed.join(', ')}) — not denied`
+    );
+  } else if (deny.length === 0) {
     lines.push(`Tools: ${shipped.length} shipped, none intersect the built-in denylist`);
   }
   if (hook.bytes === 0) {
@@ -410,10 +430,9 @@ function uniqueById(sessions) {
  */
 export function fineTune(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
-  // `--sessions-dir` is the explicit pin (mirrors `start --sessions-dir` — the dir
-  // that directly holds session subdirs) and takes precedence over `--root`, which
-  // in turn overrides the default `<cwd>/.ccsnoop`. Both feed the shared root
-  // resolver `report` uses, so discovery is identical across the subcommands.
+  // Discovery is the shared resolver `report` uses, so it is identical across the
+  // subcommands: `--sessions-dir` (the pin named after `start --sessions-dir`) wins
+  // over `--root`, which overrides the default `<cwd>/.ccsnoop`.
   const roots = resolveRoots({ cwd, root: opts.root, all: opts.all, sessionsDir: opts.sessionsDir });
   const sessions = roots.flatMap((r) => listSessions(r));
   if (sessions.length === 0) {
@@ -438,12 +457,14 @@ export function fineTune(opts = {}) {
   const model = loadSession(chosen.dir, chosen.id);
   // The denylist is the versioned file (spec Part 4), then the T7 one-run override
   // (`--deny-extra` / `--deny-allow`) is applied on top — nothing persisted.
-  const denylist = applyDenylistOverride(loadBuiltinDenylist(opts.denylistPath), {
-    extra: opts.denyExtra,
-    allow: opts.denyAllow,
-  });
+  const baseDenylist = loadBuiltinDenylist(opts.denylistPath);
+  const denylist = applyDenylistOverride(baseDenylist, { extra: opts.denyExtra, allow: opts.denyAllow });
   const shipped = shippedToolNames(model);
   const deny = denyIntersection(shipped, denylist);
+  // What `--deny-allow` actually cost: shipped names the base list would have
+  // denied. The diagnostic reports these so a missing row is never read as
+  // "this tool is not on the denylist".
+  const denyAllowed = denyIntersection(shipped, baseDenylist).filter((n) => !deny.includes(n));
 
   // MCP corpus (FT4) — over the chosen session in single-session mode, over the
   // whole corpus otherwise. On the fly each run; nothing persisted.
@@ -470,6 +491,7 @@ export function fineTune(opts = {}) {
     mcp,
     levers,
     gain,
+    denyAllowed,
   });
 
   return {

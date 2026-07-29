@@ -47,9 +47,13 @@ function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-ft7-'));
 }
 
-/** Write a minimal captured session dir with a chosen tools[] (mirrors FT1's helper). */
-function writeSession(root, id, tools) {
-  const dir = path.join(root, 'sessions', id);
+/**
+ * Write a minimal captured session dir with a chosen tools[] (mirrors FT1's helper).
+ * `dir` is the session dir itself, so callers pick the capture shape: `<root>/sessions/<id>`
+ * (what the proxy writes under a capture root) or `<sessionsDir>/<id>` (what
+ * `start --sessions-dir` writes). `listSessions` scans both.
+ */
+function writeSessionAt(dir, id, tools) {
   fs.mkdirSync(dir, { recursive: true });
   const req = buildRequestBlob({
     method: 'POST',
@@ -74,6 +78,16 @@ function writeSession(root, id, tools) {
     JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
   );
   return dir;
+}
+
+/** A session under a capture root: `<root>/sessions/<id>/`. */
+function writeSession(root, id, tools) {
+  return writeSessionAt(path.join(root, 'sessions', id), id, tools);
+}
+
+/** A session directly under a pinned sessions dir: `<sessionsDir>/<id>/`. */
+function writeSessionDirectly(sessionsDir, id, tools) {
+  return writeSessionAt(path.join(sessionsDir, id), id, tools);
 }
 
 /** Parse the paste-ready JSON block out of a CLI run's stdout. */
@@ -145,6 +159,14 @@ test('applyDenylistOverride parses a comma list and ignores empties/whitespace',
   assert.equal(names.filter((n) => n === 'B').length, 1, 'B deduped');
 });
 
+test('applyDenylistOverride ignores a non-array override value', () => {
+  // A bare string must NOT be iterated character-by-character into 8 deny entries.
+  const base = V1_NAMES.map((name) => ({ name, category: 'c', note: 'n' }));
+  const notAList = /** @type {any} */ ('Workflow');
+  assert.deepEqual(applyDenylistOverride(base, { extra: notAList }), base);
+  assert.deepEqual(applyDenylistOverride(base, { allow: notAList }), base);
+});
+
 // ── fineTune() end-to-end with the override (AC #3) ───────────────────────────
 
 test('fineTune applies --deny-extra: an extra name is denied when shipped', () => {
@@ -179,23 +201,69 @@ test('fineTune denyExtra + denyAllow compose: allow wins over extra', () => {
   assert.deepEqual(res.deny, ['Artifact', 'Foo'], 'Workflow dropped, Foo added, denylist order');
 });
 
-// ── --sessions-dir (AC #2: mirrors start --sessions-dir, the dir holding sessions) ─
-
-test('fineTune resolves --sessions-dir as the dir that directly holds session subdirs', () => {
-  // A sessions dir whose CHILDREN are sessions (the shape `start --sessions-dir`
-  // captures to), distinct from a capture root that holds a `sessions/` subdir.
-  const sessionsDir = mkTmpDir();
-  writeSessionDirectly(sessionsDir, 'direct', [{ name: 'Workflow' }]);
-  const res = fineTune({ cwd: '/nonexistent', sessionsDir });
-  assert.equal(res.sessionId, 'direct', 'session found directly under --sessions-dir');
+test('the diagnostic never claims an allowed-away name missed the denylist', () => {
+  // Workflow IS on the built-in denylist and IS shipped; only --deny-allow kept it
+  // out of the deny. Reporting "none intersect the built-in denylist" would be false.
+  const root = mkTmpDir();
+  writeSession(root, 's', [{ name: 'Bash' }, { name: 'Workflow' }]);
+  const res = fineTune({ cwd: '/nonexistent', root, session: 's', denyAllow: ['Workflow'] });
+  const out = res.lines.join('\n');
+  assert.deepEqual(res.deny, []);
+  assert.ok(!/none intersect the built-in denylist/.test(out), out);
+  assert.match(out, /--deny-allow \(Workflow\)/);
 });
 
-test('fineTune: --sessions-dir takes precedence over the default <cwd>/.ccsnoop', () => {
+test('an allowed-away name is reported even when other tools are still denied', () => {
+  const root = mkTmpDir();
+  writeSession(root, 's', [{ name: 'Workflow' }, { name: 'Artifact' }]);
+  const res = fineTune({ cwd: '/nonexistent', root, session: 's', denyAllow: ['Workflow'] });
+  assert.deepEqual(res.deny, ['Artifact']);
+  assert.match(res.lines.join('\n'), /1 allowed for this run via --deny-allow \(Workflow\)/);
+});
+
+test('allowing a name that was never shipped adds no override note', () => {
+  const root = mkTmpDir();
+  writeSession(root, 's', [{ name: 'Bash' }, { name: 'Workflow' }]);
+  const res = fineTune({ cwd: '/nonexistent', root, session: 's', denyAllow: ['CronCreate'] });
+  assert.deepEqual(res.deny, ['Workflow']);
+  assert.ok(!/--deny-allow/.test(res.lines.join('\n')), 'nothing was actually dropped');
+});
+
+test('--deny-extra alone leaves the built-in-denylist note intact', () => {
+  // Nothing shipped intersects the base list, and the extra name is not shipped
+  // either — the note is still the accurate empty state.
+  const root = mkTmpDir();
+  writeSession(root, 's', [{ name: 'Bash' }]);
+  const res = fineTune({ cwd: '/nonexistent', root, session: 's', denyExtra: ['Nope'] });
+  assert.deepEqual(res.deny, []);
+  assert.match(res.lines.join('\n'), /1 shipped, none intersect the built-in denylist/);
+});
+
+// ── --sessions-dir (AC #2: mirrors start --sessions-dir, the dir holding sessions) ─
+
+test('fineTune finds a session directly under --sessions-dir, overriding the default root', () => {
+  // The shape `start --sessions-dir` captures to: the dir's CHILDREN are sessions,
+  // no `sessions/` middle layer. cwd points nowhere useful, so only the pin can win.
   const sessionsDir = mkTmpDir();
   writeSessionDirectly(sessionsDir, 'pinned', [{ name: 'Workflow' }]);
-  // cwd points nowhere useful; the explicit --sessions-dir pin must win.
   const res = fineTune({ cwd: '/nonexistent', sessionsDir });
-  assert.equal(res.sessionId, 'pinned');
+  assert.equal(res.sessionId, 'pinned', 'session found directly under --sessions-dir');
+});
+
+test('fineTune: --sessions-dir also finds the <dir>/sessions/<id> capture shape', () => {
+  // Either flag resolves to a search root and listSessions scans both layouts, so
+  // pinning a capture root with --sessions-dir still discovers its sessions.
+  const sessionsDir = mkTmpDir();
+  writeSession(sessionsDir, 'nested', [{ name: 'Workflow' }]);
+  const res = fineTune({ cwd: '/nonexistent', sessionsDir });
+  assert.equal(res.sessionId, 'nested');
+});
+
+test('fineTune: --sessions-dir pins one location, so --all does not widen past it', () => {
+  const sessionsDir = mkTmpDir();
+  writeSessionDirectly(sessionsDir, 'only', [{ name: 'Workflow' }]);
+  const res = fineTune({ cwd: '/nonexistent', sessionsDir, all: true });
+  assert.equal(res.sessionId, 'only');
 });
 
 test('fineTune: --sessions-dir takes precedence over --root when both are given', () => {
@@ -214,35 +282,6 @@ test('report mirrors fine-tune: generateReport honours sessionsDir too', () => {
   assert.ok(fs.existsSync(res.outPath));
   fs.rmSync(dir, { recursive: true, force: true });
 });
-
-/** Write a session dir directly under `sessionsDir/<id>/` (no `sessions/` middle layer). */
-function writeSessionDirectly(sessionsDir, id, tools) {
-  const dir = path.join(sessionsDir, id);
-  fs.mkdirSync(dir, { recursive: true });
-  const req = buildRequestBlob({
-    method: 'POST',
-    url: '/v1/messages',
-    rawHeaders: ['Content-Type', 'application/json'],
-    body: Buffer.from(
-      JSON.stringify({
-        model: 'claude-x',
-        system: [{ type: 'text', text: 'system prompt' }],
-        tools,
-        messages: [{ role: 'user', content: 'hi' }],
-      })
-    ),
-  });
-  fs.writeFileSync(path.join(dir, '0001.request.http'), req);
-  fs.writeFileSync(
-    path.join(dir, '0001.response.sse'),
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}}\n\n'
-  );
-  fs.writeFileSync(
-    path.join(dir, 'manifest.jsonl'),
-    JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
-  );
-  return dir;
-}
 
 // ── CLI dispatch (AC #2 / AC #3) ──────────────────────────────────────────────
 
