@@ -1,11 +1,13 @@
-// Fine-tune engine (fine-tune-spec.md; FT1 = issue #71 — the skeleton slice).
+// Fine-tune engine (fine-tune-spec.md).
 //
-// A pure consumer of a captured session, like report. It loads ONE session,
-// intersects the session's shipped tools[] names with the built-in denylist
-// (data/builtin-denylist.json), and emits a minimal CLI text diagnostic plus a
-// paste-ready, pure-JSON settings.json block whose `permissions.deny` is that
-// intersection (bare names). Bytes/per-lever tables, the corpus scan, and the
-// MCP/hooks/CLAUDE.md levers are later tickets (T4–T6); FT1 is the tracer bullet.
+// A pure consumer of captured sessions, like report. The built-in tools lever
+// (FT1, issue #71) intersects the primary session's shipped tools[] names with
+// the built-in denylist (data/builtin-denylist.json) and emits `permissions.deny`
+// (bare names). The MCP lever (FT4, issue #74) aggregates shipped/called across
+// the corpus and emits `disabledMcpjsonServers` under the T4 guard
+// (`sessionCount>=3 AND calledCount==0`); the MCP corpus + guard live in
+// `./finetune-mcp.js`. Bytes/per-lever shipped-waste tables and the hooks /
+// CLAUDE.md levers are later tickets (T5/T6).
 //
 // Non-negotiables inherited from the spec: bytes never tokens (the diagnostic
 // figures come from Segment.bytes); output is advice-to-copy, never auto-applied.
@@ -17,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadSession, resolveRoots, listSessions, pickLatestSession } from './report.js';
+import { sessionMcpProfile, aggregateMcpCorpus } from './finetune-mcp.js';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -115,16 +118,25 @@ export function denyIntersection(shipped, denylist) {
 }
 
 /**
- * Render the FT1 diagnostic + paste-ready settings.json block (spec Part 5).
- * Minimal for this slice: a session header, a one-line-per-denied-tool list, the
- * cache-invalidation warning (above a non-empty deny), and the pure-JSON block —
- * no comments (caveats live in the text, never in the block). The per-lever
- * shipped/waste byte table arrives with the later lever tickets (T5/T6).
+ * Render the diagnostic + paste-ready settings.json block (spec Part 5).
  *
- * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[], denylist: DenylistEntry[] }} ctx
+ * Built-in tools (FT1) always emit `permissions.deny`. The MCP lever (FT4) emits
+ * `disabledMcpjsonServers` — the denied server names — **only under the T4 guard**
+ * (`sessionCount>=3 AND calledCount==0`, never in single-session mode); every
+ * other server seen is shown flag-only with its `calledCount`. The settings block
+ * stays pure, comment-free JSON; `disabledMcpjsonServers` is OMITTED entirely when
+ * no server is denied, so a corpus with no MCP action keeps the FT1 block shape
+ * (`{ permissions: { deny } }`). The per-lever shipped/waste byte table arrives
+ * with the later lever tickets (T5/T6).
+ *
+ * `mcp` is required: every run computes a corpus (an empty one when nothing was
+ * captured), so one diagnostic shape covers every case.
+ *
+ * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[],
+ *   denylist: DenylistEntry[], mcp: import('./finetune-mcp.js').McpCorpus }} ctx
  * @returns {{ lines: string[], settingsJson: string }}
  */
-export function renderFineTune({ sessionId, requests, shipped, deny, denylist }) {
+export function renderFineTune({ sessionId, requests, shipped, deny, denylist, mcp }) {
   const byName = new Map(denylist.map((e) => [e.name, e]));
   /** @type {string[]} */
   const lines = [];
@@ -138,26 +150,73 @@ export function renderFineTune({ sessionId, requests, shipped, deny, denylist })
   if (deny.length === 0) {
     lines.push('  (no shipped tool intersects the built-in denylist)');
   }
+
+  // MCP lever (FT4) — deny only under the T4 guard, else flag-only with counts.
+  // "seen", not "shipped": a server that was called with no deferred listing in the
+  // capture is in the corpus too (see McpServerVerdict.shippedSessions).
+  const mcpDeny = mcp.servers.filter((s) => s.deny).map((s) => s.name);
+  const scope = mcp.singleSession
+    ? 'single-session — flag-only'
+    : `corpus, ${mcp.sessionCount} session${mcp.sessionCount === 1 ? '' : 's'}`;
   lines.push('');
-  if (deny.length > 0) {
+  lines.push(`MCP servers: ${mcp.servers.length} seen (${scope})`);
+  for (const s of mcp.servers) {
+    const action = s.deny ? 'deny ✓' : `flag (called ${s.calledCount}/${mcp.sessionCount})`;
+    lines.push(`  ${s.name.padEnd(18)} ${action}`);
+  }
+  if (mcp.servers.length === 0) {
+    lines.push('  (no MCP server seen in the corpus)');
+  }
+
+  lines.push('');
+  // Cache-invalidation warning above any block that changes `tools[]` / MCP load.
+  if (deny.length > 0 || mcpDeny.length > 0) {
     lines.push('⚠ Applying this block invalidates the cache (tools[] changes → prefix broken).');
   }
   // Pure, comment-free, paste-ready JSON. permissions.deny is always present
-  // (spec §3.1 — unconditional); other levers join with their tickets.
-  const settingsJson = JSON.stringify({ permissions: { deny } }, null, 2);
+  // (spec §3.1 — unconditional); disabledMcpjsonServers joins ONLY when the T4
+  // guard denies ≥1 server (omitted otherwise, so the FT1 shape is preserved).
+  const block = { permissions: { deny } };
+  if (mcpDeny.length > 0) block.disabledMcpjsonServers = mcpDeny;
+  const settingsJson = JSON.stringify(block, null, 2);
   lines.push('settings.json (paste-ready):');
   lines.push(settingsJson);
   return { lines, settingsJson };
 }
 
 /**
- * FT1 skeleton entry point. Resolve + load ONE session (mirroring
- * {@link module:report.generateReport} discovery), intersect its shipped tools
- * with the denylist, and render the diagnostic + JSON block. Single-session only
- * — no corpus, no MCP/hooks/CLAUDE.md emission yet.
+ * Sessions with a repeated id collapsed to their first occurrence. Discovery can
+ * surface one session twice — `listSessions` scans `<root>/sessions/` *and*
+ * `<root>/` itself, and `--all` may add a route root that is already the cwd root.
+ * The MCP guard counts sessions as evidence (`sessionCount>=3`), so a session
+ * counted twice would let a deny fire on evidence the corpus does not have.
  *
- * @param {{ cwd?: string, root?: string, session?: string, all?: boolean, denylistPath?: string }} [opts]
- * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[], lines: string[], settingsJson: string }}
+ * @template {{ id: string }} T
+ * @param {T[]} sessions
+ * @returns {T[]}
+ */
+function uniqueById(sessions) {
+  /** @type {Map<string, T>} */
+  const byId = new Map();
+  for (const s of sessions) if (!byId.has(s.id)) byId.set(s.id, s);
+  return [...byId.values()];
+}
+
+/**
+ * Entry point. Resolve + load sessions, intersect the primary session's shipped
+ * tools with the denylist, aggregate the MCP corpus, and render the diagnostic +
+ * JSON block.
+ *
+ * Scope (spec §3.2 / T4): **default = corpus** — aggregate every session under the
+ * resolved roots so the MCP "never used" guard has the evidence to fire. A run is
+ * **single-session** (weak-evidence) under `--session` / `--latest`: the MCP lever
+ * then NEVER denies (one session is too thin for a global verdict). The built-in
+ * tools deny is always taken from the primary session (latest, or the `--session`
+ * id) — its corpus story is a later ticket.
+ *
+ * @param {{ cwd?: string, root?: string, session?: string, latest?: boolean, all?: boolean, denylistPath?: string }} [opts]
+ * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[],
+ *   mcp: import('./finetune-mcp.js').McpCorpus, lines: string[], settingsJson: string }}
  */
 export function fineTune(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
@@ -169,6 +228,9 @@ export function fineTune(opts = {}) {
     );
   }
 
+  // Single-session = weak-evidence mode (--session picks one, --latest pins the
+  // most-recent one). Default (no flag) is corpus mode over every session.
+  const singleSession = Boolean(opts.session || opts.latest);
   let chosen;
   if (opts.session) {
     chosen = sessions.find((s) => s.id === opts.session);
@@ -183,13 +245,21 @@ export function fineTune(opts = {}) {
   const denylist = loadBuiltinDenylist(opts.denylistPath);
   const shipped = shippedToolNames(model);
   const deny = denyIntersection(shipped, denylist);
+
+  // MCP corpus (FT4) — over the chosen session in single-session mode, over the
+  // whole corpus otherwise. On the fly each run; nothing persisted.
+  const mcpSessions = singleSession ? [chosen] : uniqueById(sessions);
+  const profiles = mcpSessions.map((s) => sessionMcpProfile(s.dir, s.id));
+  const mcp = aggregateMcpCorpus(profiles, { singleSession });
+
   const { lines, settingsJson } = renderFineTune({
     sessionId: model.sessionId,
     requests: model.exchanges.length,
     shipped,
     deny,
     denylist,
+    mcp,
   });
 
-  return { sessionId: model.sessionId, requests: model.exchanges.length, shipped, deny, lines, settingsJson };
+  return { sessionId: model.sessionId, requests: model.exchanges.length, shipped, deny, mcp, lines, settingsJson };
 }

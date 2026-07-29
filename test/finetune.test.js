@@ -36,6 +36,9 @@ function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-finetune-'));
 }
 
+/** A corpus with no MCP server in it — the FT4 lever's no-op input (see finetune-mcp.test.js). */
+const EMPTY_MCP_CORPUS = { sessionCount: 0, singleSession: false, servers: [] };
+
 // The 9 v1 denylist names in spec order (data/builtin-denylist.json).
 const V1_NAMES = [
   'Workflow',
@@ -191,6 +194,7 @@ test('renderFineTune emits a parseable pure-JSON block with permissions.deny', (
     shipped: ['Bash', 'Workflow', 'Artifact'],
     deny: ['Workflow', 'Artifact'],
     denylist: loadBuiltinDenylist(),
+    mcp: EMPTY_MCP_CORPUS,
   });
   // The block is valid JSON, no comments.
   assert.doesNotThrow(() => JSON.parse(settingsJson));
@@ -210,6 +214,7 @@ test('renderFineTune omits the cache warning when there is nothing to deny', () 
     shipped: ['Bash'],
     deny: [],
     denylist: loadBuiltinDenylist(),
+    mcp: EMPTY_MCP_CORPUS,
   });
   assert.deepEqual(JSON.parse(settingsJson), { permissions: { deny: [] } });
   assert.ok(!lines.some((l) => /invalidates the cache/.test(l)), 'no warning for an empty deny');
