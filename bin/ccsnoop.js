@@ -165,10 +165,12 @@ function runReport(args) {
 }
 
 /**
- * `fine-tune` — print a CLI diagnostic + a paste-ready settings.json block for
- * one captured session (fine-tune-spec.md; FT1 = issue #71). Single-session
- * skeleton: emits `permissions.deny` = intersection of the session's tools[]
- * with data/builtin-denylist.json. Flags/dispatch mirror {@link runReport}.
+ * `fine-tune` — print a CLI diagnostic + a paste-ready settings.json block
+ * (fine-tune-spec.md). Built-in tools (FT1, issue #71) emit `permissions.deny`;
+ * the MCP lever (FT4, issue #74) aggregates the corpus and emits
+ * `disabledMcpjsonServers` under the T4 guard. Default scope = corpus;
+ * `--session` / `--latest` drop to single-session mode (no MCP deny).
+ * Flags/dispatch mirror {@link runReport}.
  * @param {string[]} args
  */
 function runFineTune(args) {
@@ -176,6 +178,7 @@ function runFineTune(args) {
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
     session: getFlag(args, '--session'),
+    latest: hasFlag(args, '--latest'),
     all: hasFlag(args, '--all'),
   });
   for (const line of result.lines) console.log(line);
@@ -226,7 +229,8 @@ Commands:
              --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
   fine-tune  Print a byte diagnostic + paste-ready settings.json for one session
              --root <path>        capture root (default ./.ccsnoop)
-             --session <id>       session to tune (default: latest)
+             --session <id>       one session (weak-evidence: no MCP deny)
+             --latest             most-recent session (weak-evidence: no MCP deny)
              --all                widen discovery across ~/.ccsnoop/routes.json`);
 }
 
