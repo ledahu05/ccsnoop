@@ -174,6 +174,55 @@ export function denyIntersection(shipped, denylist) {
 }
 
 /**
+ * Category + note stamped onto a name added via `--deny-extra` (spec Part 4). The
+ * override is a one-run addition with no curated reason, so the diagnostic shows a
+ * generic marker — the name is still emitted bare, like every other deny entry.
+ */
+export const DENY_EXTRA_CATEGORY = 'override';
+export const DENY_EXTRA_NOTE = 'added via --deny-extra (one-run override)';
+
+/**
+ * Apply the T7 one-run denylist override (spec Part 4 — one of two override paths,
+ * the other being to edit `data/builtin-denylist.json` in your checkout). Drop the
+ * names in `allow`, then append the names in `extra` that are not already present
+ * and not allowed. Returns a NEW array — the base list is never mutated.
+ *
+ * Precedence is `allow` > base > `extra`: an explicitly allowed name is dropped even
+ * if it was also passed to `--deny-extra` (allow is the strongest signal). A base
+ * entry is left untouched when re-added by `extra` (no rewrite of its
+ * `{category, note}`, no duplicate), so the diagnostic still shows the curated reason.
+ *
+ * `extra`/`allow` are bare names; whitespace and empties are tolerated (a raw
+ * `--deny-extra A, ,B` flag value yields `{A, B}`), matching how the CLI splits the
+ * comma-list. Order is deterministic: base order (minus allows), then extras in the
+ * order given — so the emitted `permissions.deny` is stable run to run.
+ *
+ * @param {DenylistEntry[]} denylist  The loaded base list (source of truth).
+ * @param {{ extra?: string[], allow?: string[] }} [override]
+ * @returns {DenylistEntry[]}
+ */
+export function applyDenylistOverride(denylist, { extra = [], allow = [] } = {}) {
+  /** Bare, trimmed, non-empty allowed names. */
+  const allowSet = new Set(
+    allow
+      .map((n) => (typeof n === 'string' ? n.trim() : ''))
+      .filter((n) => n.length > 0)
+  );
+  const out = denylist.filter((e) => !allowSet.has(e.name));
+  /** @type {Set<string>} */
+  const have = new Set(out.map((e) => e.name));
+  for (const raw of extra) {
+    const name = typeof raw === 'string' ? raw.trim() : '';
+    if (name.length === 0) continue;
+    if (allowSet.has(name)) continue; // allow wins over extra for the same name
+    if (have.has(name)) continue; // base entry kept as-is — no rewrite, no duplicate
+    out.push({ name, category: DENY_EXTRA_CATEGORY, note: DENY_EXTRA_NOTE });
+    have.add(name);
+  }
+  return out;
+}
+
+/**
  * Render the diagnostic + paste-ready settings.json block (spec Part 5 / FT6).
  *
  * The diagnostic is a CLI TEXT table — one row per lever entry with `shipped` /
@@ -353,14 +402,19 @@ function uniqueById(sessions) {
  * tools deny is always taken from the primary session (latest, or the `--session`
  * id) — its corpus story is a later ticket.
  *
- * @param {{ cwd?: string, root?: string, session?: string, latest?: boolean, all?: boolean, denylistPath?: string }} [opts]
+ * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, latest?: boolean, all?: boolean,
+ *   denyExtra?: string[], denyAllow?: string[], denylistPath?: string }} [opts]
  * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus, levers: import('./finetune-levers.js').LeverVerdicts,
  *   gain: import('./finetune-gain.js').GainModel, lines: string[], settingsJson: string }}
  */
 export function fineTune(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
-  const roots = resolveRoots({ cwd, root: opts.root, all: opts.all });
+  // `--sessions-dir` is the explicit pin (mirrors `start --sessions-dir` — the dir
+  // that directly holds session subdirs) and takes precedence over `--root`, which
+  // in turn overrides the default `<cwd>/.ccsnoop`. Both feed the shared root
+  // resolver `report` uses, so discovery is identical across the subcommands.
+  const roots = resolveRoots({ cwd, root: opts.root, all: opts.all, sessionsDir: opts.sessionsDir });
   const sessions = roots.flatMap((r) => listSessions(r));
   if (sessions.length === 0) {
     throw new Error(
@@ -382,7 +436,12 @@ export function fineTune(opts = {}) {
   }
 
   const model = loadSession(chosen.dir, chosen.id);
-  const denylist = loadBuiltinDenylist(opts.denylistPath);
+  // The denylist is the versioned file (spec Part 4), then the T7 one-run override
+  // (`--deny-extra` / `--deny-allow`) is applied on top — nothing persisted.
+  const denylist = applyDenylistOverride(loadBuiltinDenylist(opts.denylistPath), {
+    extra: opts.denyExtra,
+    allow: opts.denyAllow,
+  });
   const shipped = shippedToolNames(model);
   const deny = denyIntersection(shipped, denylist);
 

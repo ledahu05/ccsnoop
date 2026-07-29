@@ -150,6 +150,7 @@ function runReport(args) {
   const result = generateReport({
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
     session: getFlag(args, '--session'),
     out: getFlag(args, '--out'),
     all: hasFlag(args, '--all'),
@@ -173,16 +174,20 @@ function runReport(args) {
  * "intent unknown" caveat) and `claudeMdExcludes` (excludable sources only) —
  * neither ever says "unused", only "costs N bytes". Default scope = corpus;
  * `--session` / `--latest` drop to single-session mode (no MCP deny).
- * Flags/dispatch mirror {@link runReport}.
+ * `--deny-extra <a,b>` / `--deny-allow <a>` apply the T7 one-run denylist override
+ * (spec Part 4). Flags/dispatch mirror {@link runReport}.
  * @param {string[]} args
  */
 function runFineTune(args) {
   const result = fineTune({
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
     session: getFlag(args, '--session'),
     latest: hasFlag(args, '--latest'),
     all: hasFlag(args, '--all'),
+    denyExtra: parseList(getFlag(args, '--deny-extra')),
+    denyAllow: parseList(getFlag(args, '--deny-allow')),
   });
   for (const line of result.lines) console.log(line);
 }
@@ -208,6 +213,21 @@ function hasFlag(args, name) {
   return args.includes(name);
 }
 
+/**
+ * Split a `--flag a,b,c` value into a clean bare-name list: comma-separated,
+ * whitespace-trimmed, empties dropped. Undefined → `[]` so an absent flag is a
+ * no-op override. Used by the T7 `--deny-extra` / `--deny-allow` run overrides.
+ * @param {string | undefined} value
+ * @returns {string[]}
+ */
+function parseList(value) {
+  if (typeof value !== 'string') return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
 function printUsage() {
   console.log(`ccsnoop — snoop raw Claude Code ↔ Anthropic traffic
 
@@ -225,6 +245,7 @@ Commands:
   status   Report daemon status (running → exit 0, stopped → exit 1)
   report   Render a captured session to a self-contained static HTML file
              --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
              --session <id>       session to render (default: latest)
              --all                widen discovery across ~/.ccsnoop/routes.json
              --out <path>         output file (default <session-dir>/report.html)
@@ -232,9 +253,12 @@ Commands:
              --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
   fine-tune  Print a byte diagnostic + paste-ready settings.json (all sessions by default)
              --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
              --session <id>       one session (weak-evidence: no MCP deny)
              --latest             most-recent session (weak-evidence: no MCP deny)
-             --all                widen discovery across ~/.ccsnoop/routes.json`);
+             --all                widen discovery across ~/.ccsnoop/routes.json
+             --deny-extra <a,b>   add denylist names for this run only
+             --deny-allow <a>     drop a denylist name for this run only`);
 }
 
 main().catch((err) => {

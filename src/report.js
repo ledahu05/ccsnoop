@@ -387,12 +387,16 @@ export function pickLatestSession(sessions) {
 
 /**
  * Roots to search for sessions (spec §3.5). Default = `<cwd>/.ccsnoop/`;
- * `--root` overrides; `--all` widens across every root in `~/.ccsnoop/routes.json`.
+ * `--root` overrides; `--sessions-dir` pins the dir that directly holds session
+ * subdirs (mirrors `start --sessions-dir`) and takes precedence over `--root`;
+ * `--all` widens across every root in `~/.ccsnoop/routes.json`. `fine-tune` shares
+ * this resolver so its discovery matches `report` exactly (fine-tune-spec Part 1).
  *
- * @param {{ cwd: string, root?: string, all?: boolean }} opts
+ * @param {{ cwd: string, root?: string, sessionsDir?: string, all?: boolean }} opts
  * @returns {string[]}
  */
-export function resolveRoots({ cwd, root, all }) {
+export function resolveRoots({ cwd, root, sessionsDir, all }) {
+  if (sessionsDir) return [path.resolve(cwd, sessionsDir)];
   if (root) return [path.resolve(cwd, root)];
   const roots = [path.resolve(cwd, '.ccsnoop')];
   if (all) {
@@ -423,12 +427,12 @@ function readRoutesRoots() {
 /**
  * Discover, load, render and write a report (spec §3.5 discovery + §2 content).
  *
- * @param {{ cwd?: string, root?: string, session?: string, all?: boolean, out?: string, waste?: object }} [opts]
+ * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, all?: boolean, out?: string, waste?: object }} [opts]
  * @returns {{ outPath: string, sessionId: string, exchanges: number, root: string }}
  */
 export function generateReport(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
-  const roots = resolveRoots({ cwd, root: opts.root, all: opts.all });
+  const roots = resolveRoots({ cwd, root: opts.root, all: opts.all, sessionsDir: opts.sessionsDir });
   const sessions = roots.flatMap((r) => listSessions(r));
   if (sessions.length === 0) {
     throw new Error(
