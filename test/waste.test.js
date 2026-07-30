@@ -8,6 +8,7 @@ import {
   DEFAULT_WASTE_CONFIG,
   segmentRequest,
   detectBloat,
+  breakpointPositions,
   classifySegments,
   computeWaste,
 } from '../src/waste.js';
@@ -51,7 +52,10 @@ test('resolveWasteConfig locks sane defaults and accepts finite overrides only',
 
 // ── segmentation ────────────────────────────────────────────────────────────
 
-test('segmentRequest splits system blocks, each tool def, and each message', () => {
+test('segmentRequest splits system blocks, each tool def, and each message (render order)', () => {
+  // The prompt cache is a prefix of the RENDERED stream — tools come first — so
+  // segments are emitted in API render order: tools → system → messages (cache spec
+  // §2.1 / issue #82). A tools-only change must diverge the prefix at position 0.
   const body = {
     system: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }],
     tools: [{ name: 'Bash' }, { name: 'Read' }],
@@ -64,8 +68,8 @@ test('segmentRequest splits system blocks, each tool def, and each message', () 
   const segs = segmentRequest(body);
   const slots = segs.map((s) => s.slot);
   assert.deepEqual(slots, [
-    'system#0', 'system#1',
     'tool:Bash', 'tool:Read',
+    'system#0', 'system#1',
     'message#0', 'message#1', 'message#2',
   ]);
   // Buckets: last message is the current turn, the rest are history.
@@ -73,6 +77,72 @@ test('segmentRequest splits system blocks, each tool def, and each message', () 
   assert.equal(segs.find((s) => s.slot === 'message#0').bucket, 'history');
   assert.equal(segs.find((s) => s.slot === 'tool:Bash').bucket, 'tools');
   assert.ok(segs.every((s) => s.bytes > 0 && s.hash.length > 0));
+});
+
+// ── cache_control breakpoints (render-ordered metadata, issue #82 Part 2.2) ─────
+
+test('segmentRequest parses cache_control and attaches it as per-segment metadata', () => {
+  // The real Claude Code layout (fixture-confirmed): two system blocks + one message
+  // block carry a breakpoint, all ttl:"1h", NEVER on a tool. The message breakpoint
+  // can sit on ANY content block of the message (here, not the first) — every block
+  // is scanned, nothing is hard-coded to position 0.
+  const cc = { type: 'ephemeral', ttl: '1h' };
+  const body = {
+    tools: [{ name: 'Bash' }, { name: 'Read' }],
+    system: [
+      { type: 'text', text: 'preamble' },
+      { type: 'text', text: 'env', cache_control: cc },
+      { type: 'text', text: 'mem', cache_control: cc },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'part-a' },
+          { type: 'text', text: 'part-b', cache_control: cc },
+        ],
+      },
+      { role: 'assistant', content: 'a' },
+    ],
+  };
+  const segs = segmentRequest(body);
+  const withBp = segs.filter((s) => s.cacheControl);
+  // Exactly the three CC breakpoints, in render order; tools and the bare system#0 carry none.
+  assert.deepEqual(withBp.map((s) => s.slot), ['system#1', 'system#2', 'message#0']);
+  assert.ok(withBp.every((s) => s.cacheControl === cc), 'the parsed breakpoint object is attached verbatim');
+  assert.equal(segs.find((s) => s.slot === 'tool:Bash').cacheControl, undefined, 'CC never breakpoints a tool');
+  assert.equal(segs.find((s) => s.slot === 'system#0').cacheControl, undefined);
+});
+
+test('breakpointPositions returns render-ordered indices and is not hard-coded', () => {
+  const cc = { type: 'ephemeral', ttl: '1h' };
+  // A breakpoint on a LATER message yields a different index than "the first
+  // message" would, and a tool breakpoint (legal in the API even if CC omits it) is
+  // indexed too — proving nothing is pinned to a fixed slot/count.
+  const body = {
+    tools: [{ name: 'Bash', cache_control: cc }],
+    system: [{ type: 'text', text: 'a', cache_control: cc }],
+    messages: [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: [{ type: 'text', text: 'q2', cache_control: cc }] },
+    ],
+  };
+  const segs = segmentRequest(body);
+  // Render order: tool:Bash(0) → system#0(1) → message#0(2) → message#1(3) → message#2(4).
+  assert.deepEqual(segs.map((s) => s.slot), ['tool:Bash', 'system#0', 'message#0', 'message#1', 'message#2']);
+  assert.deepEqual(breakpointPositions(segs), [0, 1, 4]);
+});
+
+test('breakpointPositions is empty when cache_control is absent (older capture / non-CC)', () => {
+  const body = {
+    tools: [{ name: 'Bash' }],
+    system: 'a bare-string system carries no breakpoint',
+    messages: [{ role: 'user', content: 'hi' }],
+  };
+  const segs = segmentRequest(body);
+  assert.deepEqual(breakpointPositions(segs), []);
+  assert.ok(segs.every((s) => s.cacheControl === undefined));
 });
 
 test('segmentRequest is null-safe and handles a bare-string system', () => {

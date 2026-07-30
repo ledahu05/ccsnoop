@@ -97,6 +97,9 @@ function segBytes(value) {
  * @property {boolean} [flagship]  static ∩ reused-uncached (the flagship waste case).
  * @property {boolean} [bloated]   Segment carries an outlier tool_result.
  * @property {number} [bloatBytes] Byte length of the bloated tool_result.
+ * @property {{ type: string, ttl?: string } | undefined} [cacheControl]
+ *     Parsed `cache_control` breakpoint attached to this segment's element
+ *     (cache spec §2.2 / issue #82). `undefined` when the element carries none.
  */
 
 /**
@@ -114,21 +117,28 @@ export function segmentRequest(body, config = DEFAULT_WASTE_CONFIG) {
   const segs = [];
   if (!body || typeof body !== 'object') return segs;
 
-  // System — one segment per block, or a single segment for a bare string.
-  if (Array.isArray(body.system)) {
-    body.system.forEach((block, i) => {
-      segs.push(mkSeg('system', `system#${i}`, `System block #${i}`, block));
-    });
-  } else if (body.system != null) {
-    segs.push(mkSeg('system', 'system', 'System prompt', body.system));
-  }
+  // API RENDER ORDER: tools → system → messages (cache spec §2.1 / issue #82). The
+  // prompt cache is a prefix of the *rendered* stream, and the API renders tools
+  // first — so segments are emitted in that order. A tools-only change then diverges
+  // the cache prefix at position 0 (a KEY invalidation) instead of being mis-attributed
+  // to "system intact, break in tools". Slots/buckets are unchanged; only order moves.
+  // (`finetune.js`/`report.js` aggregate by slot/bucket, not by array position.)
 
   // Tools — one segment per definition, keyed by name (stable across requests).
   if (Array.isArray(body.tools)) {
     body.tools.forEach((tool, i) => {
       const name = tool && typeof tool.name === 'string' ? tool.name : `#${i}`;
-      segs.push(mkSeg('tools', `tool:${name}`, `Tool: ${name}`, tool));
+      segs.push(mkSeg('tools', `tool:${name}`, `Tool: ${name}`, tool, tool && tool.cache_control));
     });
+  }
+
+  // System — one segment per block, or a single segment for a bare string.
+  if (Array.isArray(body.system)) {
+    body.system.forEach((block, i) => {
+      segs.push(mkSeg('system', `system#${i}`, `System block #${i}`, block, block && block.cache_control));
+    });
+  } else if (body.system != null) {
+    segs.push(mkSeg('system', 'system', 'System prompt', body.system));
   }
 
   // Messages — one segment per entry; last entry is the current turn.
@@ -137,7 +147,7 @@ export function segmentRequest(body, config = DEFAULT_WASTE_CONFIG) {
   messages.forEach((msg, i) => {
     const bucket = i === messages.length - 1 ? 'currentTurn' : 'history';
     const role = msg && typeof msg.role === 'string' ? msg.role : '?';
-    const seg = mkSeg(bucket, `message#${i}`, `Message #${i} (${role})`, msg);
+    const seg = mkSeg(bucket, `message#${i}`, `Message #${i} (${role})`, msg, messageCacheControl(msg));
     const mark = bloatMarks.get(i);
     if (mark) {
       seg.bloated = true;
@@ -150,14 +160,61 @@ export function segmentRequest(body, config = DEFAULT_WASTE_CONFIG) {
 }
 
 /**
+ * Pull a `cache_control` breakpoint off a message, if any (cache spec §2.2). CC
+ * places a breakpoint on one CONTENT BLOCK of a message (never on the message
+ * object itself); a message whose content is a bare string carries none. A message
+ * is atomic at our segmentation granularity, so the breakpoint's render position is
+ * the segment's own index. Every content block is scanned; the last block carrying
+ * a breakpoint wins (it closes the cacheable region within the message).
+ * @param {any} msg
+ * @returns {{ type: string, ttl?: string } | undefined}
+ */
+function messageCacheControl(msg) {
+  if (!msg || typeof msg !== 'object') return undefined;
+  const c = msg.content;
+  if (Array.isArray(c)) {
+    /** @type {{ type: string, ttl?: string } | undefined} */
+    let cc;
+    for (const block of c) {
+      if (block && typeof block === 'object' && block.cache_control) cc = block.cache_control;
+    }
+    return cc;
+  }
+  if (c && typeof c === 'object' && c.cache_control) return c.cache_control;
+  return undefined;
+}
+
+/**
+ * Indices of the segments carrying a `cache_control` breakpoint, in render order
+ * (tools → system → messages). Claude Code places exactly three per request (two
+ * system blocks + one message block, all `ttl:"1h"`, never on a tool) and uses
+ * three of the four the API permits — but NOTHING here is hard-coded: any segment
+ * with a breakpoint counts, and an empty array is returned when `cache_control` is
+ * absent (older capture / non-CC client). The cache spec's capability frontier
+ * (`lastMatchingBreakpoint`, issue #84) is built from this list.
+ * @param {Segment[]} segments
+ * @returns {number[]}
+ */
+export function breakpointPositions(segments) {
+  const out = [];
+  for (let i = 0; i < segments.length; i++) {
+    if (segments[i].cacheControl) out.push(i);
+  }
+  return out;
+}
+
+/**
  * @param {Segment['bucket']} bucket
  * @param {string} slot
  * @param {string} label
  * @param {any} value
+ * @param {{ type: string, ttl?: string } | undefined} [cacheControl]
  * @returns {Segment}
  */
-function mkSeg(bucket, slot, label, value) {
-  return { bucket, slot, label, hash: hashSegment(value), bytes: segBytes(value) };
+function mkSeg(bucket, slot, label, value, cacheControl) {
+  const seg = { bucket, slot, label, hash: hashSegment(value), bytes: segBytes(value) };
+  if (cacheControl) seg.cacheControl = cacheControl;
+  return seg;
 }
 
 /**
