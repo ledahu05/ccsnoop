@@ -107,5 +107,15 @@ test('cache fixture: diagnoseCache runs on a real captured session (issue #84, A
         assert.ok(r.bytes >= 0, `${id}: turn ${c.turn} region bytes is non-negative`);
       }
     }
+
+    // T4 (#85): the session rollup is EXACT, straight from the real `usage` — no attribution,
+    // no re-tokenization. Every CC write here is 1 h (×2); reads are ×0.1. This session is
+    // healthy (turn 1 establishes, turns 2–6 are warm HITs), so there is no re-write waste.
+    assert.equal(d.rollup.totals.write.equiv, 30874, `${id}: Σ cacheCreation1h × 2`);
+    assert.equal(d.rollup.totals.write.equivRange, null, `${id}: all writes are a known (1 h) tier ⇒ no range`);
+    assert.equal(d.rollup.totals.write.raw['1h'], 15437, `${id}: raw 1 h write tokens`);
+    assert.equal(d.rollup.totals.read.equiv, 18492.5, `${id}: Σ cacheRead × 0.1`);
+    assert.equal(d.rollup.totals.wasted.equiv, 0, `${id}: no cold re-write turns ⇒ no waste`);
+    assert.equal(d.rollup.summedCounterfactual.equiv, 0, `${id}: nothing would have been avoided`);
   }
 });
