@@ -295,6 +295,97 @@ test('rollup: a session with an unknown-tier turn carries a write range, not a f
   assert.deepEqual(w.equivRange, [4500, 6000]);
 });
 
+// ── partial / dirty `usage`: no write mass is ever dropped or falsely exact ────
+
+test('a per-tier write with no flat total is still costed (the tier fields are authoritative)', () => {
+  // A capture that reports `cache_creation.ephemeral_1h_input_tokens` but no flat
+  // `cache_creation_input_tokens`: the write is real and must not vanish from the total.
+  const body = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: body, usage: costUsage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      { threadId: 'A', turn: 2, requestBody: body, usage: costUsage({ cacheCreation: 0, c1h: 1000 }), requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+    ],
+    { ttl: TTL },
+  );
+  assert.equal(d.transitions[0].cost.equiv, 2000, 'the re-write is costed from the tier field');
+  assert.equal(d.rollup.totals.write.equiv, 2000, 'and it reaches the session total');
+});
+
+test('a flat total the per-tier fields under-sum: the remainder is tier-unknown, so the figure is a bound', () => {
+  // flat 1000 but only 600 attributed to the 1 h tier — the other 400 has no reported tier.
+  // Pricing only the 600 would silently under-report; pricing all 1000 at ×2 would invent a
+  // tier. The honest answer is a span: 600×2 + 400×[1.25, 2] = [1700, 2000].
+  const body = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: body, usage: costUsage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      { threadId: 'A', turn: 2, requestBody: body, usage: costUsage({ cacheCreation: 1000, c1h: 600 }), requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+    ],
+    { ttl: TTL },
+  );
+  const cost = d.transitions[0].cost;
+  assert.equal(cost.rawTokens, 1000, 'the whole reported write mass is priced, none dropped');
+  assert.equal(cost.equiv, null, 'no false-precise number while any mass is tier-unknown');
+  assert.deepEqual(cost.equivRange, [1700, 2000]);
+  assert.equal(d.rollup.totals.write.raw.unknown, 400, 'the unattributed mass is recorded as unknown');
+  assert.equal(d.rollup.totals.write.raw['1h'], 600);
+});
+
+test('a dirty `usage` (NaN / negative / non-numeric fields) costs nothing rather than NaN', () => {
+  const body = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: body, usage: costUsage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      {
+        threadId: 'A',
+        turn: 2,
+        requestBody: body,
+        usage: { ...costUsage(), cacheCreationInputTokens: NaN, cacheCreation1hInputTokens: -5, cacheReadInputTokens: /** @type {any} */ ('700') },
+        requestReceivedAt: T1_RECV_COLD,
+        responseCompletedAt: T1_DONE,
+      },
+    ],
+    { ttl: TTL },
+  );
+  assert.equal(d.transitions[0].cost, undefined, 'no write mass survives the guard ⇒ no cost line');
+  assert.equal(d.rollup.totals.write.equiv, 0);
+  assert.equal(d.rollup.totals.read.equiv, 0, 'a string token count is not coerced');
+});
+
+// ── the totals cover exactly the diagnosed turns ──────────────────────────────
+
+test('probe turns (max_tokens 1) are excluded from the cost totals', () => {
+  const body = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: body, usage: costUsage({ input: 10, cacheCreation: 100, c1h: 100 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      { threadId: 'A', turn: 2, requestBody: body, maxTokens: 1, usage: costUsage({ cacheRead: 9999, cacheCreation: 9999, c1h: 9999 }), requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+    ],
+    { ttl: TTL },
+  );
+  assert.equal(d.rollup.totals.write.equiv, 200, 'only the real turn contributes (100×2)');
+  assert.equal(d.rollup.totals.read.equiv, 0, "the probe's read is filtered out too");
+});
+
+test('the wasted total is a bound when a cold turn\'s tier is unknown', () => {
+  const body = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: body, usage: costUsage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      { threadId: 'A', turn: 2, requestBody: body, usage: costUsage({ cacheCreation: 1000, c1h: 1000 }), requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+      { threadId: 'A', turn: 3, requestBody: body, usage: costUsage({ cacheCreation: 400 }), requestReceivedAt: '2026-07-28T07:54:01.000Z', responseCompletedAt: '2026-07-28T07:54:02.000Z' },
+    ],
+    { ttl: TTL },
+  );
+  // Turn 2: 1000×2 = 2000 exact. Turn 3: flat 400, tier unknown ⇒ 400×[1.25, 2] = [500, 800].
+  const wasted = d.rollup.totals.wasted;
+  assert.equal(wasted.equiv, null, 'one tier-unknown turn ⇒ no exact wasted total');
+  assert.deepEqual(wasted.equivRange, [2500, 2800]);
+  assert.deepEqual(d.rollup.summedCounterfactual.equivRange, [2500, 2800], 'the counterfactual mirrors it');
+  assert.equal(d.rollup.summedCounterfactual.rawTokens, 1400, 'raw waste mass spans both tiers and the unknown');
+});
+
 // ── empty session ─────────────────────────────────────────────────────────────
 
 test('an empty session yields zeroed cost totals, not a crash', () => {

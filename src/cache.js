@@ -36,9 +36,9 @@ export const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
 export const TIER_MULTIPLIERS = Object.freeze({ '5m': 1.25, '1h': 2, read: 0.1 });
 
 /**
- * The tier-unknown bound (cache spec §4): when `usage` carries a flat `cache_creation`
- * but neither per-tier field, the write is somewhere in [×1.25, ×2]. Costed as a bound,
- * never a false-precise single number.
+ * The tier-unknown bound (cache spec §4): write mass the per-tier fields do not account for
+ * — all of it when `usage` carries a flat `cache_creation` but neither per-tier field — is
+ * somewhere in [×1.25, ×2]. Costed as a bound, never a false-precise single number.
  */
 export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
 
@@ -58,19 +58,22 @@ export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
 
 /**
  * @typedef {object} TokEquiv
- * @property {number} rawTokens                 Σ raw tokens across `components`, or the
- *     flat `cache_creation` total when the tier is unknown.
+ * @property {number} rawTokens                 Σ raw tokens priced here — `components` plus
+ *     `unknownTokens`. Always the whole write mass `usage` reported; nothing is dropped.
  * @property {TierCost[]} components            The per-tier multiplier breakdown (one entry
- *     per known tier present; empty when the tier is unknown).
+ *     per known tier present; empty when no tier is known).
+ * @property {number} unknownTokens             Raw tokens whose tier `usage` did not report
+ *     (the flat `cache_creation` mass the per-tier fields leave unaccounted). Priced as a
+ *     `[×1.25, ×2]` span, never as a point.
  * @property {number | null} equiv              Σ `components[].equiv` — the exact effective
- *     token-equivalents. `null` when the tier is unknown (a false-precise single number is
- *     forbidden — see `equivRange`).
+ *     token-equivalents. `null` when any mass is tier-unknown (a false-precise single number
+ *     is forbidden — see `equivRange`).
  * @property {number | null} multiplier         The single multiplier when exactly one tier
- *     applies; `null` when the write is mixed or the tier is unknown.
+ *     applies to the whole write; `null` when the write is mixed or any mass is tier-unknown.
  * @property {Tier} tier
- * @property {[number, number] | null} equivRange  `[lo, hi]` bound when the tier is unknown
- *     (`[rawTokens × 1.25, rawTokens × 2]`); `null` otherwise.
- * @property {boolean} bounded                  `true` when `equiv` is an upper bound, not an
+ * @property {[number, number] | null} equivRange  `[lo, hi]` bound when any mass is
+ *     tier-unknown (the known equiv plus `unknownTokens × [1.25, 2]`); `null` otherwise.
+ * @property {boolean} bounded                  `true` when the figure is an upper bound, not an
  *     exact figure (per-transition waste when a request-aggregate `usage` cannot be split
  *     between the re-written region and genuinely-new content).
  */
@@ -520,42 +523,47 @@ function tierCost(tier, rawTokens) {
 
 /**
  * The turn's cache-WRITE cost in token-equivalents, straight from `usage`. `null` when
- * `usage` is absent or the turn wrote nothing (`cache_creation` 0). Tier-unknown (flat
- * write > 0 but neither per-tier field) ⇒ a `[×1.25, ×2]` range bound, never a
- * false-precise single number. A write spanning both tiers is `mixed`.
+ * `usage` is absent or the turn wrote nothing.
+ *
+ * The per-tier fields (`cacheCreation{5m,1h}`) are authoritative for the TIER; the flat
+ * `cache_creation` is authoritative for the write MASS. Mass the per-tier fields leave
+ * unaccounted — all of it when neither field is reported, the remainder when they under-sum
+ * the flat total — is tier-unknown and priced as a `[×1.25, ×2]` span, never as a
+ * false-precise point and never silently dropped. A write spanning both tiers is `mixed`.
  * @param {import('./report.js').Usage | null} usage
  * @returns {TokEquiv | null}
  */
 function writeTokEquiv(usage) {
   if (!usage) return null;
-  const flat = num(usage.cacheCreationInputTokens);
-  if (flat <= 0) return null;
   const c5 = num(usage.cacheCreation5mInputTokens);
   const c1 = num(usage.cacheCreation1hInputTokens);
-  if (c5 <= 0 && c1 <= 0) {
+  const known = c5 + c1;
+  const unknownTokens = Math.max(0, num(usage.cacheCreationInputTokens) - known);
+  if (known <= 0 && unknownTokens <= 0) return null; // the turn wrote nothing
+  /** @type {TierCost[]} */
+  const components = [];
+  if (c5 > 0) components.push(tierCost('5m', c5));
+  if (c1 > 0) components.push(tierCost('1h', c1));
+  const knownEquiv = round2(components.reduce((s, c) => s + c.equiv, 0));
+  const base = { rawTokens: known + unknownTokens, components, unknownTokens, bounded: false };
+  if (unknownTokens <= 0) {
     return {
-      rawTokens: flat,
-      components: [],
-      equiv: null,
-      multiplier: null,
-      tier: 'unknown',
-      equivRange: [round2(flat * UNKNOWN_TIER_RANGE[0]), round2(flat * UNKNOWN_TIER_RANGE[1])],
-      bounded: false,
+      ...base,
+      equiv: knownEquiv,
+      multiplier: components.length === 1 ? components[0].multiplier : null,
+      tier: components.length > 1 ? 'mixed' : components[0].tier,
+      equivRange: null,
     };
   }
-  /** @type {TierCost[]} */
-  const comps = [];
-  if (c5 > 0) comps.push(tierCost('5m', c5));
-  if (c1 > 0) comps.push(tierCost('1h', c1));
-  const equiv = round2(comps.reduce((s, c) => s + c.equiv, 0));
   return {
-    rawTokens: c5 + c1,
-    components: comps,
-    equiv,
-    multiplier: comps.length === 1 ? comps[0].multiplier : null,
-    tier: comps.length > 1 ? 'mixed' : comps[0].tier,
-    equivRange: null,
-    bounded: false,
+    ...base,
+    equiv: null, // any tier-unknown mass forbids a single number
+    multiplier: null,
+    tier: components.length > 0 ? 'mixed' : 'unknown',
+    equivRange: [
+      round2(knownEquiv + unknownTokens * UNKNOWN_TIER_RANGE[0]),
+      round2(knownEquiv + unknownTokens * UNKNOWN_TIER_RANGE[1]),
+    ],
   };
 }
 
@@ -570,7 +578,16 @@ function readTokEquiv(usage) {
   const r = num(usage.cacheReadInputTokens);
   if (r <= 0) return null;
   const c = tierCost('read', r);
-  return { rawTokens: r, components: [c], equiv: c.equiv, multiplier: c.multiplier, tier: 'read', equivRange: null, bounded: false };
+  return {
+    rawTokens: r,
+    components: [c],
+    unknownTokens: 0,
+    equiv: c.equiv,
+    multiplier: c.multiplier,
+    tier: 'read',
+    equivRange: null,
+    bounded: false,
+  };
 }
 
 /**
@@ -585,9 +602,9 @@ function readTokEquiv(usage) {
  * @returns {TokEquiv | null}
  */
 function wastedCost(usage, residual) {
+  if (!residual || residual.rewrittenBytes <= 0) return null; // nothing re-written ⇒ no waste
   const write = writeTokEquiv(usage);
   if (!write) return null;
-  if (!residual || residual.rewrittenBytes <= 0) return null; // nothing re-written ⇒ no waste
   const attributesFully = residual.newBytes === 0; // the whole write is the re-write
   return { ...write, bounded: !attributesFully };
 }
@@ -627,7 +644,7 @@ function addTokEquiv(acc, t) {
     acc.hasRange = true;
   }
   for (const c of t.components) acc.raw[c.tier] += c.rawTokens;
-  if (t.tier === 'unknown') acc.raw.unknown += t.rawTokens;
+  acc.raw.unknown += t.unknownTokens;
   if (t.bounded) acc.bounded = true;
 }
 
@@ -643,41 +660,41 @@ function addUsageCost(writeAcc, readAcc, usage) {
 }
 
 /**
- * Build a rollup CostTotal from an accumulator. When a tier-unknown turn contributed a
- * span, the total is a bound (`equiv` null + `equivRange`); otherwise it is exact.
+ * An accumulator's total as the exact-or-bounded pair: an exact `equiv` unless a
+ * tier-unknown span contributed, in which case only the `[lo, hi]` bound is honest.
+ * @param {CostAcc} acc
+ * @returns {{ equiv: number | null, equivRange: [number, number] | null }}
+ */
+function spanOf(acc) {
+  if (acc.hasRange) return { equiv: null, equivRange: [round2(acc.rangeLo), round2(acc.rangeHi)] };
+  return { equiv: round2(acc.equiv), equivRange: null };
+}
+
+/**
+ * Build a rollup CostTotal from an accumulator.
  * @param {CostAcc} acc
  * @returns {CostTotal}
  */
 function accToTotal(acc) {
-  /** @type {CostTotal} */
-  const out = {
-    equiv: acc.hasRange ? null : round2(acc.equiv),
-    equivRange: acc.hasRange ? [round2(acc.rangeLo), round2(acc.rangeHi)] : null,
-    raw: { ...acc.raw },
-    tier: 'mixed',
-    bounded: acc.bounded,
-  };
-  return out;
+  return { ...spanOf(acc), raw: { ...acc.raw }, tier: 'mixed', bounded: acc.bounded };
 }
 
 /**
  * The summed counterfactual — the wasted basis framed as "would have avoided re-writing
  * ~X tok-équ." (a lower bound, not a guarantee). Same numbers as `totals.wasted`.
- * @param {CostAcc} wastedAcc
+ * @param {CostAcc} acc
  * @returns {TokEquiv}
  */
-function counterfactual(wastedAcc) {
-  /** @type {TokEquiv} */
-  const out = {
-    rawTokens: wastedAcc.raw['5m'] + wastedAcc.raw['1h'] + wastedAcc.raw.unknown,
+function counterfactual(acc) {
+  return {
+    ...spanOf(acc),
+    rawTokens: acc.raw['5m'] + acc.raw['1h'] + acc.raw.unknown,
     components: [],
-    equiv: wastedAcc.hasRange ? null : round2(wastedAcc.equiv),
+    unknownTokens: acc.raw.unknown,
     multiplier: null,
     tier: 'mixed',
-    equivRange: wastedAcc.hasRange ? [round2(wastedAcc.rangeLo), round2(wastedAcc.rangeHi)] : null,
-    bounded: wastedAcc.bounded,
+    bounded: acc.bounded,
   };
-  return out;
 }
 
 /** @param {object} e @param {number} index @returns {number} */
