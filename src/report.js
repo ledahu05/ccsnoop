@@ -354,6 +354,7 @@ export function loadSession(dir, id, wasteConfig) {
       lcp: w.lcp,
       hadBaseline: w.hadBaseline,
       mutationSite: w.mutationSite,
+      baselineLength: w.baselineLength,
       residual: w.residual,
       now: w.now,
       idleMs: w.idleMs,

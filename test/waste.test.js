@@ -434,6 +434,7 @@ test('classifySegments exposes lcp, hadBaseline, mutationSite, residual on a reu
   // Content frontier: 2 leading segments match (system + message#0).
   assert.equal(cls.hadBaseline, true);
   assert.equal(cls.lcp, 2, 'system + message#0 form the reused content prefix');
+  assert.equal(cls.baselineLength, base.length, 'baseline extent is exposed for the cache diagnostic');
   // Divergence sits at the appended turn (the structural frontier points there).
   assert.equal(cls.mutationSite, 'message#1');
   // Warm cache → no re-written region; only the new turn is genuinely-new content.
@@ -477,6 +478,7 @@ test('classifySegments: no baseline ⇒ hadBaseline false, mutationSite null, re
   const cls = classifySegments(segs, null, usage({ input: 10 }));
   assert.equal(cls.hadBaseline, false);
   assert.equal(cls.lcp, 0);
+  assert.equal(cls.baselineLength, 0, 'no baseline ⇒ zero baseline extent');
   assert.equal(cls.mutationSite, null, 'nothing to diverge from on a first request');
   assert.equal(cls.residual, null, 'no re-write to attribute without a baseline');
 });
@@ -666,5 +668,6 @@ test('classifySegments: a request that shrank to a prefix of its baseline has no
   const cls = classifySegments(cur, base, usage({ input: 5, cacheRead: 1000 }));
   assert.equal(cls.lcp, cur.length, 'the shorter request is wholly a prefix of the baseline');
   assert.equal(cls.mutationSite, null, 'nothing diverged — the tail was merely dropped');
+  assert.equal(cls.baselineLength, base.length, 'the dropped extent is visible (compaction signal)');
   assert.equal(cls.residual.total, 0);
 });

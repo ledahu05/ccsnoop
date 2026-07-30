@@ -86,6 +86,32 @@ function segBytes(value) {
 }
 
 /**
+ * Strip every `cache_control` directive recursively from a parsed value, returning an
+ * equivalent value that represents CONTENT only. A `cache_control` breakpoint is a caching
+ * directive, not payload: Claude Code migrates the message breakpoint to the latest turn
+ * every request (turn N breakpoints `message#N-1`), so a hash that includes it would read
+ * the migration as a phantom content mutation — mis-attributing a warm turn (huge
+ * `cache_read`) as STRUCTURAL. The content frontier (lcp, the structural-mutation point)
+ * must therefore hash content; the breakpoint itself stays available as per-segment
+ * `cacheControl` metadata for the capability frontier (cache spec §2.2 / §3, issue #84).
+ * @param {any} v
+ * @returns {any}
+ */
+function stripCacheControl(v) {
+  if (Array.isArray(v)) return v.map(stripCacheControl);
+  if (v && typeof v === 'object') {
+    /** @type {Record<string, any>} */
+    const out = {};
+    for (const k of Object.keys(v)) {
+      if (k === 'cache_control') continue;
+      out[k] = stripCacheControl(v[k]);
+    }
+    return out;
+  }
+  return v;
+}
+
+/**
  * @typedef {object} Segment
  * @property {'system'|'tools'|'history'|'currentTurn'} bucket  Anatomy bucket (display grouping only).
  * @property {string} slot     Stable slot identity across requests (for static detection).
@@ -225,7 +251,9 @@ export function breakpointPositions(segments) {
  * @returns {Segment}
  */
 function mkSeg(bucket, slot, label, value, cacheControl) {
-  const seg = { bucket, slot, label, hash: hashSegment(value), bytes: segBytes(value) };
+  // Hash and size CONTENT (caching directives stripped) — see {@link stripCacheControl}.
+  const content = stripCacheControl(value);
+  const seg = { bucket, slot, label, hash: hashSegment(content), bytes: segBytes(content) };
   if (cacheControl) seg.cacheControl = cacheControl;
   return seg;
 }
@@ -300,6 +328,11 @@ function medianOf(xs) {
  * @property {boolean} hadBaseline      A prior same-lineage request existed to diff against.
  * @property {string | null} mutationSite  Slot of the first divergent segment
  *     (`current[lcp].slot`); `null` when there is no baseline or the prefix never diverges.
+ * @property {number} baselineLength     Segment count of the baseline (`baseline.length`),
+ *     `0` without a baseline. The cache diagnostic (cache spec §3 / issue #84) uses it to
+ *     detect a cold turn (a prior prefix the cache stopped serving), to cap the structural
+ *     region at re-written baseline content, and to recognize compaction (a turn that
+ *     shrank vs its baseline → STRUCTURAL·TRUNCATED).
  * @property {UsageDiffResidual | null} residual  Diff-derived byte attribution of the
  *     write mass (re-written region vs genuinely-new content), so a turn's
  *     `cache_creation` total can be split (cache spec §4). `null` without a baseline.
@@ -334,6 +367,7 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
       lcp: 0,
       hadBaseline: false,
       mutationSite: null,
+      baselineLength: 0, // no prior turn ⇒ no baseline extent
       residual: null, // no prior turn ⇒ no re-write to attribute
     };
   }
@@ -403,6 +437,7 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
     lcp,
     hadBaseline: true,
     mutationSite,
+    baselineLength: baseline.length,
     residual,
   };
 }
@@ -499,6 +534,7 @@ export function computeWaste(exchanges, overrides = {}) {
       lcp: cls.lcp,
       hadBaseline: cls.hadBaseline,
       mutationSite: cls.mutationSite,
+      baselineLength: cls.baselineLength,
       residual: cls.residual,
       now,
       idleMs,
@@ -530,6 +566,7 @@ export function computeWaste(exchanges, overrides = {}) {
  * @property {number} lcp                 Content longest-common-prefix (structural frontier).
  * @property {boolean} hadBaseline        A prior same-lineage request existed.
  * @property {string | null} mutationSite First divergent slot (structural culprit candidate).
+ * @property {number} baselineLength      Segment count of the baseline (`0` without one).
  * @property {UsageDiffResidual | null} residual  Write-mass attribution (re-written vs new).
  * @property {number | null} now          This turn's reference instant, injected from the
  *     captured `request_received_at` (epoch ms); `null` for probe turns.
