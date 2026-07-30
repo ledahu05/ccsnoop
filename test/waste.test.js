@@ -606,3 +606,65 @@ test('computeWaste never calls Date.now() — now/idleMs come from injected time
     Date.now = real;
   }
 });
+
+test('a probe turn is not diffed itself — no phantom waste leaks into the session total', () => {
+  // A probe re-sends the big system but its own tail is nothing like the conversation.
+  // If the probe were diffed against the prior real turn, the whole shared system would
+  // read as a re-write and land in the headline waste for a turn nobody cached.
+  const big = 'X'.repeat(5000);
+  const { perExchange, summary } = computeWaste([
+    { threadId: 'A', maxTokens: 1024, requestBody: { system: big, messages: [{ role: 'user', content: 'q1' }] }, usage: usage({ input: 10 }) },
+    { threadId: 'A', maxTokens: 1, requestBody: { system: big, messages: [{ role: 'user', content: 'PROBE' }] }, usage: usage({ input: 1 }) },
+  ]);
+  const p = perExchange[1];
+  assert.equal(p.hadBaseline, false, 'a probe is analysed as if it had no predecessor');
+  assert.equal(p.mutationSite, null, 'a probe has no structural culprit to report');
+  assert.equal(p.residual, null);
+  assert.equal(p.reusedUncachedBytes, 0, 'a probe attributes no re-written mass');
+  assert.equal(p.cold, false, 'a probe is not judged against the cache at all');
+  assert.equal(summary.reusedUncachedBytes, 0, 'the session total is free of probe noise');
+});
+
+test('a probe turn is never marked static, even where the lineage slot is', () => {
+  // 'system' is unchanged across the two real turns (static there), but the probe's own
+  // system differs — inheriting the lineage verdict would label changed content static.
+  const { perExchange } = computeWaste([
+    { threadId: 'A', requestBody: { system: 'sys', messages: [{ role: 'user', content: 'q1' }] }, usage: usage({ input: 10 }) },
+    { threadId: 'A', maxTokens: 1, requestBody: { system: 'DIFFERENT', messages: [{ role: 'user', content: 'x' }] }, usage: usage({ input: 1 }) },
+    { threadId: 'A', requestBody: { system: 'sys', messages: [{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }] }, usage: usage({ input: 5, cacheRead: 1000 }) },
+  ]);
+  const sysOf = (i) => perExchange[i].segments.find((s) => s.slot === 'system');
+  assert.equal(sysOf(2).static, true, 'unchanged across the two real turns');
+  assert.equal(sysOf(1).static, false, 'the probe does not inherit the lineage verdict');
+});
+
+test('computeWaste: only max_tokens exactly 1 is a probe — no coercion', () => {
+  const body = { system: 's', messages: [{ role: 'user', content: 'q' }] };
+  const flags = [1, '1', true, 0, 2, undefined, null].map((maxTokens) => {
+    const { perExchange } = computeWaste([{ threadId: 'A', maxTokens, requestBody: body, usage: usage({ input: 1 }) }]);
+    return perExchange[0].probe;
+  });
+  assert.deepEqual(flags, [true, false, false, false, false, false, false]);
+});
+
+test('computeWaste: an unparseable timestamp yields null, never NaN', () => {
+  const mk = (r, c) => ({
+    threadId: 'A', requestBody: { system: 's', messages: [{ role: 'user', content: 'q' }] },
+    usage: usage({ input: 1, cacheRead: 100 }), requestReceivedAt: r, responseCompletedAt: c,
+  });
+  const { perExchange } = computeWaste([mk('not-a-date', 'also-bad'), mk('2026-07-28T07:51:09.375Z', null)]);
+  assert.equal(perExchange[0].now, null, 'garbage in ⇒ null, not NaN');
+  assert.equal(perExchange[1].idleMs, null, 'an unparseable prior completion gives no gap');
+  assert.equal(perExchange[1].now, Date.parse('2026-07-28T07:51:09.375Z'));
+});
+
+test('classifySegments: a request that shrank to a prefix of its baseline has no mutationSite', () => {
+  // Compaction dropped the tail: every remaining segment still matches, so the cache
+  // prefix is intact and there is no divergent slot to blame.
+  const base = segmentRequest({ system: 'sys', messages: [{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }] });
+  const cur = segmentRequest({ system: 'sys', messages: [{ role: 'user', content: 'q1' }] });
+  const cls = classifySegments(cur, base, usage({ input: 5, cacheRead: 1000 }));
+  assert.equal(cls.lcp, cur.length, 'the shorter request is wholly a prefix of the baseline');
+  assert.equal(cls.mutationSite, null, 'nothing diverged — the tail was merely dropped');
+  assert.equal(cls.residual.total, 0);
+});

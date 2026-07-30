@@ -335,7 +335,7 @@ export function loadSession(dir, id, wasteConfig) {
       // Date.now), and max_tokens flags the probe turns filtered before analysis.
       requestReceivedAt: e.requestReceivedAt,
       responseCompletedAt: e.responseCompletedAt,
-      maxTokens: e.requestJson && typeof e.requestJson === 'object' ? e.requestJson.max_tokens : undefined,
+      maxTokens: e.requestJson?.max_tokens,
     })),
     wasteConfig ?? {}
   );

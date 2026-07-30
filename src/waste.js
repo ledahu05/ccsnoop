@@ -421,7 +421,9 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
  * Mutates nothing on the input; returns the annotations to attach.
  *
  * @param {Array<{ threadId?: string|null, requestBody: any, usage: import('./report.js').Usage|null,
- *   requestReceivedAt?: string|null, responseCompletedAt?: string|null, maxTokens?: number }>} exchanges
+ *   requestReceivedAt?: string|null, responseCompletedAt?: string|null, maxTokens?: unknown }>} exchanges
+ *     `maxTokens` is read straight off the captured request JSON, so it is `unknown`:
+ *     only a strict `=== 1` counts as a probe (`"1"`/`true` are malformed, not probes).
  * @param {Partial<WasteConfig>} [overrides]
  * @returns {{ perExchange: ExchangeWaste[], summary: SessionWaste, config: WasteConfig }}
  */
@@ -430,8 +432,11 @@ export function computeWaste(exchanges, overrides = {}) {
 
   // Probe turns (max_tokens === 1) are filtered from analysis BEFORE anything else
   // (cache spec §2.3 / issue #83): a one-shot probe is not a conversation turn, so it
-  // must not be the next turn's baseline nor supply an idle-gap origin. The exchange
-  // still gets a perExchange entry (1:1 with the input) so report rendering is unaffected.
+  // must not be the next turn's baseline, supply an idle-gap origin, count toward a
+  // slot's recurrence, or be DIFFED ITSELF — a probe's own body barely resembles the
+  // conversation, so diffing it would invent a large phantom re-write and leak it into
+  // the session's headline waste. The exchange still gets a perExchange entry (1:1 with
+  // the input, segments classified against no baseline) so report rendering is unaffected.
   const probe = exchanges.map((e) => e.maxTokens === 1);
 
   // Segment + classify each exchange against the prior request in the SAME lineage.
@@ -444,17 +449,15 @@ export function computeWaste(exchanges, overrides = {}) {
   /** @type {{ cls: Classification, now: number | null, idleMs: number | null }[]} */
   const classifications = exchanges.map((e, i) => {
     const key = laneKey(e.threadId, i);
-    const prior = lastInThread.get(key);
+    const prior = probe[i] ? undefined : lastInThread.get(key);
     const baseline = prior ? allSegments[prior.segIdx] : null;
     const cls = classifySegments(allSegments[i], baseline, e.usage, config);
     // `now`/`idleMs` are INJECTED from the captured timestamps (Date.parse, not
     // Date.now). The gap is bounded: non-negative, finite, and null when either end
-    // is missing. Probe turns carry no temporal signal (they are filtered).
+    // is missing. Probe turns carry no temporal signal (`prior` is withheld above).
     const now = probe[i] ? null : parseMs(e.requestReceivedAt);
     const idleMs =
-      !probe[i] && now != null && prior && prior.completedMs != null
-        ? Math.max(0, now - prior.completedMs)
-        : null;
+      now != null && prior && prior.completedMs != null ? Math.max(0, now - prior.completedMs) : null;
     if (!probe[i]) lastInThread.set(key, { segIdx: i, completedMs: parseMs(e.responseCompletedAt) });
     return { cls, now, idleMs };
   });
@@ -571,13 +574,14 @@ function parseMs(iso) {
 
 /**
  * Mark each segment `.static` iff, within its lineage, the slot's content hash is
- * identical every time the slot appears. Probe turns (`probe[i]`) are excluded — a
- * one-shot probe is not a real turn and must not count toward a slot's recurrence.
+ * identical every time the slot appears. Probe turns (`probe[i]`) are excluded from
+ * BOTH passes — a one-shot probe is not a real turn, so it must neither count toward a
+ * slot's recurrence nor inherit the lineage's verdict (its own content may well differ).
  * @param {Array<{ threadId?: string|null }>} exchanges
  * @param {Segment[][]} allSegments
- * @param {boolean[]} [probe]
+ * @param {boolean[]} probe  Per-exchange probe flags, parallel to `exchanges`.
  */
-function markStatic(exchanges, allSegments, probe = exchanges.map(() => false)) {
+function markStatic(exchanges, allSegments, probe) {
   // lane → slot → { count: appearances, hashes: distinct content hashes }
   /** @type {Map<string, Map<string, { count: number, hashes: Set<string> }>>} */
   const lanes = new Map();
@@ -594,7 +598,7 @@ function markStatic(exchanges, allSegments, probe = exchanges.map(() => false)) 
     }
   });
   exchanges.forEach((e, i) => {
-    const slots = lanes.get(laneKey(e.threadId, i));
+    const slots = probe[i] ? undefined : lanes.get(laneKey(e.threadId, i));
     for (const seg of allSegments[i]) {
       const entry = slots?.get(seg.slot);
       // Static = a RECURRING slot (≥2 appearances) whose content never changed.
