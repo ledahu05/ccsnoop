@@ -1,7 +1,7 @@
 {
   "name": "ccsnoop",
   "version": "0.1.0",
-  "description": "Snoop raw Claude Code ↔ Anthropic traffic — capture proxy + static HTML report",
+  "description": "Snoop raw Claude Code ↔ Anthropic traffic — capture proxy with report, fine-tune, and cache-economy diagnostics",
   "type": "module",
   "bin": {
     "ccsnoop": "bin/ccsnoop.js"
