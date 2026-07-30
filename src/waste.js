@@ -97,9 +97,9 @@ function segBytes(value) {
  * @property {boolean} [flagship]  static ∩ reused-uncached (the flagship waste case).
  * @property {boolean} [bloated]   Segment carries an outlier tool_result.
  * @property {number} [bloatBytes] Byte length of the bloated tool_result.
- * @property {{ type: string, ttl?: string } | undefined} [cacheControl]
+ * @property {{ type: string, ttl?: string }} [cacheControl]
  *     Parsed `cache_control` breakpoint attached to this segment's element
- *     (cache spec §2.2 / issue #82). `undefined` when the element carries none.
+ *     (cache spec §2.2 / issue #82). Absent when the element carries none.
  */
 
 /**
@@ -128,17 +128,18 @@ export function segmentRequest(body, config = DEFAULT_WASTE_CONFIG) {
   if (Array.isArray(body.tools)) {
     body.tools.forEach((tool, i) => {
       const name = tool && typeof tool.name === 'string' ? tool.name : `#${i}`;
-      segs.push(mkSeg('tools', `tool:${name}`, `Tool: ${name}`, tool, tool && tool.cache_control));
+      segs.push(mkSeg('tools', `tool:${name}`, `Tool: ${name}`, tool, cacheControlOf(tool)));
     });
   }
 
   // System — one segment per block, or a single segment for a bare string.
   if (Array.isArray(body.system)) {
     body.system.forEach((block, i) => {
-      segs.push(mkSeg('system', `system#${i}`, `System block #${i}`, block, block && block.cache_control));
+      segs.push(mkSeg('system', `system#${i}`, `System block #${i}`, block, cacheControlOf(block)));
     });
   } else if (body.system != null) {
-    segs.push(mkSeg('system', 'system', 'System prompt', body.system));
+    // A bare string carries no breakpoint; `cacheControlOf` says so without a special case.
+    segs.push(mkSeg('system', 'system', 'System prompt', body.system, cacheControlOf(body.system)));
   }
 
   // Messages — one segment per entry; last entry is the current turn.
@@ -160,28 +161,39 @@ export function segmentRequest(body, config = DEFAULT_WASTE_CONFIG) {
 }
 
 /**
+ * The `cache_control` breakpoint carried by ONE cacheable element (a tool def, a
+ * system block, a message content block), or `undefined`. Only a plain object
+ * counts: a scalar or array under that key is not a breakpoint the API would
+ * honour, and attaching it would make {@link breakpointPositions} report a
+ * phantom breakpoint.
+ * @param {any} element
+ * @returns {{ type: string, ttl?: string } | undefined}
+ */
+function cacheControlOf(element) {
+  if (!element || typeof element !== 'object') return undefined;
+  const cc = element.cache_control;
+  return cc && typeof cc === 'object' && !Array.isArray(cc) ? cc : undefined;
+}
+
+/**
  * Pull a `cache_control` breakpoint off a message, if any (cache spec §2.2). CC
  * places a breakpoint on one CONTENT BLOCK of a message (never on the message
- * object itself); a message whose content is a bare string carries none. A message
- * is atomic at our segmentation granularity, so the breakpoint's render position is
- * the segment's own index. Every content block is scanned; the last block carrying
- * a breakpoint wins (it closes the cacheable region within the message).
+ * object itself, which the API would ignore); a message whose content is a bare
+ * string carries none. A message is atomic at our segmentation granularity, so the
+ * breakpoint's render position is the segment's own index. Every content block is
+ * scanned; the last block carrying a breakpoint wins (it closes the cacheable
+ * region within the message).
  * @param {any} msg
  * @returns {{ type: string, ttl?: string } | undefined}
  */
 function messageCacheControl(msg) {
   if (!msg || typeof msg !== 'object') return undefined;
-  const c = msg.content;
-  if (Array.isArray(c)) {
-    /** @type {{ type: string, ttl?: string } | undefined} */
-    let cc;
-    for (const block of c) {
-      if (block && typeof block === 'object' && block.cache_control) cc = block.cache_control;
-    }
-    return cc;
-  }
-  if (c && typeof c === 'object' && c.cache_control) return c.cache_control;
-  return undefined;
+  const content = msg.content;
+  if (!Array.isArray(content)) return cacheControlOf(content);
+  /** @type {{ type: string, ttl?: string } | undefined} */
+  let cc;
+  for (const block of content) cc = cacheControlOf(block) ?? cc;
+  return cc;
 }
 
 /**
@@ -208,7 +220,8 @@ export function breakpointPositions(segments) {
  * @param {string} slot
  * @param {string} label
  * @param {any} value
- * @param {{ type: string, ttl?: string } | undefined} [cacheControl]
+ * @param {{ type: string, ttl?: string } | undefined} cacheControl  Required (may be
+ *     `undefined`) so no call site can silently forget to look for a breakpoint.
  * @returns {Segment}
  */
 function mkSeg(bucket, slot, label, value, cacheControl) {

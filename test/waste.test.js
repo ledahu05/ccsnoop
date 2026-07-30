@@ -145,6 +145,74 @@ test('breakpointPositions is empty when cache_control is absent (older capture /
   assert.ok(segs.every((s) => s.cacheControl === undefined));
 });
 
+test('a malformed cache_control is not counted as a breakpoint', () => {
+  // Only the object form is a breakpoint the API honours; a scalar or array under
+  // that key must not produce a phantom breakpoint in the frontier list.
+  const segs = segmentRequest({
+    tools: [{ name: 'Bash', cache_control: 'ephemeral' }],
+    system: [{ type: 'text', text: 'a', cache_control: true }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'q', cache_control: [] }] }],
+  });
+  assert.deepEqual(breakpointPositions(segs), []);
+  assert.ok(segs.every((s) => s.cacheControl === undefined));
+});
+
+test('a cache_control on the message object itself is ignored (the API only honours blocks)', () => {
+  const segs = segmentRequest({
+    messages: [{ role: 'user', content: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+  });
+  assert.deepEqual(breakpointPositions(segs), []);
+});
+
+test('breakpoint parsing is null-safe across ragged tools / system / content arrays', () => {
+  const cc = { type: 'ephemeral', ttl: '1h' };
+  const segs = segmentRequest({
+    tools: [null, { name: 'Read' }],
+    system: [null, { type: 'text', text: 'a', cache_control: cc }],
+    messages: [null, { role: 'user', content: [null, 'bare', { type: 'text', text: 'q', cache_control: cc }] }],
+  });
+  assert.deepEqual(segs.map((s) => s.slot), ['tool:#0', 'tool:Read', 'system#0', 'system#1', 'message#0', 'message#1']);
+  assert.deepEqual(breakpointPositions(segs), [3, 5]);
+});
+
+test('the last breakpointed content block of a message wins', () => {
+  // A message is atomic at our granularity, so only one breakpoint can be attached;
+  // the LAST one closes the cacheable region, and a later block without one (or with
+  // a malformed one) must not clear it.
+  const first = { type: 'ephemeral', ttl: '5m' };
+  const last = { type: 'ephemeral', ttl: '1h' };
+  const segs = segmentRequest({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'a', cache_control: first },
+        { type: 'text', text: 'b', cache_control: last },
+        { type: 'text', text: 'c' },
+      ],
+    }],
+  });
+  assert.equal(segs[0].cacheControl, last);
+});
+
+test('a tools-only change diverges the cache prefix at position 0 (the reorder payoff)', () => {
+  // The reason segmentation moved to render order: with system first, a changed tool
+  // def read as "system intact, break in tools". In render order the prefix diverges
+  // at position 0, so the whole prefix is cold and the intact system is waste.
+  const body = (toolDesc) => ({
+    tools: [{ name: 'Bash', description: toolDesc }],
+    system: [{ type: 'text', text: 'a long stable system preamble' }],
+    messages: [{ role: 'user', content: 'q1' }],
+  });
+  const base = segmentRequest(body('run a command'));
+  const cur = segmentRequest(body('run a command (v2)'));
+  const cls = classifySegments(cur, base, usage({ input: 5, cacheRead: 1000 }));
+  assert.equal(cls.cacheBoundary, 0, 'nothing stays cached once the rendered head changes');
+  const byslot = Object.fromEntries(cur.map((s) => [s.slot, s.kind]));
+  assert.equal(byslot['tool:Bash'], 'new');
+  assert.equal(byslot['system#0'], 'reused-uncached', 'the intact system is re-sent past the break');
+  assert.equal(byslot['message#0'], 'reused-uncached');
+});
+
 test('segmentRequest is null-safe and handles a bare-string system', () => {
   assert.deepEqual(segmentRequest(null), []);
   const segs = segmentRequest({ system: 'be brief', messages: [] });
