@@ -279,11 +279,30 @@ function medianOf(xs) {
 }
 
 /**
+ * @typedef {object} UsageDiffResidual
+ * @property {number} rewrittenBytes  The re-written region — reused-uncached mass
+ *     (was cached, now re-sent past the break); the re-billed portion of the write.
+ * @property {number} newBytes        Genuinely-new content this turn — the part of
+ *     the write that is NOT waste (would have been written anyway).
+ * @property {number} total           `rewrittenBytes + newBytes` — the write mass
+ *     the diff attributes to this turn (the cache-creation basis, by byte proxy).
+ */
+
+/**
  * @typedef {object} Classification
  * @property {Segment[]} segments       The input segments, each with `.kind` filled.
  * @property {number} cacheBoundary     Count of leading reused-cached segments (overlay: cached prefix ends here).
  * @property {number} reusedUncachedBytes  Headline waste proxy for this request.
  * @property {boolean} cold             Cold-cache degenerate case (reused collapsed to waste).
+ * @property {number} lcp               Content longest-common-prefix with the baseline
+ *     — the STRUCTURAL frontier (the mutation point), pre usage-arbitration. The cache
+ *     diagnostic's `current[lcp].slot` is the structural culprit candidate (cache spec §3).
+ * @property {boolean} hadBaseline      A prior same-lineage request existed to diff against.
+ * @property {string | null} mutationSite  Slot of the first divergent segment
+ *     (`current[lcp].slot`); `null` when there is no baseline or the prefix never diverges.
+ * @property {UsageDiffResidual | null} residual  Diff-derived byte attribution of the
+ *     write mass (re-written region vs genuinely-new content), so a turn's
+ *     `cache_creation` total can be split (cache spec §4). `null` without a baseline.
  */
 
 /**
@@ -307,7 +326,16 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
   // First request in a lineage — everything is legitimately new.
   if (!baseline || baseline.length === 0) {
     for (const s of current) s.kind = 'new';
-    return { segments: current, cacheBoundary: 0, reusedUncachedBytes: 0, cold: false };
+    return {
+      segments: current,
+      cacheBoundary: 0,
+      reusedUncachedBytes: 0,
+      cold: false,
+      lcp: 0,
+      hadBaseline: false,
+      mutationSite: null,
+      residual: null, // no prior turn ⇒ no re-write to attribute
+    };
   }
 
   // Longest common prefix by hash = the cacheable reused prefix.
@@ -356,7 +384,27 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
   const reusedUncachedBytes = current
     .filter((s) => s.kind === 'reused-uncached')
     .reduce((sum, s) => sum + s.bytes, 0);
-  return { segments: current, cacheBoundary, reusedUncachedBytes, cold };
+
+  // ── enriched exposures for the cache diagnostic (cache spec §2.3, issue #83) ──
+  // lcp is the CONTENT frontier (pre-arbitration); cacheBoundary above is the
+  // REALITY frontier (usage-reconciled). The mutation site is the first divergent
+  // segment — the structural culprit candidate (null when the prefix never diverges).
+  const mutationSite = lcp < current.length ? current[lcp].slot : null;
+  // Residual: split the turn's write mass into the re-written region vs genuinely-new
+  // content, so T4 can attribute `cache_creation` (re-billed waste vs normal write).
+  const newBytes = current.filter((s) => s.kind === 'new').reduce((sum, s) => sum + s.bytes, 0);
+  const residual = { rewrittenBytes: reusedUncachedBytes, newBytes, total: reusedUncachedBytes + newBytes };
+
+  return {
+    segments: current,
+    cacheBoundary,
+    reusedUncachedBytes,
+    cold,
+    lcp,
+    hadBaseline: true,
+    mutationSite,
+    residual,
+  };
 }
 
 /**
@@ -364,40 +412,66 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
  * against the prior request in its own `thread_id` lineage, runs static-block
  * detection per lineage, and rolls the signals up per request and per session.
  *
+ * Cache-diagnostic enrichment (cache spec §2.3, issue #83): probe turns
+ * (`max_tokens === 1`) are filtered from the analysis (never a baseline, excluded
+ * from static detection), and each turn carries injected temporal signals
+ * (`now`/`idleMs`) derived from the captured per-turn timestamps — `Date.now()` is
+ * never called. All enrichments are additive and optional on the input.
+ *
  * Mutates nothing on the input; returns the annotations to attach.
  *
- * @param {Array<{ threadId: string|null, requestBody: any, usage: import('./report.js').Usage|null }>} exchanges
+ * @param {Array<{ threadId?: string|null, requestBody: any, usage: import('./report.js').Usage|null,
+ *   requestReceivedAt?: string|null, responseCompletedAt?: string|null, maxTokens?: unknown }>} exchanges
+ *     `maxTokens` is read straight off the captured request JSON, so it is `unknown`:
+ *     only a strict `=== 1` counts as a probe (`"1"`/`true` are malformed, not probes).
  * @param {Partial<WasteConfig>} [overrides]
  * @returns {{ perExchange: ExchangeWaste[], summary: SessionWaste, config: WasteConfig }}
  */
 export function computeWaste(exchanges, overrides = {}) {
   const config = resolveWasteConfig(overrides);
 
+  // Probe turns (max_tokens === 1) are filtered from analysis BEFORE anything else
+  // (cache spec §2.3 / issue #83): a one-shot probe is not a conversation turn, so it
+  // must not be the next turn's baseline, supply an idle-gap origin, count toward a
+  // slot's recurrence, or be DIFFED ITSELF — a probe's own body barely resembles the
+  // conversation, so diffing it would invent a large phantom re-write and leak it into
+  // the session's headline waste. The exchange still gets a perExchange entry (1:1 with
+  // the input, segments classified against no baseline) so report rendering is unaffected.
+  const probe = exchanges.map((e) => e.maxTokens === 1);
+
   // Segment + classify each exchange against the prior request in the SAME lineage.
-  /** @type {Map<string, number>} */
-  const lastInThread = new Map();
   /** @type {Segment[][]} */
   const allSegments = exchanges.map((e) => segmentRequest(e.requestBody, config));
-  /** @type {Classification[]} */
+  // Lane state holds the prior NON-PROBE exchange in each lineage: its segment index
+  // (the baseline) and its completion time (the idle-gap origin).
+  /** @type {Map<string, { segIdx: number, completedMs: number | null }>} */
+  const lastInThread = new Map();
+  /** @type {{ cls: Classification, now: number | null, idleMs: number | null }[]} */
   const classifications = exchanges.map((e, i) => {
     const key = laneKey(e.threadId, i);
-    const prevIdx = lastInThread.get(key);
-    const baseline = prevIdx === undefined ? null : allSegments[prevIdx];
+    const prior = probe[i] ? undefined : lastInThread.get(key);
+    const baseline = prior ? allSegments[prior.segIdx] : null;
     const cls = classifySegments(allSegments[i], baseline, e.usage, config);
-    lastInThread.set(key, i);
-    return cls;
+    // `now`/`idleMs` are INJECTED from the captured timestamps (Date.parse, not
+    // Date.now). The gap is bounded: non-negative, finite, and null when either end
+    // is missing. Probe turns carry no temporal signal (`prior` is withheld above).
+    const now = probe[i] ? null : parseMs(e.requestReceivedAt);
+    const idleMs =
+      now != null && prior && prior.completedMs != null ? Math.max(0, now - prior.completedMs) : null;
+    if (!probe[i]) lastInThread.set(key, { segIdx: i, completedMs: parseMs(e.responseCompletedAt) });
+    return { cls, now, idleMs };
   });
 
   // Static detection per lineage: a slot is static iff its content hash never
   // changes across the requests it appears in (spec §2.4c — default since first
-  // appearance). NOT structural role.
-  markStatic(exchanges, allSegments);
+  // appearance). NOT structural role. Probe turns are excluded here too.
+  markStatic(exchanges, allSegments, probe);
 
   // Per-request + session rollups.
   /** @type {ExchangeWaste[]} */
-  const perExchange = exchanges.map((_, i) => {
+  const perExchange = exchanges.map((e, i) => {
     const segs = allSegments[i];
-    const cls = classifications[i];
+    const { cls, now, idleMs } = classifications[i];
     let bloatCount = 0;
     let flagshipBytes = 0;
     let flagshipCount = 0;
@@ -421,6 +495,15 @@ export function computeWaste(exchanges, overrides = {}) {
       bloatCount,
       flagshipCount,
       flagshipBytes,
+      // Enriched exposures for the cache diagnostic (T3 #84). Additive.
+      lcp: cls.lcp,
+      hadBaseline: cls.hadBaseline,
+      mutationSite: cls.mutationSite,
+      residual: cls.residual,
+      now,
+      idleMs,
+      idleMsReliable: e.threadId != null, // the __no_thread__ lane has an unreliable gap
+      probe: probe[i],
     };
   });
 
@@ -444,6 +527,17 @@ export function computeWaste(exchanges, overrides = {}) {
  * @property {number} bloatCount
  * @property {number} flagshipCount
  * @property {number} flagshipBytes
+ * @property {number} lcp                 Content longest-common-prefix (structural frontier).
+ * @property {boolean} hadBaseline        A prior same-lineage request existed.
+ * @property {string | null} mutationSite First divergent slot (structural culprit candidate).
+ * @property {UsageDiffResidual | null} residual  Write-mass attribution (re-written vs new).
+ * @property {number | null} now          This turn's reference instant, injected from the
+ *     captured `request_received_at` (epoch ms); `null` for probe turns.
+ * @property {number | null} idleMs       Bounded inter-turn gap (≥0, finite) from the prior
+ *     same-lineage turn's `response_completed_at`; `null` when uncomputable or a probe.
+ * @property {boolean} idleMsReliable     `false` for the `__no_thread__` lane (capture-order
+ *     fallback) whose gap does not represent a real same-conversation idle.
+ * @property {boolean} probe              `max_tokens === 1` — filtered from cache analysis.
  */
 
 /**
@@ -457,7 +551,7 @@ export function computeWaste(exchanges, overrides = {}) {
 /**
  * Cache-lineage lane key: the manifest `thread_id`. Exchanges with no thread_id
  * share one capture-order lane so a partial capture still diffs sanely.
- * @param {string|null} threadId
+ * @param {string | null | undefined} threadId
  * @param {number} _index
  */
 function laneKey(threadId, _index) {
@@ -465,16 +559,34 @@ function laneKey(threadId, _index) {
 }
 
 /**
- * Mark each segment `.static` iff, within its lineage, the slot's content hash is
- * identical every time the slot appears.
- * @param {Array<{ threadId: string|null }>} exchanges
- * @param {Segment[][]} allSegments
+ * Parse a captured ISO-8601 timestamp to epoch ms, or `null` when absent/invalid.
+ * This is `Date.parse` (a captured string), NOT `Date.now()` — the wall clock stays
+ * out of the waste/diagnostic logic (cache spec §2.3, issue #83): `now` is injected
+ * from the per-turn capture, never read live.
+ * @param {unknown} iso
+ * @returns {number | null}
  */
-function markStatic(exchanges, allSegments) {
+function parseMs(iso) {
+  if (typeof iso !== 'string') return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Mark each segment `.static` iff, within its lineage, the slot's content hash is
+ * identical every time the slot appears. Probe turns (`probe[i]`) are excluded from
+ * BOTH passes — a one-shot probe is not a real turn, so it must neither count toward a
+ * slot's recurrence nor inherit the lineage's verdict (its own content may well differ).
+ * @param {Array<{ threadId?: string|null }>} exchanges
+ * @param {Segment[][]} allSegments
+ * @param {boolean[]} probe  Per-exchange probe flags, parallel to `exchanges`.
+ */
+function markStatic(exchanges, allSegments, probe) {
   // lane → slot → { count: appearances, hashes: distinct content hashes }
   /** @type {Map<string, Map<string, { count: number, hashes: Set<string> }>>} */
   const lanes = new Map();
   exchanges.forEach((e, i) => {
+    if (probe[i]) return; // a probe is filtered from static analysis
     const key = laneKey(e.threadId, i);
     let slots = lanes.get(key);
     if (!slots) lanes.set(key, (slots = new Map()));
@@ -486,7 +598,7 @@ function markStatic(exchanges, allSegments) {
     }
   });
   exchanges.forEach((e, i) => {
-    const slots = lanes.get(laneKey(e.threadId, i));
+    const slots = probe[i] ? undefined : lanes.get(laneKey(e.threadId, i));
     for (const seg of allSegments[i]) {
       const entry = slots?.get(seg.slot);
       // Static = a RECURRING slot (≥2 appearances) whose content never changed.

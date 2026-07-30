@@ -326,7 +326,17 @@ export function loadSession(dir, id, wasteConfig) {
   });
 
   const { perExchange, summary, config } = computeWaste(
-    exchanges.map((e) => ({ threadId: e.threadId, requestBody: e.requestJson, usage: e.usage })),
+    exchanges.map((e) => ({
+      threadId: e.threadId,
+      requestBody: e.requestJson,
+      usage: e.usage,
+      // Cache-diagnostic temporal/probe signals (issue #83 / cache spec §2.3):
+      // per-turn timestamps are injected from the capture (Date.parse, not
+      // Date.now), and max_tokens flags the probe turns filtered before analysis.
+      requestReceivedAt: e.requestReceivedAt,
+      responseCompletedAt: e.responseCompletedAt,
+      maxTokens: e.requestJson?.max_tokens,
+    })),
     wasteConfig ?? {}
   );
   exchanges.forEach((e, i) => {
@@ -340,6 +350,15 @@ export function loadSession(dir, id, wasteConfig) {
       bloatCount: w.bloatCount,
       flagshipCount: w.flagshipCount,
       flagshipBytes: w.flagshipBytes,
+      // Additive enriched exposures for the cache diagnostic (T3 #84).
+      lcp: w.lcp,
+      hadBaseline: w.hadBaseline,
+      mutationSite: w.mutationSite,
+      residual: w.residual,
+      now: w.now,
+      idleMs: w.idleMs,
+      idleMsReliable: w.idleMsReliable,
+      probe: w.probe,
     };
     delete e.requestJson; // computation-only; not embedded in the report
   });
