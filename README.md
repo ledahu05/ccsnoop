@@ -16,11 +16,12 @@ context window?"*, ccsnoop shows you — byte for byte.
 2. [How it works](#2-how-it-works)
 3. [Install](#3-install)
 4. [Quickstart](#4-quickstart--the-happy-path)
-5. [Turning it off / undoing](#5-turning-it-off--undoing) ← **read this before you start**
-6. [Command reference](#6-command-reference)
-7. [Concepts](#7-concepts)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Privacy & safety](#9-privacy--safety)
+5. [Diagnostics](#5-diagnostics)
+6. [Turning it off / undoing](#6-turning-it-off--undoing) ← **read this before you start**
+7. [Command reference](#7-command-reference)
+8. [Concepts](#8-concepts)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Privacy & safety](#10-privacy--safety)
 
 ---
 
@@ -42,6 +43,15 @@ over the wire, and later renders them as one self-contained HTML report.
 - **Spot waste** — content that gets re-sent every turn when it could have been
   cached, oversized tool results, and static blocks that never change. (These
   signals come from [`src/waste.js`](src/waste.js).)
+
+The report shows you the waste; two more commands help you **act on it**:
+
+- **`ccsnoop fine-tune`** — points at the recoverable bytes (unused tools, idle MCP
+  servers, heavy hooks, excludable CLAUDE.md files) and hands you a paste-ready
+  `settings.json`. See [`docs/fine-tune.md`](docs/fine-tune.md).
+- **`ccsnoop cache`** — for each turn where the prompt cache went cold, explains
+  *why* it expired, *what it cost*, and *what to do differently*. See
+  [`docs/cache.md`](docs/cache.md).
 
 **What it is *not*:**
 
@@ -68,7 +78,7 @@ over the wire, and later renders them as one self-contained HTML report.
                             <your repo>/.ccsnoop/sessions/<id>/
                               (raw request + response bytes)
 
-  then, offline:  ccsnoop report  ──reads the files──▶  report.html
+  then, offline:  ccsnoop report · fine-tune · cache  ──read the files──▶  HTML · settings.json · cards
 ```
 
 Four lines of what happens:
@@ -80,13 +90,16 @@ Four lines of what happens:
 3. As you use Claude Code, the daemon tees a copy of every request and response to
    disk, then forwards the real request to `api.anthropic.com` and streams the reply
    back untouched. Claude Code works exactly as normal.
-4. `ccsnoop report` reads those saved files and renders a single HTML page. It does
-   this offline, from the files — the daemon does not need to be running to make a
-   report.
+4. `ccsnoop report` reads those saved files and renders a single HTML page. `fine-tune`
+   and `cache` read the same files to prescribe savings and diagnose the cache. All
+   three run offline — the daemon does not need to be running.
+
+> For the full architecture — the proxy, redaction, path-token routing, the on-disk
+> capture layout — see [`docs/spec.md`](docs/spec.md).
 
 If your report is empty, it is almost always because step 1 or step 2 was skipped,
 or because Claude Code was not restarted after `init` (see
-[Troubleshooting](#8-troubleshooting)).
+[Troubleshooting](#9-troubleshooting)).
 
 ---
 
@@ -141,11 +154,27 @@ Commands:
   status   Report daemon status (running → exit 0, stopped → exit 1)
   report   Render a captured session to a self-contained static HTML file
              --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
              --session <id>       session to render (default: latest)
              --all                widen discovery across ~/.ccsnoop/routes.json
              --out <path>         output file (default <session-dir>/report.html)
              --bloat-floor <n>    bloat: absolute byte floor (default 4096)
              --bloat-multiplier <n>  bloat: sibling-outlier multiplier (default 3)
+  fine-tune  Print a byte diagnostic + paste-ready settings.json (all sessions by default)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       one session (weak-evidence: no MCP deny)
+             --latest             most-recent session (weak-evidence: no MCP deny)
+             --all                widen discovery across ~/.ccsnoop/routes.json
+             --deny-extra <a,b>   add denylist names for this run only
+             --deny-allow <a>     drop a denylist name for this run only
+  cache   Cache-economy diagnostic for one captured session (per-transition cards + rollup)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to diagnose (default: latest)
+             --latest             most-recent session (same as the default; no corpus mode)
+             --ttl <seconds>      TEMPORAL threshold (default 3600 = 1 h)
+             --html               render the same data as a self-contained HTML document
 ```
 
 ---
@@ -251,9 +280,57 @@ signals, in beginner terms:
 - **Bloated** — a single tool result that is much larger than its siblings (e.g. one
   huge file dump). Worth noticing when you are trying to trim a session.
 
+> **Next — act on what the report shows you:** [`fine-tune`](docs/fine-tune.md)
+> prescribes byte savings; [`cache`](docs/cache.md) diagnoses the prompt cache. See
+> [Diagnostics](#5-diagnostics) below.
+
 ---
 
-## 5. Turning it off / undoing
+## 5. Diagnostics
+
+Beyond the HTML report, two commands read your captures and tell you how to spend
+fewer tokens. Neither needs the daemon running — both are offline readers of the same
+files `report` reads.
+
+### `ccsnoop fine-tune` — trim what Claude Code sends
+
+A byte-level waste diagnostic across five levers (unused built-in tools, idle MCP
+servers, heavy `SessionStart` hooks, excludable CLAUDE.md files, the incompressible
+system floor), plus a **paste-ready `settings.json`** to act on it. It writes nothing —
+you copy the block yourself.
+
+```console
+$ ccsnoop fine-tune
+…
+Recoverable (waste, conservative): ~<n> bytes
+settings.json (paste-ready):
+{ "permissions": { "deny": ["Workflow", "ScheduleWakeup", "ReportFindings"] }, … }
+```
+
+Full guide — the levers, the T4 MCP guard, corpus vs single-session, denylist
+overrides: [`docs/fine-tune.md`](docs/fine-tune.md).
+
+### `ccsnoop cache` — diagnose the prompt cache
+
+For each turn where a cached prefix went cold, it explains **why** (a four-verdict
+taxonomy: HIT / STRUCTURAL / TEMPORAL / UNEXPLAINED), **what it cost** (in
+token-equivalents), and **what to do differently**. Per-transition cards plus a lean
+session rollup.
+
+```console
+$ ccsnoop cache
+── session rollup ────────────
+    write:   ~30,874 tok-équ.  (15,437 ×2 (1 h write))
+    read:    ~18,492 tok-équ.  (184,925 ×0.1 (read))
+    by verdict:  HIT 5 · STRUCTURAL 0 · TEMPORAL 0 · UNEXPLAINED 1
+```
+
+Full guide — the three frontiers, the verdict taxonomy, the recommendation bridges:
+[`docs/cache.md`](docs/cache.md).
+
+---
+
+## 6. Turning it off / undoing
 
 **Know the exit door before you walk in.** Everything ccsnoop does is reversible and
 stays on your machine.
@@ -290,7 +367,7 @@ $ rm -rf .ccsnoop
 
 ---
 
-## 6. Command reference
+## 7. Command reference
 
 Run `ccsnoop <command> [options]`. `--help` prints this same list.
 
@@ -300,11 +377,13 @@ Run `ccsnoop <command> [options]`. `--help` prints this same list.
 | `start`  | Start the capture-proxy daemon (detached; returns immediately). | `--port <n>` listen port (persisted to `~/.ccsnoop/config.json`)<br>`--sessions-dir <p>` capture root (default `~/.ccsnoop/sessions`) |
 | `stop`   | Stop the daemon (drain, then terminate). | — |
 | `status` | Report daemon status (running → exit `0`, stopped → exit `1`). | — |
-| `report` | Render a captured session to a self-contained static HTML file. | `--root <path>` capture root (default `./.ccsnoop`)<br>`--session <id>` session to render (default: latest)<br>`--all` widen discovery across `~/.ccsnoop/routes.json`<br>`--out <path>` output file (default `<session-dir>/report.html`)<br>`--bloat-floor <n>` bloat: absolute byte floor (default `4096`)<br>`--bloat-multiplier <n>` bloat: sibling-outlier multiplier (default `3`) |
+| `report` | Render a captured session to a self-contained static HTML file. | `--root <path>` capture root (default `./.ccsnoop`)<br>`--sessions-dir <p>` dir holding session subdirs (overrides `--root`)<br>`--session <id>` session to render (default: latest)<br>`--all` widen discovery across `~/.ccsnoop/routes.json`<br>`--out <path>` output file (default `<session-dir>/report.html`)<br>`--bloat-floor <n>` bloat: absolute byte floor (default `4096`)<br>`--bloat-multiplier <n>` bloat: sibling-outlier multiplier (default `3`) |
+| `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP deny)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run |
+| `cache`  | Cache-economy diagnostic for one captured session (per-transition cards + rollup). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--ttl <seconds>` TEMPORAL threshold (default `3600`)<br>`--html` render as a self-contained HTML document |
 
 ---
 
-## 7. Concepts
+## 8. Concepts
 
 A short glossary, saved for the end so the quickstart isn't gated behind it. Each
 term in one sentence:
@@ -322,9 +401,12 @@ term in one sentence:
 - **Session** — one Claude Code run, stored as `sessions/<session_id>/` under the
   capture root; `ccsnoop report` renders one session into one HTML page.
 
+> **Deeper reading:** the canonical glossary lives in [`CONTEXT.md`](CONTEXT.md); the
+> full architecture (proxy, routing, capture layout) in [`docs/spec.md`](docs/spec.md).
+
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 **Nothing was captured / the report is empty.** Almost always one of:
 
@@ -361,8 +443,8 @@ ccsnoop: refusing to overwrite a foreign ANTHROPIC_BASE_URL (https://example.com
 Re-run with `ccsnoop init --force` to replace it (ccsnoop's `--undo` will still
 restore the original value afterwards).
 
-**`report` says no session was found.** By default `report` only looks in the
-current repo's `.ccsnoop/`:
+**`report` (or `fine-tune` / `cache`) says no session was found.** By default these
+only look in the current repo's `.ccsnoop/`:
 
 ```console
 $ ccsnoop report
@@ -375,7 +457,7 @@ search every repo registered in the routes registry.
 
 ---
 
-## 9. Privacy & safety
+## 10. Privacy & safety
 
 **Captures are your prompts and your files, in the clear.** A capture is a
 byte-faithful copy of what Claude Code sent — that includes your messages, the
