@@ -21,11 +21,8 @@
 //     is never used for cost. Tier-unknown ⇒ a `[×1.25, ×2]` bound, never a false-precise
 //     number; usage-absent ⇒ no cost line. Rollup totals are exact from `usage`.
 
-import fs from 'node:fs';
-import path from 'node:path';
-
 import { computeWaste, breakpointPositions } from './waste.js';
-import { resolveRoots, listSessions, pickLatestSession, buildExchange } from './report.js';
+import { resolveRoots, listSessions, pickLatestSession, loadExchanges, toAnalysisInput } from './report.js';
 
 /** Default TTL threshold (cache spec AC #26): 1 h, the ttl Claude Code places. */
 export const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -1084,6 +1081,10 @@ function fineTuneBridgeRecos(transitions) {
 /** Tier label for the cost breakdown (`5m`/`1h`/`read` → a human phrase). */
 const TIER_LABEL = Object.freeze({ '5m': '5 m write', '1h': '1 h write', read: 'read' });
 
+/** Render order for the by-verdict / by-sub-mode counts — shared by the text and HTML renders. */
+const VERDICT_ORDER = /** @type {Verdict[]} */ (Object.freeze(['HIT', 'STRUCTURAL', 'TEMPORAL', 'UNEXPLAINED']));
+const STRUCT_MODE_ORDER = /** @type {StructMode[]} */ (Object.freeze(['KEY', 'PREFIX', 'TRUNCATED']));
+
 /**
  * A number as a locale-stable, comma-grouped string (30874 → "30,874"; 18492.5 →
  * "18,492.5"). `toLocaleString` is avoided so the output is identical across Node
@@ -1133,12 +1134,9 @@ function tierBreakdown(t) {
  */
 function fmtCost(t) {
   if (!t) return '—';
-  const head =
-    t.equiv != null
-      ? `~${fmtNum(t.equiv)} tok-équ.`
-      : t.equivRange
-        ? `~${fmtNum(t.equivRange[0])}–${fmtNum(t.equivRange[1])} tok-équ. (bound)`
-        : '~? tok-équ.';
+  let head = '~? tok-équ.';
+  if (t.equiv != null) head = `~${fmtNum(t.equiv)} tok-équ.`;
+  else if (t.equivRange) head = `~${fmtNum(t.equivRange[0])}–${fmtNum(t.equivRange[1])} tok-équ. (bound)`;
   return `${head}${tierBreakdown(t)}${t.bounded ? '  [≤ this turn’s write]' : ''}`;
 }
 
@@ -1222,8 +1220,8 @@ function renderRollupLines(r) {
   out.push(`    write:        ${fmtCost(r.totals.write)}`);
   out.push(`    read:         ${fmtCost(r.totals.read)}`);
   out.push(`    wasted:       ${fmtCost(r.totals.wasted)}`);
-  out.push(`    by verdict:   ${['HIT', 'STRUCTURAL', 'TEMPORAL', 'UNEXPLAINED'].map((v) => `${v} ${r.byVerdict[v] ?? 0}`).join(' · ')}`);
-  const struct = ['KEY', 'PREFIX', 'TRUNCATED'].filter((m) => r.byStructMode[m]).map((m) => `${m} ${r.byStructMode[m]}`);
+  out.push(`    by verdict:   ${VERDICT_ORDER.map((v) => `${v} ${r.byVerdict[v] ?? 0}`).join(' · ')}`);
+  const struct = STRUCT_MODE_ORDER.filter((m) => r.byStructMode[m]).map((m) => `${m} ${r.byStructMode[m]}`);
   if (struct.length) out.push(`    structural:   ${struct.join(' · ')}`);
   out.push(`    counterfactual: would have avoided re-writing ${fmtCost(r.summedCounterfactual)}`);
   if (r.rollupRecos && r.rollupRecos.length) {
@@ -1275,9 +1273,16 @@ export function renderCache(diag, opts = {}) {
   return { lines, html };
 }
 
-/** @param {unknown} s */
+const HTML_ENTITIES = Object.freeze({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' });
+
+/**
+ * Escape a value for HTML text/attribute context. Every interpolation into the document
+ * goes through here — a session id is a directory name, i.e. attacker-shaped input.
+ * @param {unknown} s
+ * @returns {string}
+ */
 function escHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  return String(s).replace(/[&<>"']/g, (c) => HTML_ENTITIES[c]);
 }
 
 /** @param {string} v */
@@ -1329,8 +1334,9 @@ function renderCacheHtml(diag, { sessionId, cards, hitCount }) {
         .join('\n')
     : '<p class="muted">No cold transitions — nothing expired or was re-written this session.</p>';
 
-  const byVerdict = ['HIT', 'STRUCTURAL', 'TEMPORAL', 'UNEXPLAINED']
-    .map((v) => `<span class="vcount ${verdictClass(v)}">${escHtml(v)} <b>${r.byVerdict[v] ?? 0}</b></span>`)
+  const byVerdict = VERDICT_ORDER.map(
+    (v) => `<span class="vcount ${verdictClass(v)}">${escHtml(v)} <b>${r.byVerdict[v] ?? 0}</b></span>`
+  )
     .join(' ');
   const recos =
     r.rollupRecos && r.rollupRecos.length
@@ -1415,52 +1421,17 @@ main{max-width:920px;margin:0 auto;padding:18px}
 `;
 
 /**
- * Load a captured session dir into the `diagnoseCache` input shape (mirrors the fixture
- * gate's helper): each manifest line → an exchange with the parsed request body, the
- * read `usage`, the per-turn timestamps, and the probe `max_tokens`. `diagnoseCache`
- * runs its own `computeWaste`, so this does NOT reuse `report.loadSession` (which deletes
- * the parsed body and computes waste for the report model).
- * @param {string} dir
- * @returns {Array<{ turn: number|null, threadId: string|null, requestBody: any, usage: import('./report.js').Usage|null, requestReceivedAt: string|null, responseCompletedAt: string|null, maxTokens: unknown }>}
- */
-function loadCacheSession(dir) {
-  const lines = fs
-    .readFileSync(path.join(dir, 'manifest.jsonl'), 'utf8')
-    .split('\n')
-    .filter((l) => l.trim())
-    .map((l) => JSON.parse(l));
-  return lines.map((line) => {
-    const requestBuf = fs.readFileSync(path.join(dir, line.request_blob));
-    let responseBuf = Buffer.alloc(0);
-    try {
-      responseBuf = fs.readFileSync(path.join(dir, line.response_blob));
-    } catch {
-      // An aborted exchange reads null usage — the diagnostic degrades to "—" on it.
-    }
-    const e = buildExchange(line, requestBuf, responseBuf);
-    return {
-      turn: e.turn,
-      threadId: e.threadId,
-      requestBody: e.requestJson,
-      usage: e.usage,
-      requestReceivedAt: e.requestReceivedAt,
-      responseCompletedAt: e.responseCompletedAt,
-      maxTokens: e.requestJson?.max_tokens,
-    };
-  });
-}
-
-/**
  * The `cache` subcommand entry point (issue #87 / cache spec §6). Discover + load ONE
  * session (the cache economy is per-conversation — no corpus mode), run the pure
  * `diagnoseCache`, and render it (text by default; the same data as HTML). Discovery
- * reuses the report resolver so `cache` finds exactly what `report`/`fine-tune` do.
+ * reuses the report resolver so `cache` finds exactly what `report`/`fine-tune` do, and
+ * loading reuses the report's session reader so both see the same exchanges.
  *
- * The TTL threshold is taken in **seconds** on the CLI surface (`--ttl`, default 1 h) and
- * handed to `diagnoseCache` in ms; an absent/invalid value falls back to the diagnostic's
- * own default.
+ * The TTL threshold is taken in **seconds** here (the CLI's `--ttl`) and handed to
+ * `diagnoseCache` in ms; an absent value falls back to the diagnostic's own 1 h default.
+ * There is no `latest` option: with no corpus mode, latest IS the default.
  *
- * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, latest?: boolean, ttlSeconds?: number }} [opts]
+ * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, ttlSeconds?: number }} [opts]
  * @returns {{ sessionId: string, transitions: number, diagnostic: Diagnostic, lines: string[], html: string }}
  */
 export function cache(opts = {}) {
@@ -1485,9 +1456,11 @@ export function cache(opts = {}) {
     chosen = /** @type {{ id: string, dir: string, mtimeMs: number }} */ (pickLatestSession(sessions));
   }
 
-  const session = loadCacheSession(chosen.dir);
-  const ttlMs = Number.isFinite(opts.ttlSeconds) && opts.ttlSeconds >= 0 ? opts.ttlSeconds * 1000 : undefined;
-  const diagnostic = diagnoseCache(session, ttlMs != null ? { ttl: ttlMs } : {});
+  const session = loadExchanges(chosen.dir).map(toAnalysisInput);
+  // `diagnoseCache` owns the TTL validation (non-finite/negative ⇒ its own default).
+  const diagnostic = diagnoseCache(session, {
+    ttl: opts.ttlSeconds === undefined ? undefined : opts.ttlSeconds * 1000,
+  });
   const { lines, html } = renderCache(diagnostic, { sessionId: chosen.id });
   return { sessionId: chosen.id, transitions: diagnostic.transitions.length, diagnostic, lines, html };
 }

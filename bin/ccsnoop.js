@@ -203,18 +203,24 @@ function runFineTune(args) {
  * @param {string[]} args
  */
 function runCache(args) {
+  // `--latest` is accepted for symmetry with report/fine-tune but needs no plumbing:
+  // with no corpus mode, the most-recent session already IS the default.
   const ttlFlag = getFlag(args, '--ttl');
   const ttlSeconds = ttlFlag === undefined ? undefined : Number(ttlFlag);
-  const wantHtml = hasFlag(args, '--html');
+  // A typo'd threshold would otherwise fall back to the 1 h default and quietly report a
+  // different diagnostic than the one asked for.
+  // (`Number('')` is 0, so a blank value is rejected explicitly rather than read as "0 s".)
+  if (ttlFlag !== undefined && (ttlFlag.trim() === '' || !Number.isFinite(ttlSeconds) || ttlSeconds < 0)) {
+    throw new Error(`--ttl expects a non-negative number of seconds, got '${ttlFlag}'`);
+  }
   const result = cache({
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
     sessionsDir: getFlag(args, '--sessions-dir'),
     session: getFlag(args, '--session'),
-    latest: hasFlag(args, '--latest'),
     ttlSeconds,
   });
-  if (wantHtml) {
+  if (hasFlag(args, '--html')) {
     process.stdout.write(result.html + '\n');
   } else {
     for (const line of result.lines) console.log(line);

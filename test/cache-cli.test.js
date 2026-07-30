@@ -264,3 +264,107 @@ test('ccsnoop cache --help lists the cache command', () => {
   assert.equal(r.status, 0);
   assert.match(r.stdout, /\bcache\b/);
 });
+
+// ── degraded / hostile inputs ─────────────────────────────────────────────────
+
+test('renderCache: a tier-unknown write is a bound, never a false-precise number', () => {
+  // `usage` reports cache_creation_input_tokens with no per-tier breakdown: the cost is
+  // knowable only as the ×1.25–×2 span (cache spec: never invent the tier).
+  const base = { tools: [{ name: 'Bash' }], system: [{ type: 'text', text: 'sys' }], messages: [{ role: 'user', content: 'q1' }] };
+  const cur = { tools: [{ name: 'Bash', description: 'changed' }], system: [{ type: 'text', text: 'sys' }], messages: [{ role: 'user', content: 'q1' }] };
+  const diag = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: base, usage: usage({ input: 10 }), requestReceivedAt: '2026-07-28T07:50:00Z', responseCompletedAt: '2026-07-28T07:50:01Z' },
+      { threadId: 'A', turn: 2, requestBody: cur, usage: usage({ input: 900, cacheCreation: 1000 }), requestReceivedAt: '2026-07-28T07:50:10Z', responseCompletedAt: '2026-07-28T07:50:11Z' },
+    ],
+    { ttl: 60000 }
+  );
+  const out = renderCache(diag, { sessionId: 'unk' }).lines.join('\n');
+  assert.match(out, /1,250–2,000 tok-équ\. \(bound\)/);
+  assert.match(out, /×1\.25–×2 \(tier unknown\)/);
+});
+
+test('renderCache: a usage-absent turn renders "—" for the cost, not a zero', () => {
+  const base = { tools: [{ name: 'Bash' }], system: [{ type: 'text', text: 'sys' }], messages: [{ role: 'user', content: 'q1' }] };
+  const cur = { tools: [{ name: 'Bash', description: 'changed' }], system: [{ type: 'text', text: 'sys' }], messages: [{ role: 'user', content: 'q1' }] };
+  const diag = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: base, usage: null },
+      { threadId: 'A', turn: 2, requestBody: cur, usage: null },
+    ],
+    { ttl: 60000 }
+  );
+  const out = renderCache(diag, { sessionId: 'nousage' }).lines.join('\n');
+  assert.match(out, /cost: +—/);
+});
+
+test('renderCache: a composite card lists each non-HIT region with its range and cause', () => {
+  // A prefix edit AND a past-TTL cold head in the same turn (see cache.test.js) — the
+  // card must show both regions rather than only its headline.
+  const base = { system: 'sys', messages: [{ role: 'user', content: 'A' }, { role: 'user', content: 'B' }] };
+  const cur = { system: 'sys', messages: [{ role: 'user', content: 'A-EDITED' }, { role: 'user', content: 'B' }] };
+  const diag = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: base, usage: usage({ input: 10 }), requestReceivedAt: '2026-07-28T07:50:00Z', responseCompletedAt: '2026-07-28T07:50:01Z' },
+      { threadId: 'A', turn: 2, requestBody: cur, usage: usage({ input: 900 }), requestReceivedAt: '2026-07-28T07:52:01Z', responseCompletedAt: '2026-07-28T07:52:02Z' },
+    ],
+    { ttl: 60000 }
+  );
+  assert.equal(diag.transitions[0].composite, true, 'the fixture is a composite card');
+  const { lines, html } = renderCache(diag, { sessionId: 'comp' });
+  const out = lines.join('\n');
+  assert.match(out, /\[composite\]/);
+  assert.match(out, /STRUCTURAL·PREFIX @ message#0/);
+  assert.match(out, /TEMPORAL/);
+  assert.match(out, /\[\d+\.\.\d+\)/, 'each region carries its segment range');
+  assert.match(html, /composite/);
+});
+
+test('renderCache (html): a session id carrying markup is escaped, not injected', () => {
+  const diag = diagnoseCache([]);
+  const { html } = renderCache(diag, { sessionId: '<script>alert(1)</script>' });
+  assert.doesNotMatch(html, /<script>alert/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+});
+
+test('cache(): a session whose manifest is empty renders a no-transitions diagnostic', () => {
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'empty');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'manifest.jsonl'), '');
+  const res = cache({ cwd: '/nonexistent', sessionsDir: root });
+  assert.equal(res.transitions, 0);
+  assert.match(res.lines.join('\n'), /No cold transitions/);
+});
+
+test('cache(): an aborted turn (no response blob) degrades instead of throwing', () => {
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'aborted');
+  writeSession(dir, [
+    { body: { tools: [{ name: 'Bash' }], system: [{ type: 'text', text: 'sys' }], messages: [{ role: 'user', content: 'q1' }] }, usageSse: writeSse({ input: 10 }) },
+    { body: { tools: [{ name: 'Bash', description: 'changed' }], system: [{ type: 'text', text: 'sys' }], messages: [{ role: 'user', content: 'q1' }] }, usageSse: '' },
+  ]);
+  fs.rmSync(path.join(dir, '0002.response.sse'));
+  const res = cache({ cwd: '/nonexistent', sessionsDir: root, session: 'aborted' });
+  assert.match(res.lines.join('\n'), /cost: +—/, 'no usage ⇒ no cost, never a fabricated one');
+});
+
+test('cache(): an unknown --session names the sessions that do exist', () => {
+  const root = mkTmpDir();
+  writeSession(path.join(root, 'sessions', 'real'), [
+    { body: { system: 'sys', messages: [{ role: 'user', content: 'a' }] }, usageSse: writeSse({ input: 10 }) },
+  ]);
+  assert.throws(() => cache({ cwd: '/nonexistent', sessionsDir: root, session: 'ghost' }), /ghost.*not found.*real/s);
+});
+
+test('ccsnoop cache: a non-numeric --ttl fails loudly instead of silently using the default', () => {
+  const root = mkTmpDir();
+  writeSession(path.join(root, 'sessions', 'ttl-bad'), [
+    { body: { system: 'sys', messages: [{ role: 'user', content: 'a' }] }, usageSse: writeSse({ input: 10 }) },
+  ]);
+  for (const bad of ['abc', '-5', '']) {
+    const r = spawnSync(process.execPath, [BIN, 'cache', '--sessions-dir', root, '--ttl', bad], { encoding: 'utf8' });
+    assert.notEqual(r.status, 0, `--ttl '${bad}' should be rejected`);
+    assert.match(r.stderr, /--ttl expects a non-negative number of seconds/);
+  }
+});
