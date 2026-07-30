@@ -27,6 +27,14 @@ import { computeWaste, breakpointPositions } from './waste.js';
 export const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
 
 /**
+ * Chronicity threshold (cache spec §5 / issue #86): a structural culprit slot must recur
+ * across this many transitions before the "stabilize the volatile block" reco fires. The
+ * spec says "≥ 2–3 transitions — never on a one-off edit"; the floor (2) is used so a
+ * single recurring slot qualifies while a genuine one-off (1) never does.
+ */
+export const CHRONICITY_THRESHOLD = 2;
+
+/**
  * Cache-tier effective-cost multipliers (cache spec §4 / issue #85). The cost unit is the
  * **effective token-equivalent** = tokens × tier multiplier (a cache-write is billed at
  * ×1.25 for a 5 m TTL or ×2 for a 1 h TTL; a cache-read at ×0.1), so a 1 h write and a
@@ -96,6 +104,25 @@ export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
  *     attributed across multiple regions without re-tokenizing, so the cost is not split per region).
  */
 
+/** @typedef {'resume-before-ttl'|'group-turns'|'batch-invalidating'|'edit-last-turn'|'stabilize-volatile'|'fine-tune-bridge'|'weak-truncated'|'weak-divorce'} RecoKind */
+
+/**
+ * @typedef {object} Reco
+ * @property {RecoKind} kind   Machine id (testing + rollup dedup).
+ * @property {string} text     Human phrase, including the counterfactual.
+ * @property {'avoidance'|'amortization'|'none'} form  Counterfactual form (cache spec §5).
+ * @property {'high'|'low'} confidence  Counterfactual confidence — low ⇒ a conditional
+ *     phrasing (a low-confidence TEMPORAL straddle never promises the saving).
+ * @property {TokEquiv | null} counterfactual  The wasted basis — "would have avoided
+ *     re-writing ~X tok-équ." (a lower bound, not a guarantee); `null` when the transition
+ *     is uncosted (usage absent / no attributed re-write).
+ * @property {boolean} [weak]  Diagnostic-only (TRUNCATED / the breakpoint↔LCP divorce) —
+ *     the lever is known but not strongly user-controllable, so this is not a strong reco.
+ * @property {string} [slot]   Culprit slot (PREFIX edit / chronicity / fine-tune bridge).
+ * @property {number} [count]  Rollup-only: how many transitions this deduped reco covers.
+ * @property {number} [recurrence]  Rollup-only (chronicity): how many turns the slot recurred.
+ */
+
 /**
  * @typedef {object} Card
  * @property {number} turn               The exchange's turn number.
@@ -107,7 +134,11 @@ export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
  * @property {FrontierModel} frontierModel  Per-turn: 3-frontier when breakpoints are present.
  * @property {TokEquiv} [cost]              The per-transition WASTED (re-write) cost in
  *     token-equivalents (T4 #85). Absent on HIT/establishing turns and on usage-absent turns.
- * // `reco?` is added by T5 (#86).
+ * @property {Reco} [reco]                  The per-transition recommendation (T5 #86), emitted
+ *     iff the lever passes the 3-condition legitimacy test (controllable ∧ causal ∧ non-trivial).
+ *     Absent on HIT and hidden-cause UNEXPLAINED turns.
+ * @property {string[]} [hiddenCauses]      Non-actionable candidate causes surfaced on a
+ *     hidden-cause UNEXPLAINED turn (cache spec §5 — never fabricated, never a reco).
  */
 
 /**
@@ -135,7 +166,9 @@ export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
  *     per-turn re-write cost (exact where the residual attributes it, else bounded).
  * @property {TokEquiv} summedCounterfactual  The summed counterfactual (T4 #85) — "would have
  *     avoided re-writing ~X tok-équ." — the wasted basis framed as a lower-bound saving.
- * // `rollupRecos` is added by T5 (#86).
+ * @property {Reco[]} rollupRecos  The deduped session-pattern recommendations (T5 #86): each
+ *     per-verdict pattern appears once (with a count) rather than per-event, plus the
+ *     rollup-only patterns (group your turns, stabilize the volatile block, fine-tune bridge).
  */
 
 /**
@@ -154,13 +187,18 @@ export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
  * @param {Array<{ threadId?: string|null, requestBody: any, usage: import('./report.js').Usage|null,
  *   requestReceivedAt?: string|null, responseCompletedAt?: string|null, maxTokens?: unknown,
  *   turn?: number }>} session  The same exchange shape `computeWaste` consumes.
- * @param {{ ttl?: number, now?: number }} [opts]  `ttl` (ms, default 1 h); `now` reserved.
+ * @param {{ ttl?: number, now?: number, chronicityThreshold?: number }} [opts]  `ttl` (ms,
+ *   default 1 h); `now` reserved; `chronicityThreshold` (default {@link CHRONICITY_THRESHOLD}).
  * @returns {Diagnostic}
  */
 export function diagnoseCache(session, opts = {}) {
   const ttl = typeof opts.ttl === 'number' && Number.isFinite(opts.ttl) && opts.ttl >= 0
     ? opts.ttl
     : DEFAULT_CACHE_TTL_MS;
+  const chronicityThreshold =
+    Number.isInteger(opts.chronicityThreshold) && opts.chronicityThreshold >= 1
+      ? opts.chronicityThreshold
+      : CHRONICITY_THRESHOLD;
   // `opts.now` is accepted for spec-faithful signature / a future session-wide reference,
   // but the temporal axis is the captured `idleMs` (computed by computeWaste) — never a
   // live clock — so it is intentionally not read here.
@@ -185,11 +223,12 @@ export function diagnoseCache(session, opts = {}) {
     const card = diagnoseTurn(session[i], i, w, ttl, breakpoints);
     if (card) {
       if (card.cost) addTokEquiv(wastedAcc, card.cost);
+      annotate(card); // T5 (#86): per-transition reco (3-condition test) + hidden-cause context
       transitions.push(card);
     }
   }
 
-  return finalize(transitions, anyBreakpoints, writeAcc, readAcc, wastedAcc);
+  return finalize(transitions, anyBreakpoints, writeAcc, readAcc, wastedAcc, chronicityThreshold);
 }
 
 /**
@@ -444,9 +483,10 @@ function card(turn, regions, hasBreakpoints) {
  * @param {CostAcc} writeAcc
  * @param {CostAcc} readAcc
  * @param {CostAcc} wastedAcc
+ * @param {number} chronicityThreshold
  * @returns {Diagnostic}
  */
-function finalize(transitions, anyBreakpoints, writeAcc, readAcc, wastedAcc) {
+function finalize(transitions, anyBreakpoints, writeAcc, readAcc, wastedAcc, chronicityThreshold) {
   /** @type {Record<Verdict, number>} */
   const byVerdict = { HIT: 0, STRUCTURAL: 0, TEMPORAL: 0, UNEXPLAINED: 0 };
   /** @type {Record<StructMode, number>} */
@@ -471,6 +511,8 @@ function finalize(transitions, anyBreakpoints, writeAcc, readAcc, wastedAcc) {
         wasted: accToTotal(wastedAcc),
       },
       summedCounterfactual: counterfactual(wastedAcc),
+      // T5 (#86): deduped session-pattern recommendations (no per-event repetition).
+      rollupRecos: buildRollupRecos(transitions, chronicityThreshold),
     },
     frontierModel,
   };
@@ -700,4 +742,259 @@ function counterfactual(acc) {
 /** @param {object} e @param {number} index @returns {number} */
 function turnOf(e, index) {
   return typeof e.turn === 'number' ? e.turn : index + 1;
+}
+
+// ── recommendations (cache spec §5 / T5 #86) ─────────────────────────────────
+// A reco is legitimate iff the lever is (1) controllable, (2) causal on THIS transition,
+// (3) non-trivial. Verdicts that fail the test carry a diagnostic + cost, no reco. The
+// counterfactual ("would have avoided re-writing ~X tok-équ.") is a confidence-aware lower
+// bound drawn from the per-transition wasted cost — never a promise of a saving.
+
+/**
+ * Candidate hidden causes surfaced as non-actionable context on a truly-UNEXPLAINED turn
+ * (cache spec §3.1 / user story #5) — never fabricated, never framed as a reco.
+ */
+const HIDDEN_CAUSE_CANDIDATES = Object.freeze([
+  'overage fallback',
+  'parallel-session eviction',
+  'un-published cache-key components',
+]);
+
+/**
+ * The counterfactual phrase — the wasted basis framed as a lower bound. A known-tier cost is
+ * a point; a tier-unknown cost is its `[lo, hi]` span; an uncosted transition ("—") carries no
+ * figure (the reco still fires — the lever is real even when the cost is not captured).
+ * @param {TokEquiv | null} cf
+ * @returns {string}
+ */
+function cfPhrase(cf) {
+  if (!cf) return 'an unmeasured re-write';
+  if (cf.equiv != null) return `~${cf.equiv} tok-équ.`;
+  if (cf.equivRange) return `~${cf.equivRange[0]}–${cf.equivRange[1]} tok-équ.`;
+  return 'an unmeasured re-write';
+}
+
+/**
+ * The per-transition reco for a card, gated by the 3-condition legitimacy test. `null` when
+ * the verdict carries no reco (HIT — no waste; hidden-cause UNEXPLAINED — not controllable).
+ * @param {Card} card
+ * @returns {Reco | null}
+ */
+function recoFor(card) {
+  const h = card.headline;
+  const cf = card.cost ?? null;
+  switch (h.verdict) {
+    case 'HIT':
+      return null; // nothing expired — no waste to act on
+    case 'TEMPORAL':
+      return {
+        kind: 'resume-before-ttl',
+        text: `${h.confidence === 'low' ? 'if the cache had expired (low confidence), ' : ''}resume inside the TTL window — would have avoided re-writing ${cfPhrase(cf)}`,
+        form: 'avoidance',
+        confidence: h.confidence === 'low' ? 'low' : 'high',
+        counterfactual: cf,
+      };
+    case 'STRUCTURAL':
+      if (h.structMode === 'TRUNCATED') {
+        return { kind: 'weak-truncated', text: 'compaction re-processed the prefix — not user-controllable; no reliable lever', form: 'none', confidence: 'low', counterfactual: null, weak: true };
+      }
+      if (h.structMode === 'PREFIX') {
+        const at = card.culpritSlot ? ` rather than ${card.culpritSlot}` : '';
+        return { kind: 'edit-last-turn', text: `edit or add the last turn${at} — would have avoided re-writing ${cfPhrase(cf)}`, form: 'avoidance', confidence: 'high', counterfactual: cf, slot: card.culpritSlot ?? undefined };
+      }
+      return {
+        kind: 'batch-invalidating',
+        text: `batch the invalidating changes${card.culpritSlot ? ` at ${card.culpritSlot}` : ''} into one turn — would have avoided re-writing ${cfPhrase(cf)} (amortized)`,
+        form: 'amortization',
+        confidence: 'high',
+        counterfactual: cf,
+        slot: card.culpritSlot ?? undefined,
+      };
+    case 'UNEXPLAINED':
+      // The breakpoint↔LCP divorce has a KNOWN cause (no breakpoint) but an uncontrollable
+      // lever ⇒ a weak diagnostic reco (cache spec §3.2). A hidden-cause UNEXPLAINED ⇒ none.
+      if (h.uncachedByDesign) {
+        return { kind: 'weak-divorce', text: 'stable content past the last cache_control breakpoint is re-processed every turn — add a breakpoint upstream if your client allows it', form: 'none', confidence: 'low', counterfactual: null, weak: true };
+      }
+      return null;
+  }
+  return null;
+}
+
+/**
+ * Stamp a card with its per-transition reco (if legitimate) and, on a hidden-cause
+ * UNEXPLAINED turn, its non-actionable candidate causes.
+ * @param {Card} card
+ */
+function annotate(card) {
+  const reco = recoFor(card);
+  if (reco) card.reco = reco;
+  const h = card.headline;
+  if (h.verdict === 'UNEXPLAINED' && !h.uncachedByDesign && h.cause === null) {
+    card.hiddenCauses = [...HIDDEN_CAUSE_CANDIDATES];
+  }
+}
+
+/**
+ * Sum an arbitrary set of per-turn costs into one {@link TokEquiv} (the deduped counterfactual
+ * for a rollup reco). Reuses the cost accumulator — token figures stay `usage`-grounded.
+ * Returns `null` when no turn contributed a cost (all uncosted), so the phrase stays
+ * "an unmeasured re-write" instead of a misleading `~0`.
+ * @param {(TokEquiv | null)[]} costs
+ * @returns {TokEquiv | null}
+ */
+function sumTokEquiv(costs) {
+  const acc = newCostAcc();
+  let any = false;
+  for (const c of costs) {
+    if (c) {
+      addTokEquiv(acc, c);
+      any = true;
+    }
+  }
+  return any ? counterfactual(acc) : null;
+}
+
+/**
+ * The deduped session-pattern rollup recommendations (cache spec §5 / §6). Each per-verdict
+ * pattern appears ONCE (with a count + summed counterfactual), never per-event. Weak per-card
+ * recos (TRUNCATED / divorce) are diagnostic-only and stay off the rollup. The session-only
+ * patterns follow: group-your-turns, chronicity (stabilize), and the fine-tune reco-bridge.
+ * @param {Card[]} transitions
+ * @param {number} chronicityThreshold
+ * @returns {Reco[]}
+ */
+function buildRollupRecos(transitions, chronicityThreshold) {
+  /** @type {Reco[]} */
+  const recos = [];
+
+  // (1) Dedup the actionable per-card recos by kind: TEMPORAL rolls up to "group your turns";
+  //     KEY to "batch"; PREFIX to "edit the last turn".
+  /** @type {Map<RecoKind, Card[]>} */
+  const byKind = new Map();
+  for (const c of transitions) {
+    if (!c.reco) continue;
+    const kind = c.reco.kind;
+    if (kind === 'weak-truncated' || kind === 'weak-divorce') continue; // diagnostic-only
+    if (!byKind.has(kind)) byKind.set(kind, []);
+    byKind.get(kind).push(c);
+  }
+  for (const [kind, cards] of byKind) recos.push(rollupReco(kind, cards));
+
+  // (2) Session-only patterns.
+  recos.push(...chronicityRecos(transitions, chronicityThreshold));
+  recos.push(...fineTuneBridgeRecos(transitions));
+  return recos;
+}
+
+/**
+ * One deduped rollup reco for a per-verdict kind. TEMPORAL's rollup form is "group your
+ * turns" (the sliding-TTL session pattern); KEY/PREFIX keep their per-verdict phrasing.
+ * @param {RecoKind} perCardKind
+ * @param {Card[]} cards
+ * @returns {Reco}
+ */
+function rollupReco(perCardKind, cards) {
+  const count = cards.length;
+  const cf = sumTokEquiv(cards.map((c) => c.cost ?? null));
+  const plural = count === 1 ? '' : 's';
+  if (perCardKind === 'resume-before-ttl') {
+    return {
+      kind: 'group-turns',
+      text: `group your turns to keep the sliding TTL alive (${count} cold turn${plural} this session) — would have avoided re-writing ${cfPhrase(cf)}`,
+      form: 'avoidance',
+      confidence: 'high',
+      counterfactual: cf,
+      count,
+    };
+  }
+  if (perCardKind === 'batch-invalidating') {
+    return {
+      kind: 'batch-invalidating',
+      text: `batch your invalidating changes into one turn (${count}× this session) — would have avoided re-writing ${cfPhrase(cf)} (amortized)`,
+      form: 'amortization',
+      confidence: 'high',
+      counterfactual: cf,
+      count,
+    };
+  }
+  return {
+    kind: 'edit-last-turn',
+    text: `edit or add the last turn rather than an old one (${count}× this session) — would have avoided re-writing ${cfPhrase(cf)}`,
+    form: 'avoidance',
+    confidence: 'high',
+    counterfactual: cf,
+    count,
+  };
+}
+
+/**
+ * Chronicity (cache spec §5): "stabilize the volatile block" fires once per culprit slot that
+ * recurred across ≥ `threshold` transitions — never on a one-off edit. A recurring mutation
+ * site is a pattern, not a series of one-offs, regardless of its KEY/PREFIX sub-mode.
+ * @param {Card[]} transitions
+ * @param {number} threshold
+ * @returns {Reco[]}
+ */
+function chronicityRecos(transitions, threshold) {
+  /** @type {Map<string, Card[]>} */
+  const bySlot = new Map();
+  for (const c of transitions) {
+    if (!c.culpritSlot) continue; // only structural-culprit cards count
+    if (!bySlot.has(c.culpritSlot)) bySlot.set(c.culpritSlot, []);
+    bySlot.get(c.culpritSlot).push(c);
+  }
+  /** @type {Reco[]} */
+  const out = [];
+  for (const [slot, cards] of bySlot) {
+    if (cards.length < threshold) continue;
+    const cf = sumTokEquiv(cards.map((c) => c.cost ?? null));
+    out.push({
+      kind: 'stabilize-volatile',
+      text: `stabilize the volatile block — slot ${slot} invalidated the cache on ${cards.length} turns; move the changing part out of the cached prefix (would have avoided re-writing ${cfPhrase(cf)})`,
+      form: 'amortization',
+      confidence: 'high',
+      counterfactual: cf,
+      slot,
+      recurrence: cards.length,
+    });
+  }
+  out.sort((a, b) => b.recurrence - a.recurrence || (a.slot < b.slot ? -1 : 1));
+  return out;
+}
+
+/**
+ * The fine-tune reco-bridge (sister map #29 / cache spec §5): a tool-caused KEY invalidation
+ * (culprit `tool:*` — a built-in tool change or an MCP connect/disconnect) is BOTH a fine-tune
+ * deny lever and a whole-prefix KEY invalidator, so its cache re-write cost is surfaced alongside
+ * the fine-tune axis's static-bloat cost. One bridge reco per recurring tool slot.
+ * @param {Card[]} transitions
+ * @returns {Reco[]}
+ */
+function fineTuneBridgeRecos(transitions) {
+  /** @type {Map<string, Card[]>} */
+  const bySlot = new Map();
+  for (const c of transitions) {
+    if (c.headline.verdict !== 'STRUCTURAL' || c.headline.structMode !== 'KEY') continue;
+    const slot = c.culpritSlot;
+    if (!slot || !slot.startsWith('tool:')) continue; // system/compaction KEY is not a fine-tune tool lever
+    if (!bySlot.has(slot)) bySlot.set(slot, []);
+    bySlot.get(slot).push(c);
+  }
+  /** @type {Reco[]} */
+  const out = [];
+  for (const [slot, cards] of bySlot) {
+    const cf = sumTokEquiv(cards.map((c) => c.cost ?? null));
+    out.push({
+      kind: 'fine-tune-bridge',
+      text: `slot ${slot} is also a fine-tune deny lever — denying it (fine-tune) avoids both its static bloat and re-writing ${cfPhrase(cf)} of cache`,
+      form: 'amortization',
+      confidence: 'high',
+      counterfactual: cf,
+      slot,
+      count: cards.length,
+    });
+  }
+  out.sort((a, b) => (a.slot < b.slot ? -1 : 1));
+  return out;
 }
