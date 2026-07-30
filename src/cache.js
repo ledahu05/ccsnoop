@@ -30,7 +30,9 @@ export const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
  * Chronicity threshold (cache spec §5 / issue #86): a structural culprit slot must recur
  * across this many transitions before the "stabilize the volatile block" reco fires. The
  * spec says "≥ 2–3 transitions — never on a one-off edit"; the floor (2) is used so a
- * single recurring slot qualifies while a genuine one-off (1) never does.
+ * single recurring slot qualifies while a genuine one-off (1) never does. It is also the
+ * hard floor for the `chronicityThreshold` option: the "never on a one-off" invariant is
+ * not configurable away — a caller may only ask for a stricter threshold.
  */
 export const CHRONICITY_THRESHOLD = 2;
 
@@ -188,7 +190,9 @@ export const UNKNOWN_TIER_RANGE = Object.freeze([1.25, 2]);
  *   requestReceivedAt?: string|null, responseCompletedAt?: string|null, maxTokens?: unknown,
  *   turn?: number }>} session  The same exchange shape `computeWaste` consumes.
  * @param {{ ttl?: number, now?: number, chronicityThreshold?: number }} [opts]  `ttl` (ms,
- *   default 1 h); `now` reserved; `chronicityThreshold` (default {@link CHRONICITY_THRESHOLD}).
+ *   default 1 h); `now` reserved; `chronicityThreshold` (default and hard floor
+ *   {@link CHRONICITY_THRESHOLD} — a smaller or non-integer value falls back to the default,
+ *   so a one-off edit can never be reported as chronic).
  * @returns {Diagnostic}
  */
 export function diagnoseCache(session, opts = {}) {
@@ -196,7 +200,7 @@ export function diagnoseCache(session, opts = {}) {
     ? opts.ttl
     : DEFAULT_CACHE_TTL_MS;
   const chronicityThreshold =
-    Number.isInteger(opts.chronicityThreshold) && opts.chronicityThreshold >= 1
+    Number.isInteger(opts.chronicityThreshold) && opts.chronicityThreshold >= CHRONICITY_THRESHOLD
       ? opts.chronicityThreshold
       : CHRONICITY_THRESHOLD;
   // `opts.now` is accepted for spec-faithful signature / a future session-wide reference,
@@ -761,17 +765,39 @@ const HIDDEN_CAUSE_CANDIDATES = Object.freeze([
 ]);
 
 /**
- * The counterfactual phrase — the wasted basis framed as a lower bound. A known-tier cost is
- * a point; a tier-unknown cost is its `[lo, hi]` span; an uncosted transition ("—") carries no
- * figure (the reco still fires — the lever is real even when the cost is not captured).
+ * The counterfactual amount — the wasted basis framed as a lower bound. A known-tier cost is
+ * a point; a tier-unknown cost is its `[lo, hi]` span; an uncosted transition carries no
+ * figure (the reco still fires — the lever is real even when the cost is not captured). The
+ * result is a bare noun phrase so every caller can read it after "re-writing …".
  * @param {TokEquiv | null} cf
  * @returns {string}
  */
-function cfPhrase(cf) {
-  if (!cf) return 'an unmeasured re-write';
-  if (cf.equiv != null) return `~${cf.equiv} tok-équ.`;
-  if (cf.equivRange) return `~${cf.equivRange[0]}–${cf.equivRange[1]} tok-équ.`;
-  return 'an unmeasured re-write';
+function cfAmount(cf) {
+  if (cf?.equiv != null) return `~${cf.equiv} tok-équ.`;
+  if (cf?.equivRange) return `~${cf.equivRange[0]}–${cf.equivRange[1]} tok-équ.`;
+  return 'an unmeasured amount';
+}
+
+/**
+ * The structural culprit of a card: the mutated slot and sub-mode of its STRUCTURAL region
+ * (the same region `card.culpritSlot` is drawn from), or `null` when the card has none.
+ * @param {Card} card
+ * @returns {{ slot: string, mode: StructMode } | null}
+ */
+function structuralCulprit(card) {
+  const region = card.regions.find((r) => r.verdict === 'STRUCTURAL');
+  if (!region || !region.culpritSlot || !region.structMode) return null;
+  return { slot: region.culpritSlot, mode: region.structMode };
+}
+
+/**
+ * The Σ of a group of cards' per-transition wasted costs — the deduped counterfactual for a
+ * rollup reco. `null` when no card in the group carried a cost.
+ * @param {Card[]} cards
+ * @returns {TokEquiv | null}
+ */
+function summedCost(cards) {
+  return sumTokEquiv(cards.map((c) => c.cost ?? null));
 }
 
 /**
@@ -786,39 +812,64 @@ function recoFor(card) {
   switch (h.verdict) {
     case 'HIT':
       return null; // nothing expired — no waste to act on
-    case 'TEMPORAL':
+    case 'TEMPORAL': {
+      const lowConfidence = h.confidence === 'low';
       return {
         kind: 'resume-before-ttl',
-        text: `${h.confidence === 'low' ? 'if the cache had expired (low confidence), ' : ''}resume inside the TTL window — would have avoided re-writing ${cfPhrase(cf)}`,
+        // A low-confidence straddle never promises the saving — it is phrased conditionally.
+        text: `${lowConfidence ? 'if the cache had expired (low confidence), ' : ''}resume inside the TTL window — would have avoided re-writing ${cfAmount(cf)}`,
         form: 'avoidance',
-        confidence: h.confidence === 'low' ? 'low' : 'high',
+        confidence: lowConfidence ? 'low' : 'high',
         counterfactual: cf,
       };
-    case 'STRUCTURAL':
-      if (h.structMode === 'TRUNCATED') {
-        return { kind: 'weak-truncated', text: 'compaction re-processed the prefix — not user-controllable; no reliable lever', form: 'none', confidence: 'low', counterfactual: null, weak: true };
+    }
+    case 'STRUCTURAL': {
+      const slot = card.culpritSlot ?? undefined;
+      switch (h.structMode) {
+        case 'TRUNCATED':
+          return {
+            kind: 'weak-truncated',
+            text: 'compaction re-processed the prefix — not user-controllable; no reliable lever',
+            form: 'none',
+            confidence: 'low',
+            counterfactual: null,
+            weak: true,
+          };
+        case 'PREFIX':
+          return {
+            kind: 'edit-last-turn',
+            text: `edit or add the last turn${slot ? ` rather than ${slot}` : ''} — would have avoided re-writing ${cfAmount(cf)}`,
+            form: 'avoidance',
+            confidence: 'high',
+            counterfactual: cf,
+            slot,
+          };
+        default:
+          return {
+            kind: 'batch-invalidating',
+            text: `batch the invalidating changes${slot ? ` at ${slot}` : ''} into one turn — would have avoided re-writing ${cfAmount(cf)} (amortized)`,
+            form: 'amortization',
+            confidence: 'high',
+            counterfactual: cf,
+            slot,
+          };
       }
-      if (h.structMode === 'PREFIX') {
-        const at = card.culpritSlot ? ` rather than ${card.culpritSlot}` : '';
-        return { kind: 'edit-last-turn', text: `edit or add the last turn${at} — would have avoided re-writing ${cfPhrase(cf)}`, form: 'avoidance', confidence: 'high', counterfactual: cf, slot: card.culpritSlot ?? undefined };
-      }
-      return {
-        kind: 'batch-invalidating',
-        text: `batch the invalidating changes${card.culpritSlot ? ` at ${card.culpritSlot}` : ''} into one turn — would have avoided re-writing ${cfPhrase(cf)} (amortized)`,
-        form: 'amortization',
-        confidence: 'high',
-        counterfactual: cf,
-        slot: card.culpritSlot ?? undefined,
-      };
+    }
     case 'UNEXPLAINED':
       // The breakpoint↔LCP divorce has a KNOWN cause (no breakpoint) but an uncontrollable
       // lever ⇒ a weak diagnostic reco (cache spec §3.2). A hidden-cause UNEXPLAINED ⇒ none.
       if (h.uncachedByDesign) {
-        return { kind: 'weak-divorce', text: 'stable content past the last cache_control breakpoint is re-processed every turn — add a breakpoint upstream if your client allows it', form: 'none', confidence: 'low', counterfactual: null, weak: true };
+        return {
+          kind: 'weak-divorce',
+          text: 'stable content past the last cache_control breakpoint is re-processed every turn — add a breakpoint upstream if your client allows it',
+          form: 'none',
+          confidence: 'low',
+          counterfactual: null,
+          weak: true,
+        };
       }
       return null;
   }
-  return null;
 }
 
 /**
@@ -896,42 +947,46 @@ function buildRollupRecos(transitions, chronicityThreshold) {
  */
 function rollupReco(perCardKind, cards) {
   const count = cards.length;
-  const cf = sumTokEquiv(cards.map((c) => c.cost ?? null));
-  const plural = count === 1 ? '' : 's';
-  if (perCardKind === 'resume-before-ttl') {
-    return {
-      kind: 'group-turns',
-      text: `group your turns to keep the sliding TTL alive (${count} cold turn${plural} this session) — would have avoided re-writing ${cfPhrase(cf)}`,
-      form: 'avoidance',
-      confidence: 'high',
-      counterfactual: cf,
-      count,
-    };
+  const cf = summedCost(cards);
+  switch (perCardKind) {
+    case 'resume-before-ttl':
+      return {
+        kind: 'group-turns',
+        text: `group your turns to keep the sliding TTL alive (${count} cold turn${count === 1 ? '' : 's'} this session) — would have avoided re-writing ${cfAmount(cf)}`,
+        form: 'avoidance',
+        confidence: 'high',
+        counterfactual: cf,
+        count,
+      };
+    case 'batch-invalidating':
+      return {
+        kind: 'batch-invalidating',
+        text: `batch your invalidating changes into one turn (${count}× this session) — would have avoided re-writing ${cfAmount(cf)} (amortized)`,
+        form: 'amortization',
+        confidence: 'high',
+        counterfactual: cf,
+        count,
+      };
+    default:
+      return {
+        kind: 'edit-last-turn',
+        text: `edit or add the last turn rather than an old one (${count}× this session) — would have avoided re-writing ${cfAmount(cf)}`,
+        form: 'avoidance',
+        confidence: 'high',
+        counterfactual: cf,
+        count,
+      };
   }
-  if (perCardKind === 'batch-invalidating') {
-    return {
-      kind: 'batch-invalidating',
-      text: `batch your invalidating changes into one turn (${count}× this session) — would have avoided re-writing ${cfPhrase(cf)} (amortized)`,
-      form: 'amortization',
-      confidence: 'high',
-      counterfactual: cf,
-      count,
-    };
-  }
-  return {
-    kind: 'edit-last-turn',
-    text: `edit or add the last turn rather than an old one (${count}× this session) — would have avoided re-writing ${cfPhrase(cf)}`,
-    form: 'avoidance',
-    confidence: 'high',
-    counterfactual: cf,
-    count,
-  };
 }
 
 /**
  * Chronicity (cache spec §5): "stabilize the volatile block" fires once per culprit slot that
  * recurred across ≥ `threshold` transitions — never on a one-off edit. A recurring mutation
  * site is a pattern, not a series of one-offs, regardless of its KEY/PREFIX sub-mode.
+ *
+ * A TRUNCATED (compaction) culprit is excluded: the compactor rewrote that slot, not the user,
+ * so telling them to "stabilize" it fails condition (1) of the legitimacy test — the same
+ * reason the per-card TRUNCATED reco is weak and stays off the rollup.
  * @param {Card[]} transitions
  * @param {number} threshold
  * @returns {Reco[]}
@@ -940,18 +995,19 @@ function chronicityRecos(transitions, threshold) {
   /** @type {Map<string, Card[]>} */
   const bySlot = new Map();
   for (const c of transitions) {
-    if (!c.culpritSlot) continue; // only structural-culprit cards count
-    if (!bySlot.has(c.culpritSlot)) bySlot.set(c.culpritSlot, []);
-    bySlot.get(c.culpritSlot).push(c);
+    const culprit = structuralCulprit(c);
+    if (!culprit || culprit.mode === 'TRUNCATED') continue; // controllable culprits only
+    if (!bySlot.has(culprit.slot)) bySlot.set(culprit.slot, []);
+    bySlot.get(culprit.slot).push(c);
   }
   /** @type {Reco[]} */
   const out = [];
   for (const [slot, cards] of bySlot) {
     if (cards.length < threshold) continue;
-    const cf = sumTokEquiv(cards.map((c) => c.cost ?? null));
+    const cf = summedCost(cards);
     out.push({
       kind: 'stabilize-volatile',
-      text: `stabilize the volatile block — slot ${slot} invalidated the cache on ${cards.length} turns; move the changing part out of the cached prefix (would have avoided re-writing ${cfPhrase(cf)})`,
+      text: `stabilize the volatile block — slot ${slot} invalidated the cache on ${cards.length} turns; move the changing part out of the cached prefix (would have avoided re-writing ${cfAmount(cf)})`,
       form: 'amortization',
       confidence: 'high',
       counterfactual: cf,
@@ -959,15 +1015,27 @@ function chronicityRecos(transitions, threshold) {
       recurrence: cards.length,
     });
   }
-  out.sort((a, b) => b.recurrence - a.recurrence || (a.slot < b.slot ? -1 : 1));
+  // Loudest pattern first; the slot name breaks ties so the order is deterministic.
+  out.sort((a, b) => (b.recurrence ?? 0) - (a.recurrence ?? 0) || compareSlots(a.slot, b.slot));
   return out;
+}
+
+/** Deterministic slot ordering for the rollup lists. @param {string} [a] @param {string} [b] */
+function compareSlots(a = '', b = '') {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 /**
  * The fine-tune reco-bridge (sister map #29 / cache spec §5): a tool-caused KEY invalidation
  * (culprit `tool:*` — a built-in tool change or an MCP connect/disconnect) is BOTH a fine-tune
  * deny lever and a whole-prefix KEY invalidator, so its cache re-write cost is surfaced alongside
- * the fine-tune axis's static-bloat cost. One bridge reco per recurring tool slot.
+ * the fine-tune axis's static-bloat cost. One bridge reco per tool slot (a single denial is
+ * already actionable, so unlike chronicity this needs no recurrence).
+ *
+ * The gate is the HEADLINE being that KEY region: the counterfactual is the whole turn's
+ * re-write cost, which is only honest to hand to the tool lever when the KEY region dominates
+ * the turn (else a mostly-temporal turn's cost would be billed to the tool).
  * @param {Card[]} transitions
  * @returns {Reco[]}
  */
@@ -984,10 +1052,10 @@ function fineTuneBridgeRecos(transitions) {
   /** @type {Reco[]} */
   const out = [];
   for (const [slot, cards] of bySlot) {
-    const cf = sumTokEquiv(cards.map((c) => c.cost ?? null));
+    const cf = summedCost(cards);
     out.push({
       kind: 'fine-tune-bridge',
-      text: `slot ${slot} is also a fine-tune deny lever — denying it (fine-tune) avoids both its static bloat and re-writing ${cfPhrase(cf)} of cache`,
+      text: `slot ${slot} is also a fine-tune deny lever — denying it (fine-tune) avoids both its static bloat and re-writing ${cfAmount(cf)} of cache`,
       form: 'amortization',
       confidence: 'high',
       counterfactual: cf,
@@ -995,6 +1063,6 @@ function fineTuneBridgeRecos(transitions) {
       count: cards.length,
     });
   }
-  out.sort((a, b) => (a.slot < b.slot ? -1 : 1));
+  out.sort((a, b) => compareSlots(a.slot, b.slot));
   return out;
 }

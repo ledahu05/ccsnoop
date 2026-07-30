@@ -318,3 +318,120 @@ test('a warm session emits no recos (per-card or rollup)', () => {
   assert.equal(d.transitions[0].reco, undefined);
   assert.deepEqual(d.rollup.rollupRecos, []);
 });
+
+test('an empty session emits no recos', () => {
+  assert.deepEqual(diagnoseCache([]).rollup.rollupRecos, []);
+});
+
+// ── the uncontrollable-lever guard (3-condition test, condition 1) ─────────────
+
+/** Two consecutive compactions that each also diverge at `message#0`. */
+function repeatedCompactionSession() {
+  const mk = (msgs) => ({ system: 'sys', messages: msgs });
+  return [
+    { threadId: 'A', turn: 1, requestBody: mk([{ role: 'user', content: 'AAAA' }, { role: 'user', content: 'BBBB' }, { role: 'user', content: 'CCCC' }]), usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+    { threadId: 'A', turn: 2, requestBody: mk([{ role: 'user', content: 'SUMMARY-1' }, { role: 'user', content: 'XXXX' }]), usage: usage({ input: 900, cacheCreation: 1000, c1h: 1000 }), requestReceivedAt: '2026-07-28T07:50:10.000Z', responseCompletedAt: '2026-07-28T07:50:11.000Z' },
+    { threadId: 'A', turn: 3, requestBody: mk([{ role: 'user', content: 'SUMMARY-2' }]), usage: usage({ input: 900, cacheCreation: 1000, c1h: 1000 }), requestReceivedAt: '2026-07-28T07:50:20.000Z', responseCompletedAt: '2026-07-28T07:50:21.000Z' },
+  ];
+}
+
+test('chronicity: a recurring COMPACTION culprit does not fire stabilize-volatile', () => {
+  // Compaction rewrites the slot, not the user — advising them to "stabilize" it would fail
+  // condition (1) controllable, exactly as the weak per-card TRUNCATED reco says.
+  const d = diagnoseCache(repeatedCompactionSession(), { ttl: TTL });
+  assert.deepEqual(
+    d.transitions.map((c) => c.headline.structMode),
+    ['TRUNCATED', 'TRUNCATED'],
+    'both transitions are compactions',
+  );
+  assert.equal(
+    d.rollup.rollupRecos.find((r) => r.kind === 'stabilize-volatile'),
+    undefined,
+    'an uncontrollable culprit is never chronic',
+  );
+});
+
+test('repeated compaction contributes nothing to the rollup — only weak per-card diagnostics', () => {
+  const d = diagnoseCache(repeatedCompactionSession(), { ttl: TTL });
+  assert.ok(d.transitions.every((c) => c.reco && c.reco.weak === true));
+  assert.deepEqual(d.rollup.rollupRecos, [], 'weak levers stay off the rollup');
+});
+
+// ── the chronicity threshold option ───────────────────────────────────────────
+
+/** `tool:Bash` mutates on turns 2 and 3 ⇒ one recurring culprit across 2 transitions. */
+function recurringToolSession() {
+  const mk = (desc) => ({ tools: [{ name: 'Bash', description: desc }], system: [{ type: 'text', text: 's' }], messages: [{ role: 'user', content: 'q' }] });
+  return [
+    { threadId: 'A', turn: 1, requestBody: mk('v1'), usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+    { threadId: 'A', turn: 2, requestBody: mk('v2'), usage: usage({ cacheCreation: 1000, c1h: 1000 }), requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+    { threadId: 'A', turn: 3, requestBody: mk('v3'), usage: usage({ cacheCreation: 1000, c1h: 1000 }), requestReceivedAt: '2026-07-28T07:54:01.000Z', responseCompletedAt: '2026-07-28T07:54:02.000Z' },
+  ];
+}
+
+test('a stricter chronicity threshold suppresses a 2-transition recurrence', () => {
+  const d = diagnoseCache(recurringToolSession(), { ttl: TTL, chronicityThreshold: 3 });
+  assert.equal(d.rollup.rollupRecos.find((r) => r.kind === 'stabilize-volatile'), undefined);
+});
+
+test('the chronicity threshold cannot be lowered to make a one-off chronic', () => {
+  // A threshold of 1 would report a single edit as a pattern — the "never on a one-off"
+  // invariant is not configurable away, so it falls back to the default.
+  const oneOff = recurringToolSession().slice(0, 2);
+  for (const chronicityThreshold of [1, 0, -5, 2.5, Number.NaN]) {
+    const d = diagnoseCache(oneOff, { ttl: TTL, chronicityThreshold });
+    assert.equal(
+      d.rollup.rollupRecos.find((r) => r.kind === 'stabilize-volatile'),
+      undefined,
+      `threshold ${chronicityThreshold} must not make a one-off chronic`,
+    );
+  }
+});
+
+// ── uncosted and tier-unknown transitions ─────────────────────────────────────
+
+test('a cold turn with no captured usage still recommends its lever, with no invented figure', () => {
+  const mk = (desc) => ({ tools: [{ name: 'Bash', description: desc }], system: [{ type: 'text', text: 's' }], messages: [{ role: 'user', content: 'q' }] });
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: mk('v1'), usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      { threadId: 'A', turn: 2, requestBody: mk('v2'), usage: null, requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+    ],
+    { ttl: TTL },
+  );
+  const r = d.transitions[0].reco;
+  assert.equal(r.kind, 'batch-invalidating', 'the lever is real even when the cost is not captured');
+  assert.equal(r.counterfactual, null, 'no figure is invented');
+  assert.ok(!/~/.test(r.text) && !/\bNaN\b|undefined/.test(r.text), `no bogus figure in: ${r.text}`);
+});
+
+test('a tier-unknown write is quoted as a span, never a false-precise number', () => {
+  const mk = (desc) => ({ tools: [{ name: 'Bash', description: desc }], system: [{ type: 'text', text: 's' }], messages: [{ role: 'user', content: 'q' }] });
+  const d = diagnoseCache(
+    [
+      { threadId: 'A', turn: 1, requestBody: mk('v1'), usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+      // A flat `cache_creation` with neither per-tier field ⇒ the whole mass is tier-unknown.
+      { threadId: 'A', turn: 2, requestBody: mk('v2'), usage: usage({ cacheCreation: 1000 }), requestReceivedAt: T1_RECV_COLD, responseCompletedAt: T1_DONE },
+    ],
+    { ttl: TTL },
+  );
+  const r = d.transitions[0].reco;
+  assert.equal(r.counterfactual.equiv, null);
+  assert.deepEqual(r.counterfactual.equivRange, [1250, 2000]);
+  assert.ok(r.text.includes('1250–2000'), `the span is quoted: ${r.text}`);
+});
+
+// ── every reco is well-formed ─────────────────────────────────────────────────
+
+test('no reco text ever leaks a placeholder or an unrendered value', () => {
+  const sessions = [warmSession(), recurringToolSession(), repeatedCompactionSession()];
+  for (const s of sessions) {
+    const d = diagnoseCache(s, { ttl: TTL });
+    const all = [...d.transitions.flatMap((c) => (c.reco ? [c.reco] : [])), ...d.rollup.rollupRecos];
+    for (const r of all) {
+      assert.ok(r.text.length > 0 && !/undefined|NaN|\[object/.test(r.text), `bad text: ${r.text}`);
+      assert.ok(['avoidance', 'amortization', 'none'].includes(r.form));
+      assert.ok(['high', 'low'].includes(r.confidence));
+    }
+  }
+});
