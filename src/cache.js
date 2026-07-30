@@ -98,9 +98,9 @@ export function diagnoseCache(session, opts = {}) {
   for (let i = 0; i < session.length; i++) {
     const w = perExchange[i];
     if (w.probe) continue; // one-shot probes are filtered before the diagnostic (cache spec §2.3)
-    const segs = w.segments;
-    if (breakpointPositions(segs).length > 0) anyBreakpoints = true;
-    const card = diagnoseTurn(session[i], i, w, ttl);
+    const breakpoints = breakpointPositions(w.segments);
+    if (breakpoints.length > 0) anyBreakpoints = true;
+    const card = diagnoseTurn(session[i], i, w, ttl, breakpoints);
     if (card) transitions.push(card);
   }
 
@@ -113,21 +113,23 @@ export function diagnoseCache(session, opts = {}) {
  * @param {number} index
  * @param {import('./waste.js').ExchangeWaste} w
  * @param {number} ttl
+ * @param {number[]} breakpoints  Render-ordered `cache_control` positions for this turn.
  * @returns {Card | null}
  */
-function diagnoseTurn(e, index, w, ttl) {
+function diagnoseTurn(e, index, w, ttl, breakpoints) {
   const segs = w.segments;
   const end = segs.length;
-  const c = w.cacheBoundary; // reality frontier (what was served)
-  const l = w.lcp; // content frontier (mutation point)
-  const b = w.baselineLength; // prior extent (baseline segment count)
-  const { hasBreakpoints, lmb } = capabilityFrontier(segs, l);
-  const compacted = end < b; // compaction/truncation shrank the turn vs its baseline
+  const cacheBoundary = w.cacheBoundary; // reality frontier (what was served)
+  const lcp = w.lcp; // content frontier (mutation point)
+  // Capability frontier (what COULD have been cached); null ⇒ the 2-frontier fallback.
+  const lastMatchingBreakpoint = capabilityFrontier(breakpoints, lcp);
+  const hasBreakpoints = lastMatchingBreakpoint !== null;
+  const compacted = end < w.baselineLength; // the turn shrank vs its baseline
   // Cold = the cache stopped serving prior-prefix content that is STILL in this turn. The
-  // prior extent still present is [0, min(b, end)) (compaction may have dropped the tail),
-  // so a warm compaction — which served everything it sent (c == end) — is a HIT, not cold.
-  const priorExtent = Math.min(b, end);
-  const cold = c < priorExtent;
+  // prior extent still present is [0, min(baselineLength, end)) (compaction may have dropped
+  // the tail), so a warm compaction — which served everything it sent — is a HIT, not cold.
+  const priorExtent = Math.min(w.baselineLength, end);
+  const cold = cacheBoundary < priorExtent;
 
   // No baseline: either the establishing turn (nothing expired → skip) or a cache_read
   // with no captured antecedent (content-keyed cache → UNEXPLAINED, cache spec §3).
@@ -150,10 +152,10 @@ function diagnoseTurn(e, index, w, ttl) {
   if (!cold) {
     /** @type {Region} */
     const region = {
-      range: range(0, c),
+      range: range(0, cacheBoundary),
       verdict: 'HIT',
       cause: 'cached prefix served — nothing expired this turn',
-      bytes: extent(segs, 0, c),
+      bytes: extent(segs, 0, cacheBoundary),
     };
     return card(turnOf(e, index), [region], hasBreakpoints);
   }
@@ -163,30 +165,33 @@ function diagnoseTurn(e, index, w, ttl) {
   const regions = [];
   const gap = w.idleMs;
   const reliable = w.idleMsReliable;
-  const purePrefixShrink = compacted && l === end; // shrank with no in-current divergence
+  const purePrefixShrink = compacted && lcp === end; // shrank with no in-current divergence
 
-  // (1) Identical-but-cold prefix [c, l): content matches the baseline yet was not served.
-  //     A pure prefix-shrink compaction folds this into the TRUNCATED region below instead.
-  if (l > c && !purePrefixShrink) {
-    if (hasBreakpoints && lmb !== undefined) {
-      // 3-frontier split: [c, lmb) capable-but-cold vs [lmb, l) stable-but-uncached (divorce).
-      if (lmb > c) regions.push(capableColdRegion(c, Math.min(lmb, l), segs, gap, reliable, ttl));
-      if (l > lmb) regions.push(divorceRegion(lmb, l, segs));
+  // (1) Identical-but-cold prefix [cacheBoundary, lcp): content matches the baseline yet was
+  //     not served. A pure prefix-shrink folds this into the TRUNCATED region below instead.
+  if (lcp > cacheBoundary && !purePrefixShrink) {
+    if (lastMatchingBreakpoint === null) {
+      regions.push(capableColdRegion(cacheBoundary, lcp, segs, gap, reliable, ttl));
     } else {
-      regions.push(capableColdRegion(c, l, segs, gap, reliable, ttl));
+      // 3-frontier split: [cacheBoundary, cut) capable-but-cold vs [cut, lcp) the divorce.
+      // The cut is clamped to the cache boundary: a breakpoint below it covers content
+      // `usage` says WAS served, and the divorce must never reach back over that (it would
+      // bill served bytes as uncached-by-design and double-count them downstream).
+      const cut = Math.max(lastMatchingBreakpoint, cacheBoundary);
+      if (cut > cacheBoundary) regions.push(capableColdRegion(cacheBoundary, cut, segs, gap, reliable, ttl));
+      if (lcp > cut) regions.push(divorceRegion(cut, lcp, segs));
     }
   }
 
   // (2) Structural region: divergent baseline content re-written because of a mutation,
   //     or — for a compaction — the cold extent of a turn that lost content.
-  const structuralEnd = priorExtent;
-  if (l < structuralEnd) {
+  if (lcp < priorExtent) {
     const mode = compacted ? 'TRUNCATED' : structModeFor(w.mutationSite);
-    regions.push(structuralRegion(l, structuralEnd, w.mutationSite, mode, segs));
-  } else if (purePrefixShrink && c < end) {
+    regions.push(structuralRegion(lcp, priorExtent, w.mutationSite, mode, segs));
+  } else if (purePrefixShrink) {
     // Compaction dropped the tail with no surviving divergence: the cold prefix is
-    // compaction-caused, not temporal.
-    regions.push(structuralRegion(c, end, null, 'TRUNCATED', segs));
+    // compaction-caused, not temporal. (Cold guarantees cacheBoundary < priorExtent == end.)
+    regions.push(structuralRegion(cacheBoundary, end, null, 'TRUNCATED', segs));
   }
 
   return card(turnOf(e, index), regions, hasBreakpoints);
@@ -197,18 +202,18 @@ function diagnoseTurn(e, index, w, ttl) {
  * `cache_control` breakpoints (cache spec §3 / issue #84). A breakpoint at segment index p
  * covers the prefix [0, p]; the last breakpoint that sits within the stable prefix
  * (p < lcp) is `lastMatchingBreakpoint`, expressed as an exclusive length (p + 1). Content
- * beyond it up to lcp is stable but never cached (the divorce). `undefined` when no
- * breakpoints are present (the 2-frontier fallback).
- * @param {import('./waste.js').Segment[]} segments
+ * beyond it up to lcp is stable but never cached (the divorce). `0` when the request carries
+ * breakpoints but none of them covers the stable prefix; `null` when it carries none at all
+ * (the 2-frontier fallback).
+ * @param {number[]} breakpoints  Render-ordered breakpoint positions.
  * @param {number} lcp
- * @returns {{ hasBreakpoints: boolean, lmb: number | undefined }}
+ * @returns {number | null}
  */
-function capabilityFrontier(segments, lcp) {
-  const bps = breakpointPositions(segments);
-  if (bps.length === 0) return { hasBreakpoints: false, lmb: undefined };
+function capabilityFrontier(breakpoints, lcp) {
+  if (breakpoints.length === 0) return null;
   let maxMatching = -1;
-  for (const p of bps) if (p < lcp && p > maxMatching) maxMatching = p;
-  return { hasBreakpoints: true, lmb: maxMatching >= 0 ? maxMatching + 1 : 0 };
+  for (const p of breakpoints) if (p < lcp && p > maxMatching) maxMatching = p;
+  return maxMatching + 1; // −1 (nothing covered) ⇒ 0; else the exclusive length
 }
 
 /**
@@ -299,8 +304,6 @@ function structuralCause(mode, culpritSlot) {
       return `history mutated${at} — the head stays cached, the tail downstream is re-written`;
     case 'TRUNCATED':
       return 'compaction/truncation replaced or dropped history — the prefix was re-processed';
-    default:
-      return 'structural mutation re-wrote the prefix';
   }
 }
 
@@ -361,7 +364,7 @@ function finalize(transitions, anyBreakpoints) {
     rollup: {
       byVerdict,
       byStructMode,
-      coldTransitions: transitions.filter((c) => c.headline.verdict !== 'HIT').length,
+      coldTransitions: transitions.length - byVerdict.HIT, // cold ≡ headline is not HIT
       totalTransitions: transitions.length,
     },
     frontierModel,
@@ -378,7 +381,13 @@ function range(s, e) {
   return [s, e];
 }
 
-/** Canonical byte extent of a segment range (the only legal size measure; never re-tokens). */
+/**
+ * Canonical byte extent of a segment range (the only legal size measure; never re-tokens).
+ * @param {import('./waste.js').Segment[]} segs
+ * @param {number} start
+ * @param {number} endExclusive
+ * @returns {number}
+ */
 function extent(segs, start, endExclusive) {
   let s = 0;
   for (let i = start; i < endExclusive && i < segs.length; i++) s += segs[i].bytes;

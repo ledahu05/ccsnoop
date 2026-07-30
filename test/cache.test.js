@@ -137,6 +137,24 @@ test('a warm compaction (turn shrank to a prefix but the cache held) is a HIT, n
   assert.ok(card.regions.length === 1, 'a HIT card carries exactly one region');
 });
 
+test('STRUCTURAL·TRUNCATED: a cold prefix-shrink is blamed on compaction, never on time', () => {
+  // cur is a strict prefix of the baseline (the tail was dropped, nothing diverged) AND the
+  // cache went cold. The gap exceeds the TTL, so the temporal cause is available — but the
+  // turn lost content, so compaction owns the cold prefix. No TEMPORAL region.
+  const base = { system: 'sys', messages: [{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }] };
+  const cur = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  // T0_DONE 07:50:01 → t1 received 07:52:01 = 120 000 ms gap; ttl 60 000 ms.
+  const d = diagnoseCache([
+    { threadId: 'A', turn: 1, requestBody: base, usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+    { threadId: 'A', turn: 2, requestBody: cur, usage: usage({ input: 900, cacheRead: 0 }), requestReceivedAt: '2026-07-28T07:52:01.000Z', responseCompletedAt: '2026-07-28T07:52:02.000Z' },
+  ], { ttl: 60000 });
+  const card = d.transitions[0];
+  assert.equal(card.headline.structMode, 'TRUNCATED');
+  assert.deepEqual(card.headline.range, [0, 2], 'compaction owns the whole cold prefix');
+  assert.equal(regionsOf(card, 'TEMPORAL').length, 0, 'an expired-looking gap does not steal the blame');
+  assert.equal(card.culpritSlot, null, 'compaction names no mutated slot');
+});
+
 // ── TEMPORAL ──────────────────────────────────────────────────────────────────
 
 test('TEMPORAL: an append-only turn cold because the gap exceeded the TTL (high confidence)', () => {
@@ -223,6 +241,58 @@ test('divorce: stable content past the last breakpoint is UNCACHED-by-design, ne
   // Never mis-blamed on time or a mutation:
   assert.equal(divorce.structMode, undefined);
   assert.equal(divorce.confidence, undefined);
+});
+
+test('divorce: the region never reaches back over content usage says was served', () => {
+  // Every breakpoint sits at or past lcp, so no breakpoint covers the stable prefix
+  // (lastMatchingBreakpoint 0) — yet `usage` confirms a served prefix (cacheBoundary 1).
+  // The divorce may only claim the cold remainder; the served head is not "uncached".
+  const big = 'X'.repeat(20000);
+  const base = { system: 'sys', messages: [{ role: 'user', content: big }, { role: 'user', content: 'tail' }] };
+  const cur = {
+    system: 'sys',
+    messages: [
+      { role: 'user', content: big },
+      { role: 'user', content: [{ type: 'text', text: 'tail-EDITED', cache_control: CC }] },
+    ],
+  };
+  // Render: system(0), message#0(1), message#1(2). lcp 2; the lone breakpoint is at 2.
+  // A warm-but-short cache_read confirms only system(0) ⇒ cacheBoundary 1.
+  const d = diagnoseCache([
+    { threadId: 'A', turn: 1, requestBody: base, usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+    { threadId: 'A', turn: 2, requestBody: cur, usage: usage({ input: 2000, cacheRead: 20 }), requestReceivedAt: '2026-07-28T07:50:10.000Z', responseCompletedAt: '2026-07-28T07:50:11.000Z' },
+  ]);
+  const card = d.transitions[0];
+  const divorce = region(card, (r) => r.uncachedByDesign === true);
+  assert.ok(divorce, 'the divorce region is emitted');
+  assert.deepEqual(divorce.range, [1, 2], 'the divorce starts at the cache boundary, not at 0');
+  assert.equal(divorce.bytes, 20028, 'the served head is not billed as uncached-by-design');
+});
+
+test('a cold turn partitions the cold span contiguously — no gaps, no overlaps', () => {
+  // The partition is the diagnostic's cost basis: an overlap would double-bill the same
+  // bytes downstream (T4), a gap would lose them. Both must hold on a composite card.
+  const big = 'X'.repeat(20000);
+  const base = { system: 'sys', messages: [{ role: 'user', content: big }, { role: 'user', content: 'tail' }] };
+  const cur = {
+    system: 'sys',
+    messages: [
+      { role: 'user', content: big },
+      { role: 'user', content: [{ type: 'text', text: 'tail-EDITED', cache_control: CC }] },
+    ],
+  };
+  const d = diagnoseCache([
+    { threadId: 'A', turn: 1, requestBody: base, usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+    { threadId: 'A', turn: 2, requestBody: cur, usage: usage({ input: 2000, cacheRead: 20 }), requestReceivedAt: '2026-07-28T07:50:10.000Z', responseCompletedAt: '2026-07-28T07:50:11.000Z' },
+  ]);
+  const card = d.transitions[0];
+  assert.ok(card.regions.length > 1, 'a composite partition to check');
+  let prevEnd = card.regions[0].range[0];
+  for (const r of card.regions) {
+    assert.ok(r.range[0] < r.range[1], `region ${r.range} is non-empty`);
+    assert.equal(r.range[0], prevEnd, `region ${r.range} abuts the previous one exactly`);
+    prevEnd = r.range[1];
+  }
 });
 
 // ── 2-frontier fallback ───────────────────────────────────────────────────────
@@ -328,6 +398,35 @@ test('diagnoseCache never calls Date.now() — time is injected', () => {
 
 test('DEFAULT_CACHE_TTL_MS is 1 h (the ttl Claude Code places)', () => {
   assert.equal(DEFAULT_CACHE_TTL_MS, 60 * 60 * 1000);
+});
+
+test('an unusable ttl falls back to the default instead of being honoured', () => {
+  // A negative / non-finite / non-numeric ttl would make every gap look expired and
+  // fabricate TEMPORAL verdicts session-wide. The 2-minute gap here is well under 1 h.
+  const base = { system: 'sys', messages: [{ role: 'user', content: 'q1' }] };
+  const cur = { system: 'sys', messages: [{ role: 'user', content: 'q1' }, { role: 'user', content: 'q2' }] };
+  const exchanges = [
+    { threadId: 'A', turn: 1, requestBody: base, usage: usage({ input: 10 }), requestReceivedAt: T0_RECV, responseCompletedAt: T0_DONE },
+    { threadId: 'A', turn: 2, requestBody: cur, usage: usage({ input: 900, cacheRead: 0 }), requestReceivedAt: '2026-07-28T07:52:01.000Z', responseCompletedAt: '2026-07-28T07:52:02.000Z' },
+  ];
+  // Deliberately includes values the type system forbids — this guards the runtime path.
+  /** @type {any[]} */
+  const unusable = [-1, NaN, Infinity, '60000', null, undefined];
+  for (const ttl of unusable) {
+    const card = diagnoseCache(exchanges, { ttl }).transitions[0];
+    assert.equal(card.headline.verdict, 'UNEXPLAINED', `ttl ${String(ttl)} must not confirm a TEMPORAL cause`);
+  }
+});
+
+// ── empty input ───────────────────────────────────────────────────────────────
+
+test('an empty session yields a zeroed rollup, not a crash', () => {
+  const d = diagnoseCache([]);
+  assert.deepEqual(d.transitions, []);
+  assert.equal(d.rollup.totalTransitions, 0);
+  assert.equal(d.rollup.coldTransitions, 0);
+  assert.deepEqual(d.rollup.byVerdict, { HIT: 0, STRUCTURAL: 0, TEMPORAL: 0, UNEXPLAINED: 0 });
+  assert.equal(d.frontierModel, '2-frontier-fallback');
 });
 
 // ── rollup ────────────────────────────────────────────────────────────────────
