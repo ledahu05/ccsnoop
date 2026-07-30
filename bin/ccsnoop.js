@@ -6,9 +6,10 @@ import { start } from '../src/proxy.js';
 import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
 import { fineTune } from '../src/finetune.js';
+import { cache } from '../src/cache.js';
 import { init } from '../src/init.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -41,6 +42,7 @@ async function main() {
   if (sub === 'status') return runStatus(home, args);
   if (sub === 'report') return runReport(args);
   if (sub === 'fine-tune') return runFineTune(args);
+  if (sub === 'cache') return runCache(args);
 }
 
 /**
@@ -193,6 +195,33 @@ function runFineTune(args) {
 }
 
 /**
+ * `cache` — the cache-economy diagnostic (cache spec §6 / issue #87). One session: for
+ * each turn where a cached prefix went cold, a per-transition card (turn → verdict →
+ * cause → cost → reco) plus a lean session rollup. Text by default; `--html` renders the
+ * same data as a self-contained document. Flags/dispatch mirror {@link runReport} /
+ * {@link runFineTune}; discovery is the shared report resolver. No corpus mode.
+ * @param {string[]} args
+ */
+function runCache(args) {
+  const ttlFlag = getFlag(args, '--ttl');
+  const ttlSeconds = ttlFlag === undefined ? undefined : Number(ttlFlag);
+  const wantHtml = hasFlag(args, '--html');
+  const result = cache({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
+    session: getFlag(args, '--session'),
+    latest: hasFlag(args, '--latest'),
+    ttlSeconds,
+  });
+  if (wantHtml) {
+    process.stdout.write(result.html + '\n');
+  } else {
+    for (const line of result.lines) console.log(line);
+  }
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -258,7 +287,14 @@ Commands:
              --latest             most-recent session (weak-evidence: no MCP deny)
              --all                widen discovery across ~/.ccsnoop/routes.json
              --deny-extra <a,b>   add denylist names for this run only
-             --deny-allow <a>     drop a denylist name for this run only`);
+             --deny-allow <a>     drop a denylist name for this run only
+  cache   Cache-economy diagnostic for one captured session (per-transition cards + rollup)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to diagnose (default: latest)
+             --latest             most-recent session (same as the default; no corpus mode)
+             --ttl <seconds>      TEMPORAL threshold (default 3600 = 1 h)
+             --html               render the same data as a self-contained HTML document`);
 }
 
 main().catch((err) => {

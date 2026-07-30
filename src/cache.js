@@ -21,7 +21,11 @@
 //     is never used for cost. Tier-unknown ⇒ a `[×1.25, ×2]` bound, never a false-precise
 //     number; usage-absent ⇒ no cost line. Rollup totals are exact from `usage`.
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { computeWaste, breakpointPositions } from './waste.js';
+import { resolveRoots, listSessions, pickLatestSession, buildExchange } from './report.js';
 
 /** Default TTL threshold (cache spec AC #26): 1 h, the ttl Claude Code places. */
 export const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -1065,4 +1069,425 @@ function fineTuneBridgeRecos(transitions) {
   }
   out.sort((a, b) => compareSlots(a.slot, b.slot));
   return out;
+}
+
+// ── surface (T6 #87): the text + HTML renderer + the `cache` entry ─────────────
+//
+// `diagnoseCache` above stays PURE — this section is the I/O-bearing surface that
+// turns a structured `Diagnostic` into a human-readable card/rollup (text by default,
+// the same data as HTML) and wires it to a captured session. Render is a pure function
+// over structured data; the only I/O is the session discovery in `cache`, which reuses
+// the report resolver (`resolveRoots`/`listSessions`/`pickLatestSession`) so `cache`
+// discovers exactly what `report`/`fine-tune` do. The unit of a cache diagnostic is
+// ONE session — there is no corpus mode (a cache economy is per-conversation).
+
+/** Tier label for the cost breakdown (`5m`/`1h`/`read` → a human phrase). */
+const TIER_LABEL = Object.freeze({ '5m': '5 m write', '1h': '1 h write', read: 'read' });
+
+/**
+ * A number as a locale-stable, comma-grouped string (30874 → "30,874"; 18492.5 →
+ * "18,492.5"). `toLocaleString` is avoided so the output is identical across Node
+ * locales/icu builds — the renderer is asserted on for shape.
+ * @param {number} n
+ * @returns {string}
+ */
+function fmtNum(n) {
+  const rounded = Math.round((Number(n) || 0) * 100) / 100;
+  const [int, dec] = String(rounded).split('.');
+  const grouped = int.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return dec ? `${grouped}.${dec}` : grouped;
+}
+
+/**
+ * The per-tier multiplier breakdown in parens, shared by per-card `TokEquiv` (which
+ * carries `components`) and rollup `CostTotal` (which carries `raw`). Tier-unknown mass
+ * is priced as its `×1.25–×2` span and labelled — never a silent single number.
+ *
+ * Treated structurally: `components` lives on a per-card {@link TokEquiv}, `raw` on a
+ * rollup {@link CostTotal} — both optional here so one helper renders both shapes.
+ * @param {{ components?: TierCost[], raw?: { '5m': number, '1h': number, read: number, unknown: number }, unknownTokens?: number }} t
+ * @returns {string}
+ */
+function tierBreakdown(t) {
+  /** @type {string[]} */
+  let parts = [];
+  if (Array.isArray(t.components) && t.components.length) {
+    parts = t.components.map((c) => `${fmtNum(c.rawTokens)} ×${c.multiplier} (${TIER_LABEL[c.tier] ?? c.tier})`);
+  } else if (t.raw) {
+    for (const k of ['5m', '1h', 'read']) {
+      if (t.raw[k]) parts.push(`${fmtNum(t.raw[k])} ×${TIER_MULTIPLIERS[k]} (${TIER_LABEL[k]})`);
+    }
+  }
+  const unknown = t.unknownTokens ?? (t.raw ? t.raw.unknown : 0);
+  if (unknown > 0) parts.push(`${fmtNum(unknown)} ×1.25–×2 (tier unknown)`);
+  return parts.length ? `  (${parts.join(' + ')})` : '';
+}
+
+/**
+ * Render a cost figure (a per-card `TokEquiv`, a rollup `CostTotal`, or `undefined`).
+ * `—` when there is no cost (usage absent / HIT / establishing); an exact point when the
+ * tier is known; a `[lo, hi] (bound)` when any mass is tier-unknown; plus the per-tier
+ * breakdown and a `[≤ this turn's write]` marker when the figure is a bounded attribute.
+ * @param {TokEquiv | CostTotal | undefined | null} t
+ * @returns {string}
+ */
+function fmtCost(t) {
+  if (!t) return '—';
+  const head =
+    t.equiv != null
+      ? `~${fmtNum(t.equiv)} tok-équ.`
+      : t.equivRange
+        ? `~${fmtNum(t.equivRange[0])}–${fmtNum(t.equivRange[1])} tok-équ. (bound)`
+        : '~? tok-équ.';
+  return `${head}${tierBreakdown(t)}${t.bounded ? '  [≤ this turn’s write]' : ''}`;
+}
+
+/**
+ * @param {[number, number]} r
+ * @returns {string}
+ */
+function fmtRange(r) {
+  return `[${r[0]}..${r[1]})`;
+}
+
+/**
+ * The headline verdict of a region as a one-token label (e.g. `STRUCTURAL·KEY`,
+ * `TEMPORAL (low confidence)`).
+ * @param {Region} r
+ * @returns {string}
+ */
+function verdictHeadline(r) {
+  switch (r.verdict) {
+    case 'HIT':
+      return 'HIT';
+    case 'STRUCTURAL':
+      return `STRUCTURAL·${r.structMode ?? '?'}`;
+    case 'TEMPORAL':
+      return r.confidence === 'low' ? 'TEMPORAL (low confidence)' : 'TEMPORAL';
+    case 'UNEXPLAINED':
+      return r.uncachedByDesign ? 'UNEXPLAINED (uncached-by-design)' : 'UNEXPLAINED';
+    default:
+      return r.verdict;
+  }
+}
+
+/**
+ * A region rendered inline for a composite card's region list (verdict · sub-mode · the
+ * culprit slot when present).
+ * @param {Region} r
+ * @returns {string}
+ */
+function regionInline(r) {
+  let label = r.verdict === 'STRUCTURAL' ? `STRUCTURAL·${r.structMode ?? '?'}` : r.verdict;
+  if (r.confidence === 'low') label += ' (low conf.)';
+  return `${label}${r.culpritSlot ? ` @ ${r.culpritSlot}` : ''}`;
+}
+
+/**
+ * The text lines for one per-transition card: the turn + headline verdict (and the
+ * composite regions when >1 non-HIT region), the cause, the cost, and the reco. HIT
+ * turns never reach here (the renderer filters them).
+ * @param {Card} card
+ * @returns {string[]}
+ */
+function renderCardLines(card) {
+  const h = card.headline;
+  /** @type {string[]} */
+  const out = [];
+  out.push(`── turn ${card.turn} ── ${verdictHeadline(h)}${card.composite ? '  [composite]' : ''}`);
+  if (card.composite) {
+    for (const r of card.regions) {
+      if (r.verdict === 'HIT') continue;
+      out.push(`    · ${fmtRange(r.range)} ${regionInline(r)} — ${r.cause ?? '(no cause — unexplained)'}`);
+    }
+  } else {
+    out.push(`    cause: ${h.cause ?? '(no cause — unexplained)'}`);
+  }
+  out.push(`    cost:  ${fmtCost(card.cost)}`);
+  if (card.reco) out.push(`    reco:  ${card.reco.text}`);
+  if (card.hiddenCauses && card.hiddenCauses.length) out.push(`    hidden candidates: ${card.hiddenCauses.join('; ')}`);
+  return out;
+}
+
+/**
+ * The text lines for the lean session rollup: write/read/wasted totals, the count by
+ * verdict (and by STRUCTURAL sub-mode), the summed counterfactual, and the deduped
+ * rollup recommendations (each session pattern once — no per-event repetition).
+ * @param {Rollup} r
+ * @returns {string[]}
+ */
+function renderRollupLines(r) {
+  /** @type {string[]} */
+  const out = ['── session rollup ────────────'];
+  out.push(`    write:        ${fmtCost(r.totals.write)}`);
+  out.push(`    read:         ${fmtCost(r.totals.read)}`);
+  out.push(`    wasted:       ${fmtCost(r.totals.wasted)}`);
+  out.push(`    by verdict:   ${['HIT', 'STRUCTURAL', 'TEMPORAL', 'UNEXPLAINED'].map((v) => `${v} ${r.byVerdict[v] ?? 0}`).join(' · ')}`);
+  const struct = ['KEY', 'PREFIX', 'TRUNCATED'].filter((m) => r.byStructMode[m]).map((m) => `${m} ${r.byStructMode[m]}`);
+  if (struct.length) out.push(`    structural:   ${struct.join(' · ')}`);
+  out.push(`    counterfactual: would have avoided re-writing ${fmtCost(r.summedCounterfactual)}`);
+  if (r.rollupRecos && r.rollupRecos.length) {
+    out.push('    recommendations (deduped):');
+    for (const reco of r.rollupRecos) out.push(`      • ${reco.text}`);
+  } else {
+    out.push('    recommendations: none');
+  }
+  return out;
+}
+
+/**
+ * Render a structured `Diagnostic` as a human-readable card/rollup. Pure: no I/O, no
+ * wall clock — a formatter over the diagnostic the pure `diagnoseCache` produced.
+ *
+ * Per-transition cards are emitted for each NON-HIT transition (the atomic diagnostic;
+ * HIT turns are summarised in the rollup's by-verdict count, not printed as cards). The
+ * rollup footer carries the write/read/wasted totals in token-equivalents, the count by
+ * verdict, the deduped session-pattern recommendations, and the summed counterfactual.
+ * Text is returned in `lines`; `html` is a self-contained document of the same data.
+ *
+ * @param {Diagnostic} diag
+ * @param {{ sessionId?: string }} [opts]
+ * @returns {{ lines: string[], html: string }}
+ */
+export function renderCache(diag, opts = {}) {
+  const sessionId = opts.sessionId ?? '(no id)';
+  const cards = diag.transitions.filter((c) => c.headline.verdict !== 'HIT');
+  const hitCount = diag.rollup.byVerdict.HIT ?? 0;
+
+  /** @type {string[]} */
+  const lines = [];
+  lines.push(`ccsnoop cache — session ${sessionId}`);
+  lines.push(
+    `  ${diag.rollup.totalTransitions} transition(s) · ${diag.rollup.coldTransitions} cold · ${diag.frontierModel}`
+  );
+  if (diag.note) lines.push(`  note: ${diag.note}`);
+  lines.push('');
+  if (cards.length === 0) {
+    lines.push('No cold transitions — nothing expired or was re-written this session.');
+  } else {
+    for (const c of cards) lines.push(...renderCardLines(c));
+    if (hitCount > 0) lines.push(`  (${hitCount} warm HIT turn${hitCount === 1 ? '' : 's'} omitted from the cards)`);
+  }
+  lines.push('');
+  lines.push(...renderRollupLines(diag.rollup));
+
+  const html = renderCacheHtml(diag, { sessionId, cards, hitCount });
+  return { lines, html };
+}
+
+/** @param {unknown} s */
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+/** @param {string} v */
+const verdictClass = (v) => `verdict-${String(v).toLowerCase()}`;
+
+/**
+ * The self-contained HTML render of the SAME data the text renderer emits — a render
+ * target, not a separate model. One file, no external assets; the diagnostic is laid out
+ * as cards then a rollup footer.
+ * @param {Diagnostic} diag
+ * @param {{ sessionId: string, cards: Card[], hitCount: number }} ctx
+ * @returns {string}
+ */
+function renderCacheHtml(diag, { sessionId, cards, hitCount }) {
+  const r = diag.rollup;
+
+  const cardsHtml = cards.length
+    ? cards
+        .map((c) => {
+          const h = c.headline;
+          /** @type {string[]} */
+          const p = [`<article class="card ${verdictClass(h.verdict)}">`];
+          p.push(
+            `<h3><span class="turn">turn ${escHtml(c.turn)}</span> ` +
+              `<span class="verdict">${escHtml(verdictHeadline(h))}</span>` +
+              `${c.composite ? ' <span class="composite">composite</span>' : ''}</h3>`
+          );
+          if (c.composite) {
+            p.push('<ul class="regions">');
+            for (const reg of c.regions) {
+              if (reg.verdict === 'HIT') continue;
+              p.push(
+                `  <li><span class="region ${verdictClass(reg.verdict)}">${escHtml(regionInline(reg))}</span> ` +
+                  `<span class="range">${escHtml(fmtRange(reg.range))}</span> ` +
+                  `<span class="cause">${escHtml(reg.cause ?? '(unexplained)')}</span></li>`
+              );
+            }
+            p.push('</ul>');
+          } else {
+            p.push(`<p class="cause"><b>cause:</b> ${escHtml(h.cause ?? '(unexplained)')}</p>`);
+          }
+          p.push(`<p class="cost"><b>cost:</b> ${escHtml(fmtCost(c.cost))}</p>`);
+          if (c.reco) p.push(`<p class="reco"><b>reco:</b> ${escHtml(c.reco.text)}</p>`);
+          if (c.hiddenCauses && c.hiddenCauses.length)
+            p.push(`<p class="hidden"><b>hidden candidates:</b> ${escHtml(c.hiddenCauses.join('; '))}</p>`);
+          p.push('</article>');
+          return p.join('\n');
+        })
+        .join('\n')
+    : '<p class="muted">No cold transitions — nothing expired or was re-written this session.</p>';
+
+  const byVerdict = ['HIT', 'STRUCTURAL', 'TEMPORAL', 'UNEXPLAINED']
+    .map((v) => `<span class="vcount ${verdictClass(v)}">${escHtml(v)} <b>${r.byVerdict[v] ?? 0}</b></span>`)
+    .join(' ');
+  const recos =
+    r.rollupRecos && r.rollupRecos.length
+      ? `<ul class="recos">${r.rollupRecos.map((rc) => `<li>${escHtml(rc.text)}</li>`).join('')}</ul>`
+      : '<p class="muted">none</p>';
+
+  const title = `ccsnoop cache — ${escHtml(sessionId)}`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>${CACHE_CSS}</style>
+</head>
+<body>
+<header class="topbar">
+  <h1>ccsnoop cache</h1>
+  <div class="session-id">session ${escHtml(sessionId)}</div>
+  <div class="meta">${r.totalTransitions} transition(s) · ${r.coldTransitions} cold · ${escHtml(diag.frontierModel)}</div>
+</header>
+<main>
+  <section class="cards" aria-label="per-transition cards">
+${cardsHtml}
+${hitCount > 0 ? `    <p class="muted">(${hitCount} warm HIT turn${hitCount === 1 ? '' : 's'} omitted from the cards)</p>` : ''}
+  </section>
+  <section class="rollup" aria-label="session rollup">
+    <h2>session rollup</h2>
+    <div class="totals">
+      <div class="cell"><span>write</span><b>${escHtml(fmtCost(r.totals.write))}</b></div>
+      <div class="cell"><span>read</span><b>${escHtml(fmtCost(r.totals.read))}</b></div>
+      <div class="cell"><span>wasted</span><b>${escHtml(fmtCost(r.totals.wasted))}</b></div>
+    </div>
+    <div class="byverdict">by verdict: ${byVerdict}</div>
+    <div class="cf">would have avoided re-writing ${escHtml(fmtCost(r.summedCounterfactual))}</div>
+    <h3>recommendations (deduped)</h3>
+    ${recos}
+${diag.note ? `    <p class="note">${escHtml(diag.note)}</p>` : ''}
+  </section>
+</main>
+</body>
+</html>`;
+}
+
+const CACHE_CSS = `
+:root{--bg:#0f1117;--panel:#171a23;--edge:#252a37;--fg:#e6e9ef;--muted:#8b93a7;--accent:#5b9dff}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+.topbar{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;padding:12px 18px;border-bottom:1px solid var(--edge);background:var(--panel)}
+.topbar h1{margin:0;font-size:16px;letter-spacing:.5px;color:var(--accent)}
+.session-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);font-size:12px}
+.meta{margin-left:auto;color:var(--muted);font-size:12px}
+main{max-width:920px;margin:0 auto;padding:18px}
+.card{background:var(--panel);border:1px solid var(--edge);border-left:3px solid var(--muted);border-radius:8px;padding:12px 16px;margin-bottom:12px}
+.card h3{margin:0 0 8px;font-size:14px}
+.card .turn{color:var(--muted);font-family:ui-monospace,monospace}
+.card .verdict{color:var(--accent);font-weight:600}
+.card .composite{font-size:11px;color:var(--muted);border:1px solid var(--edge);border-radius:6px;padding:0 6px;margin-left:6px}
+.card p{margin:4px 0}
+.card .cause b,.card .cost b,.card .reco b,.card .hidden b{color:var(--muted)}
+.card .reco{color:#9ad19a}
+.card .hidden{color:var(--muted);font-size:12px}
+.card .regions{list-style:none;margin:4px 0;padding-left:0}
+.card .regions li{margin:2px 0}
+.card .regions .range{color:var(--muted);font-family:ui-monospace,monospace;font-size:12px}
+.card.verdict-structural{border-left-color:#e5566b}
+.card.verdict-temporal{border-left-color:#f0a336}
+.card.verdict-unexplained{border-left-color:#7c5cff}
+.rollup{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:14px 16px;margin-top:18px}
+.rollup h2{margin:0 0 10px;font-size:15px}
+.rollup h3{margin:14px 0 6px;font-size:13px;color:var(--muted)}
+.totals{display:flex;gap:12px;flex-wrap:wrap}
+.totals .cell{flex:1;min-width:140px;background:#12151d;border:1px solid var(--edge);border-radius:6px;padding:8px 12px}
+.totals .cell span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.totals .cell b{font-variant-numeric:tabular-nums}
+.byverdict{margin:10px 0;color:var(--muted);font-size:13px}
+.byverdict .vcount{display:inline-block;margin-right:10px}
+.cf{margin:6px 0;color:var(--fg)}
+.recos{margin:0;padding-left:18px}
+.recos li{margin:4px 0}
+.note,.muted{color:var(--muted);font-size:12px}
+`;
+
+/**
+ * Load a captured session dir into the `diagnoseCache` input shape (mirrors the fixture
+ * gate's helper): each manifest line → an exchange with the parsed request body, the
+ * read `usage`, the per-turn timestamps, and the probe `max_tokens`. `diagnoseCache`
+ * runs its own `computeWaste`, so this does NOT reuse `report.loadSession` (which deletes
+ * the parsed body and computes waste for the report model).
+ * @param {string} dir
+ * @returns {Array<{ turn: number|null, threadId: string|null, requestBody: any, usage: import('./report.js').Usage|null, requestReceivedAt: string|null, responseCompletedAt: string|null, maxTokens: unknown }>}
+ */
+function loadCacheSession(dir) {
+  const lines = fs
+    .readFileSync(path.join(dir, 'manifest.jsonl'), 'utf8')
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l));
+  return lines.map((line) => {
+    const requestBuf = fs.readFileSync(path.join(dir, line.request_blob));
+    let responseBuf = Buffer.alloc(0);
+    try {
+      responseBuf = fs.readFileSync(path.join(dir, line.response_blob));
+    } catch {
+      // An aborted exchange reads null usage — the diagnostic degrades to "—" on it.
+    }
+    const e = buildExchange(line, requestBuf, responseBuf);
+    return {
+      turn: e.turn,
+      threadId: e.threadId,
+      requestBody: e.requestJson,
+      usage: e.usage,
+      requestReceivedAt: e.requestReceivedAt,
+      responseCompletedAt: e.responseCompletedAt,
+      maxTokens: e.requestJson?.max_tokens,
+    };
+  });
+}
+
+/**
+ * The `cache` subcommand entry point (issue #87 / cache spec §6). Discover + load ONE
+ * session (the cache economy is per-conversation — no corpus mode), run the pure
+ * `diagnoseCache`, and render it (text by default; the same data as HTML). Discovery
+ * reuses the report resolver so `cache` finds exactly what `report`/`fine-tune` do.
+ *
+ * The TTL threshold is taken in **seconds** on the CLI surface (`--ttl`, default 1 h) and
+ * handed to `diagnoseCache` in ms; an absent/invalid value falls back to the diagnostic's
+ * own default.
+ *
+ * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, latest?: boolean, ttlSeconds?: number }} [opts]
+ * @returns {{ sessionId: string, transitions: number, diagnostic: Diagnostic, lines: string[], html: string }}
+ */
+export function cache(opts = {}) {
+  const cwd = opts.cwd ?? process.cwd();
+  const roots = resolveRoots({ cwd, root: opts.root, all: false, sessionsDir: opts.sessionsDir });
+  const sessions = roots.flatMap((r) => listSessions(r));
+  if (sessions.length === 0) {
+    throw new Error(
+      `no captured sessions found under ${roots.join(', ')} — run 'ccsnoop start' first, or pass --root <path>`
+    );
+  }
+
+  let chosen;
+  if (opts.session) {
+    chosen = sessions.find((s) => s.id === opts.session);
+    if (!chosen) {
+      throw new Error(`session '${opts.session}' not found (have: ${sessions.map((s) => s.id).join(', ')})`);
+    }
+  } else {
+    // No `--session` ⇒ the most-recent session (default-latest, mirroring report). `--latest`
+    // is accepted by the CLI as the same signal — there is no corpus mode to drop out of.
+    chosen = /** @type {{ id: string, dir: string, mtimeMs: number }} */ (pickLatestSession(sessions));
+  }
+
+  const session = loadCacheSession(chosen.dir);
+  const ttlMs = Number.isFinite(opts.ttlSeconds) && opts.ttlSeconds >= 0 ? opts.ttlSeconds * 1000 : undefined;
+  const diagnostic = diagnoseCache(session, ttlMs != null ? { ttl: ttlMs } : {});
+  const { lines, html } = renderCache(diagnostic, { sessionId: chosen.id });
+  return { sessionId: chosen.id, transitions: diagnostic.transitions.length, diagnostic, lines, html };
 }
