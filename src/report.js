@@ -295,6 +295,56 @@ export function buildExchange(line, requestBuf, responseBuf) {
 }
 
 /**
+ * Read a captured session directory into its exchanges, in capture order. The only
+ * filesystem seam any analysis shares: `report` (waste + HTML) and `cache` (the
+ * cache diagnostic) both start here, so they see exactly the same session.
+ *
+ * @param {string} dir  The `sessions/<session_id>/` directory.
+ * @returns {object[]}  One {@link buildExchange} model per manifest line.
+ */
+export function loadExchanges(dir) {
+  return fs
+    .readFileSync(path.join(dir, 'manifest.jsonl'), 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l))
+    .map((line) => {
+      const requestBuf = fs.readFileSync(path.join(dir, line.request_blob));
+      let responseBuf = Buffer.alloc(0);
+      try {
+        responseBuf = fs.readFileSync(path.join(dir, line.response_blob));
+      } catch {
+        // Response blob may be missing on an aborted exchange — accounting reads null.
+      }
+      return buildExchange(line, requestBuf, responseBuf);
+    });
+}
+
+/**
+ * Project a loaded exchange onto the input shape the analyses consume
+ * (`computeWaste` and `diagnoseCache` take the same shape).
+ *
+ * @param {any} e  An exchange from {@link loadExchanges} (its `requestJson` still present).
+ * @returns {{ turn: number|null, threadId: string|null, requestBody: any,
+ *   usage: Usage|null, requestReceivedAt: string|null, responseCompletedAt: string|null,
+ *   maxTokens: unknown }}
+ */
+export function toAnalysisInput(e) {
+  return {
+    turn: e.turn,
+    threadId: e.threadId,
+    requestBody: e.requestJson,
+    usage: e.usage,
+    // Cache-diagnostic temporal/probe signals (issue #83 / cache spec §2.3):
+    // per-turn timestamps are injected from the capture (Date.parse, not
+    // Date.now), and max_tokens flags the probe turns filtered before analysis.
+    requestReceivedAt: e.requestReceivedAt,
+    responseCompletedAt: e.responseCompletedAt,
+    maxTokens: e.requestJson?.max_tokens,
+  };
+}
+
+/**
  * Load a captured session directory into a report model. Reads the manifest
  * (capture order) and each exchange's raw blobs.
  *
@@ -308,37 +358,8 @@ export function buildExchange(line, requestBuf, responseBuf) {
  * @returns {{ sessionId: string, exchanges: object[], waste: object, wasteConfig: object }}
  */
 export function loadSession(dir, id, wasteConfig) {
-  const manifestPath = path.join(dir, 'manifest.jsonl');
-  const lines = fs
-    .readFileSync(manifestPath, 'utf8')
-    .split('\n')
-    .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l));
-  const exchanges = lines.map((line) => {
-    const requestBuf = fs.readFileSync(path.join(dir, line.request_blob));
-    let responseBuf = Buffer.alloc(0);
-    try {
-      responseBuf = fs.readFileSync(path.join(dir, line.response_blob));
-    } catch {
-      // Response blob may be missing on an aborted exchange — accounting reads null.
-    }
-    return buildExchange(line, requestBuf, responseBuf);
-  });
-
-  const { perExchange, summary, config } = computeWaste(
-    exchanges.map((e) => ({
-      threadId: e.threadId,
-      requestBody: e.requestJson,
-      usage: e.usage,
-      // Cache-diagnostic temporal/probe signals (issue #83 / cache spec §2.3):
-      // per-turn timestamps are injected from the capture (Date.parse, not
-      // Date.now), and max_tokens flags the probe turns filtered before analysis.
-      requestReceivedAt: e.requestReceivedAt,
-      responseCompletedAt: e.responseCompletedAt,
-      maxTokens: e.requestJson?.max_tokens,
-    })),
-    wasteConfig ?? {}
-  );
+  const exchanges = loadExchanges(dir);
+  const { perExchange, summary, config } = computeWaste(exchanges.map(toAnalysisInput), wasteConfig ?? {});
   exchanges.forEach((e, i) => {
     const w = perExchange[i];
     e.segments = w.segments;
