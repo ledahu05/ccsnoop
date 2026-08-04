@@ -55,6 +55,10 @@ The report shows you the waste; two more commands help you **act on it**:
 - **`ccsnoop lifetime`** — surfaces compaction as a first-class signal: *how many
   turns / minutes* the context window lasted before it was first compacted, and *how
   many bytes* each compaction dropped.
+- **`ccsnoop isolate`** — quantifies **subagent context isolation**: how much context
+  ran in subagent threads (isolated from — and discarded by — the main window) vs the
+  main thread, with an *if-inlined* counterfactual. Recommends routing context-heavy
+  exploration to subagents when the isolation paid off.
 
 **What it is *not*:**
 
@@ -81,7 +85,7 @@ The report shows you the waste; two more commands help you **act on it**:
                             <your repo>/.ccsnoop/sessions/<id>/
                               (raw request + response bytes)
 
-  then, offline:  ccsnoop report · fine-tune · cache  ──read the files──▶  HTML · settings.json · cards
+  then, offline:  ccsnoop report · fine-tune · cache · isolate  ──read the files──▶  HTML · settings.json · cards
 ```
 
 Four lines of what happens:
@@ -333,6 +337,35 @@ Full guide — the three frontiers, the verdict taxonomy, the recommendation bri
 
 ---
 
+### `ccsnoop isolate` — quantify subagent context isolation
+
+A subagent's context never enters the main window — it is built up, used, and discarded
+in the subagent's own thread. `isolate` measures that payoff: it groups the session's
+exchanges by `thread_id`, tags the subagent threads (`parent_session_id` set), and sums
+per-thread input tokens (the prompt footprint = input + cache-read + cache-creation) straight
+from the captured `usage` — never re-tokenizing. It then frames the **main** total against
+an **if-inlined counterfactual** (main + subagent), and recommends routing context-heavy
+exploration to subagents when the isolated context is a material fraction of that
+counterfactual.
+
+```console
+$ ccsnoop isolate
+per-thread input tokens (prompt: input + cache-read + cache-creation):
+  main      ccsnoop-main-aaaa1111  · 2 exch · 2,150 tok
+  subagent  ccsnoop-sub-bbbb2222 ← ccsnoop-main-aaaa1111  · 3 exch · 6,570 tok
+
+main (actual):             2,150 tok
+subagent (isolated):       6,570 tok
+if-inlined counterfactual: 8,720 tok   (main + subagent)
+isolation ratio:           75.3%
+reco: Subagents isolated 75.3% of the inlinable context … Route context-heavy exploration to subagents …
+```
+
+A session with no subagents reports that honestly and emits no reco. Bytes appear only as a
+labelled fallback column, never as the headline currency.
+
+---
+
 ## 6. Turning it off / undoing
 
 **Know the exit door before you walk in.** Everything ccsnoop does is reversible and
@@ -394,6 +427,7 @@ Run `ccsnoop <command> [options]`. `--help` prints this same list.
 | `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP deny)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run |
 | `cache`  | Cache-economy diagnostic for one captured session (per-transition cards + rollup). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--ttl <seconds>` TEMPORAL threshold (default `3600`)<br>`--html` render as a self-contained HTML document |
 | `lifetime` | Effective context-lifetime metric for one captured session (compaction count, turns/wall-time to the first compaction, per-event bytes-dropped). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--html` render as a self-contained HTML document |
+| `isolate` | Subagent context-isolation for one captured session (isolated vs main + an if-inlined counterfactual). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to analyze (default: latest)<br>`--threshold <f>` isolation ratio that fires the reco, in `[0,1]` (default `0.25`)<br>`--html` render as a self-contained HTML document |
 
 ---
 

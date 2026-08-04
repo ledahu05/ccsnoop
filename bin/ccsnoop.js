@@ -9,9 +9,10 @@ import { fineTune } from '../src/finetune.js';
 import { cache } from '../src/cache.js';
 import { floor } from '../src/floor.js';
 import { lifetime } from '../src/lifetime.js';
+import { isolate } from '../src/isolate.js';
 import { init, undoAllRoutes } from '../src/init.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -47,6 +48,7 @@ async function main() {
   if (sub === 'cache') return runCache(args);
   if (sub === 'floor') return runFloor(args);
   if (sub === 'lifetime') return runLifetime(args);
+  if (sub === 'isolate') return runIsolate(args);
 }
 
 /**
@@ -335,6 +337,40 @@ function runLifetime(args) {
 }
 
 /**
+ * `isolate` — the subagent context-isolation diagnostic (issue #102, epic #93 part 4). One
+ * session: groups exchanges by `threadId`, sums per-thread input tokens from `usage`
+ * (never re-tokenizes), and frames isolated (subagent) context vs main plus an if-inlined
+ * counterfactual. Recommends routing context-heavy exploration to subagents when the
+ * isolated context is a material fraction of that counterfactual. Text by default; `--html`
+ * renders the same data as a self-contained document. Flags/dispatch mirror `runCache`;
+ * discovery is the shared report resolver. No corpus mode.
+ * @param {string[]} args
+ */
+function runIsolate(args) {
+  const thresholdFlag = getFlag(args, '--threshold');
+  let threshold;
+  if (thresholdFlag !== undefined) {
+    const v = Number(thresholdFlag);
+    if (thresholdFlag.trim() === '' || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new Error(`--threshold expects a fraction in [0, 1], got '${thresholdFlag}'`);
+    }
+    threshold = v;
+  }
+  const result = isolate({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
+    session: getFlag(args, '--session'),
+    threshold,
+  });
+  if (hasFlag(args, '--html')) {
+    process.stdout.write(result.html + '\n');
+  } else {
+    for (const line of result.lines) console.log(line);
+  }
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -423,6 +459,12 @@ Commands:
              --sessions-dir <p>   dir holding session subdirs (overrides --root)
              --session <id>       session to diagnose (default: latest)
              --latest             most-recent session (same as the default; no corpus mode)
+             --html               render the same data as a self-contained HTML document
+  isolate Subagent context-isolation for one captured session (isolated vs main + counterfactual)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to analyze (default: latest)
+             --threshold <f>      isolation ratio that fires the reco, in [0,1] (default 0.25)
              --html               render the same data as a self-contained HTML document`);
 }
 

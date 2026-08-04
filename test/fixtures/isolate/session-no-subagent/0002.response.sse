@@ -1,0 +1,2 @@
+data: {"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":600,"cache_creation_input_tokens":0}}}
+
