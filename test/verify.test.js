@@ -37,11 +37,16 @@ const BIN = path.join(REPO_ROOT, 'bin', 'ccsnoop.js');
  *
  * Tool bytes come from `segments` (`tool:<name>`); the body's `tools[]` is kept in sync
  * for realism (the gain model attributes tools from segments, not from the body array).
- * @param {{ sessionId?: string, tools?: Record<string, number>, usage?: any }} [cfg]
+ * @param {{ sessionId?: string, tools?: Record<string, number>, usage?: any, claudeMdPath?: string }} [cfg]
  */
-function synthModel({ sessionId = 'synth', tools = { Read: 4000, Write: 1500 }, usage } = {}) {
+function synthModel({
+  sessionId = 'synth',
+  tools = { Read: 4000, Write: 1500 },
+  usage,
+  claudeMdPath = './CLAUDE.md',
+} = {}) {
   const harnessTxt = 'system prompt identity' + 'H'.repeat(200); // harness (no lever marker)
-  const claudeMdTxt = 'Contents of ./CLAUDE.md (project instructions)' + 'C'.repeat(300);
+  const claudeMdTxt = `Contents of ${claudeMdPath} (project instructions)` + 'C'.repeat(300);
   const hookTxt = 'SessionStart:startup hook success: persona output' + 'K'.repeat(120);
   const mcpTxt = 'deferred tools: mcp__stub__t00 listing' + 'M'.repeat(60);
 
@@ -304,6 +309,54 @@ test('renderVerify: the per-block table rows share one column layout', () => {
   }
   const widths = new Set(tableLines.map((l) => [...l].length));
   assert.equal(widths.size, 1, `table rows differ in width: ${[...widths].join(', ')}`);
+});
+
+test('renderVerify keeps its columns aligned when a block label overflows', () => {
+  // A real CLAUDE.md source is an absolute path — longer than the label column. An
+  // over-long label must not shove the before/after/Δ cells right, or the table stops
+  // being scannable on exactly the rows a maintainer wants to compare.
+  const claudeMdPath = '/home/agent/workspace/deeply/nested/project/CLAUDE.md';
+  const before = synthModel({ tools: { Read: 4000 }, claudeMdPath });
+  const after = synthModel({ tools: { Read: 1800 }, claudeMdPath });
+  const lines = renderVerify(computeVerify(before, after)).lines;
+  const start = lines.findIndex((l) => /^\s+block\s+before/.test(l));
+  const tableLines = [];
+  for (const l of lines.slice(start)) {
+    if (l === '') break;
+    tableLines.push(l);
+  }
+  const mdRow = tableLines.find((l) => /^ {2}CLAUDE\.md/.test(l));
+  assert.ok(mdRow, `the long CLAUDE.md row is present:\n${tableLines.join('\n')}`);
+  const widths = new Set(tableLines.map((l) => [...l].length));
+  assert.equal(widths.size, 1, `table rows differ in width: ${[...widths].join(', ')}`);
+  // The elided label still ends in the basename — the part that identifies the source.
+  assert.match(mdRow, /CLAUDE\.md\s*$|CLAUDE\.md\s+\d/, `elided label keeps its tail: ${JSON.stringify(mdRow)}`);
+});
+
+test('renderVerify phrases a zero before baseline in words, not a bogus nested percentage', () => {
+  const before = synthModel({
+    tools: { Read: 0 },
+    usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+  });
+  const after = synthModel({ tools: { Read: 1000 }, usage: { inputTokens: 500 } });
+  const out = renderVerify(computeVerify(before, after)).lines.join('\n');
+  assert.match(out, /\+500 tokens {2}\(no % — zero before baseline\)/, out);
+  // No NaN%, and no parenthetical nested inside the delta's own parentheses.
+  assert.doesNotMatch(out, /NaN/);
+  assert.doesNotMatch(out, /\([^()\n]*\([^()\n]*\)/);
+});
+
+test('renderVerify flags the byte-proxy basis on a FLAT verdict too', () => {
+  // "The floors match" backed by a byte proxy is a weaker claim than the same words
+  // backed by real tokens; the reader must be able to tell which they got.
+  const before = synthModel({ sessionId: 'before', usage: { inputTokens: 5 } });
+  const after = synthModel({ sessionId: 'after', usage: null });
+  const v = computeVerify(before, after);
+  assert.equal(v.delta.verdict, 'flat', 'identical byte totals ⇒ flat');
+  assert.equal(v.delta.basis, 'bytes');
+  const verdict = renderVerify(v).lines.at(-1);
+  assert.match(verdict, /FLAT/);
+  assert.match(verdict, /real tokens unavailable; byte-proxy basis/);
 });
 
 // ── buildVerifyJson: the versioned tuning-session/v1 contract ─────────────────

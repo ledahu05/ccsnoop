@@ -27,6 +27,7 @@
 import { loadSession, resolveRoots, listSessions } from './report.js';
 import { computeFloor, DEFAULT_WINDOW_TOKENS, fmtBytes, fmtTokens, blockLabel } from './floor.js';
 import { SCHEMA_URL, SCHEMA_VERSION } from './finetune-json.js';
+import { fitLabel } from './format.js';
 
 /**
  * The contract note — every token figure is real captured usage; every per-block
@@ -108,7 +109,7 @@ function blockKey(b) {
  * Match the two floors' attribution block-by-block and produce the per-block byte delta.
  * A block present on only one side reads 0 on the other (a tool added after = "grew", a
  * tool removed after = "shrank"). Ranked by the ABSOLUTE change (biggest movers first),
- * tiebroken by total size then label so the order is deterministic.
+ * tiebroken by total size, then label, then detail so the order is total and deterministic.
  *
  * @param {Array<{ kind: import('./floor.js').FloorBlock['kind'], label: string, detail: string | null, bytes: number }>} beforeAttr
  * @param {Array<{ kind: import('./floor.js').FloorBlock['kind'], label: string, detail: string | null, bytes: number }>} afterAttr
@@ -140,7 +141,10 @@ function computeBlockDeltas(beforeAttr, afterAttr) {
     (a, b) =>
       Math.abs(b.delta) - Math.abs(a.delta) ||
       b.beforeBytes + b.afterBytes - (a.beforeBytes + a.afterBytes) ||
-      a.label.localeCompare(b.label)
+      a.label.localeCompare(b.label) ||
+      // Two CLAUDE.md blocks share one label; `detail` (the source path) is what
+      // distinguishes them, so it completes the order.
+      (a.detail ?? '').localeCompare(b.detail ?? '')
   );
   return rows;
 }
@@ -166,15 +170,16 @@ function signedTokens(n) {
 }
 
 /**
- * A signed percentage for an inline delta phrase: `+20%` / `-20%` / `0%`. Null-relative
- * (a zero before baseline) is rendered as words so the cell never shows a bogus `NaN%`.
+ * The parenthetical that qualifies a delta cell: `+20% of the before floor` /
+ * `-20% of the before floor`. A null relative (a zero before baseline) is rendered as
+ * words — the WHOLE phrase, not just the figure, so the caller's parentheses wrap one
+ * legible clause instead of nesting a second pair inside them.
  * @param {number | null} rel
  * @returns {string}
  */
-function pctPhrase(rel) {
-  if (rel === null) return 'no % (zero before baseline)';
-  if (rel > 0) return `+${rel}%`;
-  return `${rel}%`;
+function relPhrase(rel) {
+  if (rel === null) return 'no % — zero before baseline';
+  return `${rel > 0 ? '+' : ''}${rel}% of the before floor`;
 }
 
 /**
@@ -248,15 +253,20 @@ export function computeVerify(beforeModel, afterModel, opts = {}) {
   };
 }
 
-/** Per-block table column widths; the header, rule and every row share them. */
+/**
+ * Per-block table column widths; the header, rule and every row share them. Every block
+ * label passes through {@link module:format.fitLabel}, which pads OR elides to exactly
+ * `block` characters — a CLAUDE.md source is an absolute path and would otherwise shove
+ * the before/after/Δ cells right on precisely the rows this table exists to compare.
+ */
 const VCOL = { block: 44, before: 8, after: 8, delta: 10 };
 const VRULE = '─'.repeat(VCOL.block + 1 + VCOL.before + 1 + VCOL.after + 2 + VCOL.delta);
 
 /**
- * One row of the per-block delta table in the shared columns: the block label
- * (left-aligned), the before / after byte cells and the signed Δbytes cell
- * (right-aligned). Cells are pre-rendered strings so the same formatter lays out the
- * header, every block row and the total.
+ * One row of the per-block delta table in the shared columns: the block label (fitted to
+ * the label column — padded, or middle-elided when it overruns), the before / after byte
+ * cells and the signed Δbytes cell (right-aligned). Cells are pre-rendered strings so the
+ * same formatter lays out the header, every block row and the total.
  * @param {string} block
  * @param {string} beforeCell
  * @param {string} afterCell
@@ -264,26 +274,29 @@ const VRULE = '─'.repeat(VCOL.block + 1 + VCOL.before + 1 + VCOL.after + 2 + V
  * @returns {string}
  */
 function vRow(block, beforeCell, afterCell, deltaCell) {
-  return `  ${block.padEnd(VCOL.block)} ${beforeCell.padStart(VCOL.before)} ${afterCell.padStart(VCOL.after)}  ${deltaCell.padStart(VCOL.delta)}`;
+  return `  ${fitLabel(block, VCOL.block)} ${beforeCell.padStart(VCOL.before)} ${afterCell.padStart(VCOL.after)}  ${deltaCell.padStart(VCOL.delta)}`;
 }
 
 /**
  * The one-line verdict summary. Names the verdict, the magnitude (tokens when both sides
  * captured usage, else the byte proxy), the % of the before floor, and — for the byte
- * basis — that real tokens were unavailable.
+ * basis — that real tokens were unavailable. The byte-basis caveat is appended to EVERY
+ * verdict including `flat`: "the floors match" on a byte proxy is a weaker claim than the
+ * same words backed by real tokens, and the reader has to be able to tell which they got.
  * @param {{ verdict: Verdict, basis: 'tokens' | 'bytes',
  *   tokens: { absolute: number | null, relative: number | null },
  *   bytes: { absolute: number, relative: number | null } }} delta
  * @returns {string}
  */
 function verdictLine(delta) {
-  if (delta.verdict === 'flat') return 'verdict: FLAT — the before and after floors match';
+  const basisNote = delta.basis === 'tokens' ? '' : ' — real tokens unavailable; byte-proxy basis';
+  if (delta.verdict === 'flat') return `verdict: FLAT — the before and after floors match${basisNote}`;
   const word = delta.verdict === 'lowered' ? 'LOWERED' : 'RAISED';
   const dir = delta.verdict === 'lowered' ? 'below' : 'above';
   const d = delta.basis === 'tokens' ? delta.tokens : delta.bytes;
-  const mag = delta.basis === 'tokens' ? `${fmtTokens(Math.abs(d.absolute))} tokens` : `${fmtBytes(Math.abs(d.absolute))} bytes`;
+  const mag =
+    delta.basis === 'tokens' ? `${fmtTokens(Math.abs(d.absolute))} tokens` : `${fmtBytes(Math.abs(d.absolute))} bytes`;
   const pct = d.relative !== null ? `(${Math.abs(d.relative)}% of the before floor)` : '(zero before baseline)';
-  const basisNote = delta.basis === 'tokens' ? '' : ' — real tokens unavailable; byte-proxy basis';
   return `verdict: FLOOR ${word} — the after floor sits ${mag} ${pct} ${dir} the before floor${basisNote}`;
 }
 
@@ -310,7 +323,7 @@ export function renderVerify(ctx) {
   if (t.before !== null && t.after !== null) {
     lines.push(`  before: ${fmtTokens(t.before)} tokens  (${ctx.before.headline.pctOfWindow}% of window)`);
     lines.push(`  after:  ${fmtTokens(t.after)} tokens  (${ctx.after.headline.pctOfWindow}% of window)`);
-    lines.push(`  delta:  ${signedTokens(/** @type {number} */ (t.absolute))} tokens  (${pctPhrase(t.relative)} of the before floor)`);
+    lines.push(`  delta:  ${signedTokens(/** @type {number} */ (t.absolute))} tokens  (${relPhrase(t.relative)})`);
   } else {
     lines.push('  real turn-1 tokens unavailable on at least one side (no captured usage)');
     lines.push('  delta:  verdict falls back to the byte proxy below');
@@ -322,7 +335,7 @@ export function renderVerify(ctx) {
   lines.push('Byte proxy — per-block byte-length totals (never re-tokenized)');
   lines.push(`  before: ${fmtBytes(b.before)} bytes`);
   lines.push(`  after:  ${fmtBytes(b.after)} bytes`);
-  lines.push(`  delta:  ${signedBytes(b.absolute)} bytes  (${pctPhrase(b.relative)} of the before floor)`);
+  lines.push(`  delta:  ${signedBytes(b.absolute)} bytes  (${relPhrase(b.relative)})`);
   lines.push('');
 
   // Per-block delta, ranked by absolute byte change.

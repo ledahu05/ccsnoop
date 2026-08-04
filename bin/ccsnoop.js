@@ -301,23 +301,12 @@ function runCache(args) {
  * @param {string[]} args
  */
 function runFloor(args) {
-  const windowFlag = getFlag(args, '--window');
-  let windowTokens;
-  if (windowFlag !== undefined) {
-    const n = Number(windowFlag);
-    // A typo'd window would otherwise fall back to the 200k default and report the
-    // wrong %. (`Number('')` is 0, so a blank value is rejected explicitly.)
-    if (windowFlag.trim() === '' || !Number.isFinite(n) || n <= 0) {
-      throw new Error(`--window expects a positive number of tokens, got '${windowFlag}'`);
-    }
-    windowTokens = n;
-  }
   const result = floor({
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
     sessionsDir: getFlag(args, '--sessions-dir'),
     session: getFlag(args, '--session'),
-    windowTokens,
+    windowTokens: getWindowFlag(args),
   });
   for (const line of result.lines) console.log(line);
 }
@@ -396,24 +385,13 @@ function runIsolate(args) {
  * @param {string[]} args
  */
 function runVerify(args) {
-  const windowFlag = getFlag(args, '--window');
-  let windowTokens;
-  if (windowFlag !== undefined) {
-    const n = Number(windowFlag);
-    // A typo'd window would otherwise fall back to the 200k default and report the
-    // wrong %. (`Number('')` is 0, so a blank value is rejected explicitly.)
-    if (windowFlag.trim() === '' || !Number.isFinite(n) || n <= 0) {
-      throw new Error(`--window expects a positive number of tokens, got '${windowFlag}'`);
-    }
-    windowTokens = n;
-  }
   const result = verify({
     cwd: process.cwd(),
     root: getFlag(args, '--root'),
     sessionsDir: getFlag(args, '--sessions-dir'),
     before: getFlag(args, '--before'),
     after: getFlag(args, '--after'),
-    windowTokens,
+    windowTokens: getWindowFlag(args),
   });
   if (hasFlag(args, '--json')) {
     process.stdout.write(JSON.stringify(result.json, null, 2) + '\n');
@@ -431,6 +409,24 @@ function runVerify(args) {
 function getFlag(args, name) {
   const i = args.indexOf(name);
   return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+}
+
+/**
+ * Read `--window <tokens>`, the context window the headline % is scored against. Shared
+ * by `floor` and `verify` so both reject an unusable value identically: a typo'd window
+ * would otherwise fall back to the 200k default and silently report the wrong %.
+ * (`Number('')` is 0, so a blank value is rejected explicitly.)
+ * @param {string[]} args
+ * @returns {number | undefined} The parsed window, or undefined when the flag is absent.
+ */
+function getWindowFlag(args) {
+  const raw = getFlag(args, '--window');
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (raw.trim() === '' || !Number.isFinite(n) || n <= 0) {
+    throw new Error(`--window expects a positive number of tokens, got '${raw}'`);
+  }
+  return n;
 }
 
 /**
