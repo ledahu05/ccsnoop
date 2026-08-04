@@ -7,9 +7,10 @@ import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
 import { fineTune } from '../src/finetune.js';
 import { cache } from '../src/cache.js';
+import { floor } from '../src/floor.js';
 import { init, undoAllRoutes } from '../src/init.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -43,6 +44,7 @@ async function main() {
   if (sub === 'report') return runReport(args);
   if (sub === 'fine-tune') return runFineTune(args);
   if (sub === 'cache') return runCache(args);
+  if (sub === 'floor') return runFloor(args);
 }
 
 /**
@@ -272,6 +274,41 @@ function runCache(args) {
 }
 
 /**
+ * `floor` — the turn-1 baseline metric + per-block attribution (issue #99, epic #93).
+ * The skill's verify KPI (#96): one headline number (the REAL turn-1 input tokens
+ * from captured `usage`, plus a labelled byte proxy) and a ranked breakdown of every
+ * contributor (each tool def, each CLAUDE.md source, each MCP tool, the SessionStart
+ * hook output, and the incompressible harness `system[]` floor). Turn-1 isolation
+ * profiles the first exchange; an offline reader of `sessions/`, daemon not required.
+ * `--window` overrides the 200 000-token context window the headline % is scored
+ * against (the 1M-context beta is not detectable from a capture). Flags/dispatch
+ * mirror {@link runReport} / {@link runCache}; no corpus mode — the default is the
+ * latest session, and `--latest` is accepted as a no-op for symmetry.
+ * @param {string[]} args
+ */
+function runFloor(args) {
+  const windowFlag = getFlag(args, '--window');
+  let windowTokens;
+  if (windowFlag !== undefined) {
+    const n = Number(windowFlag);
+    // A typo'd window would otherwise fall back to the 200k default and report the
+    // wrong %. (`Number('')` is 0, so a blank value is rejected explicitly.)
+    if (windowFlag.trim() === '' || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`--window expects a positive number of tokens, got '${windowFlag}'`);
+    }
+    windowTokens = n;
+  }
+  const result = floor({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
+    session: getFlag(args, '--session'),
+    windowTokens,
+  });
+  for (const line of result.lines) console.log(line);
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -347,7 +384,13 @@ Commands:
              --session <id>       session to diagnose (default: latest)
              --latest             most-recent session (same as the default; no corpus mode)
              --ttl <seconds>      TEMPORAL threshold (default 3600 = 1 h)
-             --html               render the same data as a self-contained HTML document`);
+             --html               render the same data as a self-contained HTML document
+  floor   Turn-1 baseline metric + ranked per-block attribution (the default context window)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to score (default: latest)
+             --latest             most-recent session (same as the default; no corpus mode)
+             --window <tokens>    context window for the headline % (default 200000)`);
 }
 
 main().catch((err) => {
