@@ -7,7 +7,7 @@ import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
 import { fineTune } from '../src/finetune.js';
 import { cache } from '../src/cache.js';
-import { init } from '../src/init.js';
+import { init, undoAllRoutes } from '../src/init.js';
 
 const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache'];
 
@@ -80,14 +80,58 @@ async function runStart(home, args) {
 }
 
 /**
- * `stop` — SIGTERM (drain) → SIGKILL fallback → remove pidfile (spec §3.4).
+ * `stop` — SIGTERM (drain) → SIGKILL fallback → remove pidfile (spec §3.4). With
+ * `--clean`, also un-routes every registered repo so a relaunched session isn't
+ * left pointing at the now-dead port (issue #90, gap 1). Either way, warns about
+ * sessions already running — their `ANTHROPIC_BASE_URL` is cached in-process and
+ * only a restart clears it (issue #90, gap 2).
  * @param {string} home
  * @param {string[]} args
  */
 async function runStop(home, args) {
+  const clean = hasFlag(args, '--clean');
   const result = await daemon.stop(home);
   console.log(result.line);
-  process.exit(result.exitCode);
+  // The stranded-session warning is the highest-value part of issue #90 — print
+  // it before --clean so an undo failure (e.g. a repo with non-strict settings)
+  // can't suppress it. Advisory, on stderr so a `pid=$(ccsnoop stop)` capture
+  // stays clean; exit stays 0 because we did stop successfully.
+  if (result.stranded && result.stranded.length) {
+    console.error(formatStrandedWarning(daemon.summarizeStranded(result.stranded)));
+  }
+  let cleanFailed = false;
+  if (clean) {
+    try {
+      for (const line of undoAllRoutes(home).lines) console.log(line);
+    } catch (err) {
+      // Surface the undo failure without losing the daemon-stop / stranded info
+      // already printed above.
+      cleanFailed = true;
+      console.error(`ccsnoop: --clean failed: ${err?.message ?? err}`);
+    }
+  }
+  process.exit(cleanFailed ? 1 : result.exitCode);
+}
+
+/**
+ * Render the stranded-session warning as one block. One line per working tree
+ * (a session's main process + its subagents/hooks all share the cached env).
+ * @param {{ count: number, groups: Array<{ cwd: string, pids: number[], token: string }> }} summary
+ * @returns {string}
+ */
+function formatStrandedWarning(summary) {
+  const lines = [
+    `⚠ ${summary.count} Claude Code session${summary.count === 1 ? '' : 's'} still route${
+      summary.count === 1 ? 's' : ''
+    } through ccsnoop (now stopped) and will hit ConnectionRefused until restarted:`,
+  ];
+  for (const g of summary.groups) {
+    lines.push(`    ${g.cwd}  [pid ${g.pids.join(', ')}]`);
+  }
+  lines.push(
+    '  Restart them (or run `ccsnoop init --undo` in each repo) to clear the cached ANTHROPIC_BASE_URL.',
+  );
+  return lines.join('\n');
 }
 
 /**
@@ -276,7 +320,10 @@ Commands:
   start    Start the capture-proxy daemon (detached; returns immediately)
              --port <n>           listen port (persisted to ~/.ccsnoop/config.json)
              --sessions-dir <p>   capture root (default ~/.ccsnoop/sessions)
-  stop     Stop the daemon (drain, then terminate)
+  stop     Stop the daemon (drain, then terminate). Warns about live Claude Code
+           sessions still routed through it — restart those, or they'll retry on
+           ConnectionRefused.
+             --clean              also un-route every registered repo (init --undo for all)
   status   Report daemon status (running → exit 0, stopped → exit 1)
   report   Render a captured session to a self-contained static HTML file
              --root <path>        capture root (default ./.ccsnoop)

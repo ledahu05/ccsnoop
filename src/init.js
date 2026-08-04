@@ -356,3 +356,72 @@ function undoInit(P) {
     ],
   };
 }
+
+/**
+ * Reconstruct the minimal {@link resolvePaths} shape {@link undoInit} needs, from
+ * a route's recorded manifest rather than by re-deriving it from `cwd` (no `git`
+ * spawn). `repo`/`dir` are the two anchors init stored; `isGit` is unused on the
+ * undo path.
+ * @param {string} token
+ * @param {{ repo?: string, dir?: string }} m
+ * @param {string} routesFile
+ * @returns {{ repo: string, isGit: boolean, captureDir: string, token: string, settings: string, gitignore: string, routes: string }}
+ */
+function pathsFromManifest(token, m, routesFile) {
+  const repo = typeof m.repo === 'string' && m.repo ? m.repo : (typeof m.dir === 'string' ? path.dirname(m.dir) : '');
+  const captureDir = typeof m.dir === 'string' && m.dir ? m.dir : path.join(repo, '.ccsnoop');
+  return {
+    repo,
+    isGit: false, // unused by undoInit
+    captureDir,
+    token,
+    settings: path.join(repo, '.claude', 'settings.local.json'),
+    gitignore: path.join(repo, '.gitignore'),
+    routes: routesFile,
+  };
+}
+
+/**
+ * `ccsnoop stop --clean` — un-route every registered repo in one shot (issue
+ * #90, gap 1). The default `stop` leaves `routes.json` intact (spec §3.4: routes
+ * survive a restart); `--clean` opts into reverting every repo the daemon served,
+ * so a session relaunched afterwards isn't left pointing at the now-dead port.
+ *
+ * Reuses {@link undoInit} per route, so each repo is reverted with its own
+ * recorded provenance (`env_prev`, gitignore flags) and captured `.ccsnoop/`
+ * data is never touched. It cannot reach sessions already running — their env is
+ * cached in-process until restart — so pair it with the `stop` stranded-session
+ * warning. Malformed `routes.json` throws (same strict read as a single undo),
+ * refusing to drop other repos' routes.
+ *
+ * @param {string} home
+ * @returns {{ exitCode: number, lines: string[], undone: string[] }}
+ *   `undone` is the list of route tokens reverted (empty if none registered).
+ */
+export function undoAllRoutes(home) {
+  const routesFile = daemon.paths(home).routes;
+  const routes = readRoutesStrict(routesFile);
+  const tokens = Object.keys(routes).filter(
+    (t) => routes[t] && typeof routes[t] === 'object',
+  );
+  if (tokens.length === 0) {
+    return {
+      exitCode: 0,
+      undone: [],
+      lines: ['ccsnoop stop --clean: no routes registered — nothing to un-route'],
+    };
+  }
+  /** @type {string[]} */
+  const undone = [];
+  const lines = [`ccsnoop stop --clean: un-routing ${tokens.length} repo${tokens.length === 1 ? '' : 's'}`];
+  for (const token of tokens) {
+    // undoInit re-reads routes.json and deletes this one token, so each call is
+    // independent and the loop converges on an empty registry.
+    undoInit(pathsFromManifest(token, routes[token], routesFile));
+    undone.push(token);
+    const repo = typeof routes[token].repo === 'string' ? routes[token].repo : routes[token].dir ?? '';
+    lines.push(`  un-routed ${token} → ${repo || '(unknown repo)'}`);
+  }
+  lines.push('  restart Claude Code in each repo to clear the cached ANTHROPIC_BASE_URL');
+  return { exitCode: 0, undone, lines };
+}

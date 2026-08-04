@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { init, gitTopLevel, InitError } from '../src/init.js';
+import { init, undoAllRoutes, gitTopLevel, InitError } from '../src/init.js';
 import { deriveToken } from '../src/routes.js';
 import * as daemon from '../src/daemon.js';
 
@@ -398,4 +398,51 @@ test('undo is idempotent — a second undo reports nothing to undo', () => {
   const res = init({ cwd: repo, home, undo: true });
   assert.equal(res.exitCode, 0);
   assert.match(res.lines.join('\n'), /nothing to undo/);
+});
+
+// ── undoAllRoutes (stop --clean, issue #90 gap 1) ─────────────────────────────
+
+test('undoAllRoutes reverts every registered route; captured data survives', () => {
+  const home = mkHome();
+  const repoA = mkRepo();
+  const repoB = mkRepo();
+  init({ cwd: repoA, home });
+  init({ cwd: repoB, home });
+  assert.equal(daemon.countRoutes(home), 2);
+
+  // Captured data under repoA must survive the bulk undo.
+  const captured = path.join(repoA, '.ccsnoop', 'sessions', 's1', '0001.request.http');
+  fs.mkdirSync(path.dirname(captured), { recursive: true });
+  fs.writeFileSync(captured, 'POST /v1/messages HTTP/1.1\n');
+
+  const res = undoAllRoutes(home);
+  assert.equal(res.exitCode, 0);
+  assert.equal(res.undone.length, 2);
+  assert.equal(daemon.countRoutes(home), 0, 'all routes removed');
+  assert.ok(!fs.existsSync(path.join(repoA, '.claude', 'settings.local.json')), 'A settings removed');
+  assert.ok(!fs.existsSync(path.join(repoB, '.claude', 'settings.local.json')), 'B settings removed');
+  assert.ok(fs.existsSync(captured), 'captured data left intact');
+  assert.match(res.lines.join('\n'), /un-routing 2 repos/);
+});
+
+test('undoAllRoutes restores per-route provenance (user-owned settings kept whole)', () => {
+  const home = mkHome();
+  const repo = mkRepo();
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  fs.writeFileSync(
+    path.join(repo, '.claude', 'settings.local.json'),
+    JSON.stringify({ env: { FOO: 'bar' } }),
+  );
+  init({ cwd: repo, home });
+
+  undoAllRoutes(home);
+  assert.deepEqual(readSettings(repo), { env: { FOO: 'bar' } }, 'pre-existing key restored');
+});
+
+test('undoAllRoutes with no routes reports nothing to un-route', () => {
+  const home = mkHome();
+  const res = undoAllRoutes(home);
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(res.undone, []);
+  assert.match(res.lines.join('\n'), /nothing to un-route/);
 });
