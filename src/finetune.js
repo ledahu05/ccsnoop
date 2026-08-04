@@ -30,6 +30,7 @@ import {
   HOOK_INTENT_CAVEAT,
 } from './finetune-levers.js';
 import { computeGain, EMPTY_GAIN, NULL_SOURCE } from './finetune-gain.js';
+import { buildJsonReport, summarizeLevers } from './finetune-json.js';
 import { DEFAULT_WASTE_CONFIG } from './waste.js';
 
 /** The single reused cost floor (spec §3.5) gating the hooks + CLAUDE.md levers. */
@@ -264,9 +265,9 @@ export function applyDenylistOverride(denylist, { extra, allow } = {}) {
  * @returns {{ lines: string[], settingsJson: string }}
  */
 export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers = EMPTY_LEVER_VERDICTS, gain = EMPTY_GAIN, denyAllowed = [] }) {
-  const hook = levers.hook;
-  const mcpDeny = mcp.servers.filter((s) => s.deny).map((s) => s.name);
-  const claudeMdExclude = levers.claudeMd.filter((c) => c.deny).map((c) => /** @type {string} */ (c.source));
+  // The acting levers + the conservative recoverable headline come from the shared
+  // summary the JSON contract also uses — one source of truth across both surfaces.
+  const { hook, mcpDeny, claudeMdExclude, recoverable } = summarizeLevers({ deny, mcp, levers, gain });
 
   /** @type {{ lever: string, label: string, shipped: number, waste: number | null, action: string }[]} */
   const rows = [];
@@ -318,13 +319,7 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   // ── the headline: Σ waste over the ACTIONABLE levers (conservative, cache-aware) ─
   // Non-actionable rows (flag-only MCP, below-floor hook, managed CLAUDE.md, harness)
   // are shown but never counted — bytes you cannot cut are not bytes you recover.
-  const deniedToolsWaste = deny.reduce((s, n) => s + (gain.tool.get(n)?.waste ?? 0), 0);
-  const mcpWaste = mcpDeny.length > 0 ? gain.mcp.waste : 0;
-  const hookWaste = hook.deny ? gain.hook.waste : 0;
-  const claudeMdWaste = levers.claudeMd
-    .filter((c) => c.deny)
-    .reduce((s, c) => s + (gain.claudeMd.get(c.source ?? NULL_SOURCE)?.waste ?? 0), 0);
-  const recoverable = deniedToolsWaste + mcpWaste + hookWaste + claudeMdWaste;
+  // `recoverable` itself comes from the shared {@link summarizeLevers} call above.
   const totalShipped = rows.reduce((s, r) => s + r.shipped, 0);
 
   // ── emit ──────────────────────────────────────────────────────────────────────
@@ -423,10 +418,11 @@ function uniqueById(sessions) {
  * id) — its corpus story is a later ticket.
  *
  * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, latest?: boolean, all?: boolean,
- *   denyExtra?: string[], denyAllow?: string[], denylistPath?: string }} [opts]
+ *   denyExtra?: string[], denyAllow?: string[], denylistPath?: string, includeTokens?: boolean }} [opts]
  * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus, levers: import('./finetune-levers.js').LeverVerdicts,
- *   gain: import('./finetune-gain.js').GainModel, lines: string[], settingsJson: string }}
+ *   gain: import('./finetune-gain.js').GainModel, lines: string[], settingsJson: string,
+ *   json: Record<string, any> }}
  */
 export function fineTune(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
@@ -494,6 +490,26 @@ export function fineTune(opts = {}) {
     denyAllowed,
   });
 
+  // The machine-readable contract (issue #95) — the same ctx the text renderer
+  // consumes, structured for the skill to consume programmatically. Always built: it
+  // is cheap and pure, and the CLI prints it only under `--json`. `includeTokens`
+  // (GAP C) backfills a primary-session token total from the captured `usage`.
+  const json = buildJsonReport(
+    {
+      sessionId: model.sessionId,
+      requests: model.exchanges.length,
+      scope: singleSession ? 'single' : 'corpus',
+      shipped,
+      deny,
+      denyAllowed,
+      mcp,
+      levers,
+      gain,
+      exchanges: model.exchanges,
+    },
+    { includeTokens: opts.includeTokens }
+  );
+
   return {
     sessionId: model.sessionId,
     requests: model.exchanges.length,
@@ -504,5 +520,6 @@ export function fineTune(opts = {}) {
     gain,
     lines,
     settingsJson,
+    json,
   };
 }

@@ -240,8 +240,16 @@ function runFineTune(args) {
     all: hasFlag(args, '--all'),
     denyExtra: parseList(getFlag(args, '--deny-extra')),
     denyAllow: parseList(getFlag(args, '--deny-allow')),
+    includeTokens: hasFlag(args, '--include-tokens'),
   });
-  for (const line of result.lines) console.log(line);
+  // `--json` emits the versioned tuning-report contract (issue #95) — the stable,
+  // parseable surface the context-tuning skill consumes. Absent it, the default
+  // human text diagnostic + paste-ready block is unchanged.
+  if (hasFlag(args, '--json')) {
+    process.stdout.write(JSON.stringify(result.json, null, 2) + '\n');
+  } else {
+    for (const line of result.lines) console.log(line);
+  }
 }
 
 /**
@@ -440,6 +448,8 @@ Commands:
              --all                widen discovery across ~/.ccsnoop/routes.json
              --deny-extra <a,b>   add denylist names for this run only
              --deny-allow <a>     drop a denylist name for this run only
+             --json               emit the versioned tuning-report contract (issue #95)
+             --include-tokens     with --json, backfill primary-session token totals
   cache   Cache-economy diagnostic for one captured session (per-transition cards + rollup)
              --root <path>        capture root (default ./.ccsnoop)
              --sessions-dir <p>   dir holding session subdirs (overrides --root)
