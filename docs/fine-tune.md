@@ -103,6 +103,26 @@ then your extras.
 | `--all` | widen discovery across `~/.ccsnoop/routes.json` |
 | `--deny-extra <a,b>` | add denylist names for this run only |
 | `--deny-allow <a>` | drop a denylist name for this run only |
+| `--json` | emit the versioned [`tuning-report/v1`](tuning-report-schema.md) contract instead of the text table |
+| `--include-tokens` | with `--json`, backfill primary-session token totals from captured `usage` |
+
+---
+
+## Machine-readable output (`--json`)
+
+For programmatic consumers — the [context-tuning skill](https://github.com/ledahu05/ccsnoop/issues/94)
+and any automation — pass `--json` to get a stable, versioned JSON contract instead of
+the text table. It carries the same verdicts, structured: each lever's `verdict`,
+`evidence`, and `action`; the **safe vs advice** tier split (safe = `tools` / `mcp`,
+auto-writable; advice = `hooks` / `claudeMd`, paste-only); and the `settings.auto` /
+`settings.advice` partition of the paste-ready block. See
+[`tuning-report-schema.md`](tuning-report-schema.md) for the full schema.
+
+```console
+$ ccsnoop fine-tune --json --include-tokens
+```
+
+The default text output is unchanged when `--json` is absent.
 
 ---
 
