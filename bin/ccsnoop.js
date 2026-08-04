@@ -10,9 +10,10 @@ import { cache } from '../src/cache.js';
 import { floor } from '../src/floor.js';
 import { lifetime } from '../src/lifetime.js';
 import { isolate } from '../src/isolate.js';
+import { verify } from '../src/verify.js';
 import { init, undoAllRoutes } from '../src/init.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate', 'verify'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -49,6 +50,7 @@ async function main() {
   if (sub === 'floor') return runFloor(args);
   if (sub === 'lifetime') return runLifetime(args);
   if (sub === 'isolate') return runIsolate(args);
+  if (sub === 'verify') return runVerify(args);
 }
 
 /**
@@ -379,6 +381,48 @@ function runIsolate(args) {
 }
 
 /**
+ * `verify` — the before/after floor delta (issue #96, epic #94): given two captured
+ * sessions (a before and an after — one tuning session), compute the turn-1 floor on
+ * each via `computeFloor` (#99) and report whether the tuning lowered the floor, and by
+ * how much. The headline delta is real turn-1 captured `usage`; the per-block delta is a
+ * labelled byte proxy. A pure offline reader of `sessions/`; the daemon is not required.
+ *
+ * `--before <id>` and `--after <id>` are required — ccsnoop emits the pairing, it does
+ * not decide it (the skill in #97 picks the two sessions). `--window` overrides the
+ * context window the headline % is scored against, identically on both sides so the
+ * delta is apples-to-apples. Text by default; `--json` emits the versioned
+ * `tuning-session/v1` contract (issue #95 envelope, `kind: "tuning-session"`). Flags
+ * and discovery mirror {@link runFloor}; no corpus mode.
+ * @param {string[]} args
+ */
+function runVerify(args) {
+  const windowFlag = getFlag(args, '--window');
+  let windowTokens;
+  if (windowFlag !== undefined) {
+    const n = Number(windowFlag);
+    // A typo'd window would otherwise fall back to the 200k default and report the
+    // wrong %. (`Number('')` is 0, so a blank value is rejected explicitly.)
+    if (windowFlag.trim() === '' || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`--window expects a positive number of tokens, got '${windowFlag}'`);
+    }
+    windowTokens = n;
+  }
+  const result = verify({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
+    before: getFlag(args, '--before'),
+    after: getFlag(args, '--after'),
+    windowTokens,
+  });
+  if (hasFlag(args, '--json')) {
+    process.stdout.write(JSON.stringify(result.json, null, 2) + '\n');
+  } else {
+    for (const line of result.lines) console.log(line);
+  }
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -475,7 +519,16 @@ Commands:
              --sessions-dir <p>   dir holding session subdirs (overrides --root)
              --session <id>       session to analyze (default: latest)
              --threshold <f>      isolation ratio that fires the reco, in [0,1] (default 0.25)
-             --html               render the same data as a self-contained HTML document`);
+             --html               render the same data as a self-contained HTML document
+  verify  Before/after floor delta for two captured sessions (a tuning session): did the
+          tuning lower the turn-1 floor, and by how much? Computes floor (#99) on each
+          side and diffs. A pure offline reader of sessions/; the daemon is not required.
+             --before <id>       the baseline session (required)
+             --after <id>        the tuned session (required)
+             --root <path>       capture root (default ./.ccsnoop)
+             --sessions-dir <p>  dir holding session subdirs (overrides --root)
+             --window <tokens>   context window for the headline % (default 200000)
+             --json              emit the versioned tuning-session contract (kind: tuning-session)`);
 }
 
 main().catch((err) => {
