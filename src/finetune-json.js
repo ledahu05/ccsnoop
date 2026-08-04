@@ -99,7 +99,7 @@ export function summarizeLevers({ deny, mcp, levers, gain }) {
  * @param {Map<string, { shipped: number, waste: number }>} toolMap
  * @returns {Map<string, { shipped: number, waste: number }>}
  */
-function sumMcpServerBytes(toolMap) {
+export function sumMcpServerBytes(toolMap) {
   /** @type {Map<string, { shipped: number, waste: number }>} */
   const acc = new Map();
   for (const [name, g] of toolMap) {
