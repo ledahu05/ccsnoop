@@ -23,6 +23,7 @@
 
 import { computeWaste, breakpointPositions } from './waste.js';
 import { resolveRoots, listSessions, pickLatestSession, loadExchanges, toAnalysisInput } from './report.js';
+import { escHtml, fmtNum } from './format.js';
 
 /** Default TTL threshold (cache spec AC #26): 1 h, the ttl Claude Code places. */
 export const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -1086,20 +1087,6 @@ const VERDICT_ORDER = /** @type {Verdict[]} */ (Object.freeze(['HIT', 'STRUCTURA
 const STRUCT_MODE_ORDER = /** @type {StructMode[]} */ (Object.freeze(['KEY', 'PREFIX', 'TRUNCATED']));
 
 /**
- * A number as a locale-stable, comma-grouped string (30874 → "30,874"; 18492.5 →
- * "18,492.5"). `toLocaleString` is avoided so the output is identical across Node
- * locales/icu builds — the renderer is asserted on for shape.
- * @param {number} n
- * @returns {string}
- */
-function fmtNum(n) {
-  const rounded = Math.round((Number(n) || 0) * 100) / 100;
-  const [int, dec] = String(rounded).split('.');
-  const grouped = int.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return dec ? `${grouped}.${dec}` : grouped;
-}
-
-/**
  * The per-tier multiplier breakdown in parens, shared by per-card `TokEquiv` (which
  * carries `components`) and rollup `CostTotal` (which carries `raw`). Tier-unknown mass
  * is priced as its `×1.25–×2` span and labelled — never a silent single number.
@@ -1271,18 +1258,6 @@ export function renderCache(diag, opts = {}) {
 
   const html = renderCacheHtml(diag, { sessionId, cards, hitCount });
   return { lines, html };
-}
-
-const HTML_ENTITIES = Object.freeze({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' });
-
-/**
- * Escape a value for HTML text/attribute context. Every interpolation into the document
- * goes through here — a session id is a directory name, i.e. attacker-shaped input.
- * @param {unknown} s
- * @returns {string}
- */
-function escHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => HTML_ENTITIES[c]);
 }
 
 /** @param {string} v */

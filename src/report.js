@@ -13,6 +13,7 @@ import zlib from 'node:zlib';
 
 import { computeWaste } from './waste.js';
 import { defaultHome } from './daemon.js';
+import { escHtml as escapeHtml } from './format.js';
 
 /**
  * @typedef {object} Usage
@@ -542,11 +543,6 @@ export function renderReport(model) {
 <script>${REPORT_JS}</script>
 </body>
 </html>`;
-}
-
-/** @param {string} s */
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
 
 const REPORT_CSS = `

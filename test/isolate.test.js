@@ -116,8 +116,10 @@ test('isolateAnalyze: recommends routing to subagents when isolation is a materi
   assert.ok(d.recommendation, 'a material isolation ratio fires a reco');
   assert.equal(d.recommendation.kind, 'route-to-subagent');
   assert.match(d.recommendation.text, /subagent/i);
-  // The reco carries the counterfactual so it is auditable, not a bare assertion.
-  assert.match(d.recommendation.text, /8720|6570|4\d{2}%|75%/);
+  // The reco carries the isolated total, the counterfactual and the share, so the claim
+  // is auditable rather than a bare assertion.
+  assert.match(d.recommendation.text, /3,000 of 4,000 prompt tokens/);
+  assert.match(d.recommendation.text, /isolated 75% of/);
 });
 
 test('isolateAnalyze: no reco when subagents isolate a trivial fraction (below threshold)', () => {
@@ -129,6 +131,28 @@ test('isolateAnalyze: no reco when subagents isolate a trivial fraction (below t
   assert.equal(d.hasSubagents, true);
   assert.ok(d.isolationRatio < DEFAULT_ISOLATION_THRESHOLD);
   assert.equal(d.recommendation, null);
+});
+
+test('isolateAnalyze: no reco when the subagent threads carried no measurable context', () => {
+  // A threshold of 0 makes every ratio "material" arithmetically — but a subagent whose
+  // turns have no usage isolated nothing, so claiming a payoff would be dishonest.
+  const d = isolateAnalyze([ex('main', null, usage({ input: 1000 })), ex('sub-a', 'main', null)], {
+    threshold: 0,
+  });
+  assert.equal(d.hasSubagents, true);
+  assert.equal(d.subagentTotal, 0);
+  assert.equal(d.recommendation, null);
+});
+
+test('isolateAnalyze: a threshold outside [0,1] is rejected, never silently honoured', () => {
+  const session = [ex('main', null, usage({ input: 10000 })), ex('sub-a', 'main', usage({ input: 1 }))];
+  // A nonsense threshold must not smuggle out a reco the user never asked for.
+  assert.throws(() => isolateAnalyze(session, { threshold: -5 }), RangeError);
+  assert.throws(() => isolateAnalyze(session, { threshold: 42 }), RangeError);
+  assert.throws(() => isolateAnalyze(session, { threshold: Number.NaN }), RangeError);
+  // The boundaries themselves are valid.
+  assert.doesNotThrow(() => isolateAnalyze(session, { threshold: 0 }));
+  assert.doesNotThrow(() => isolateAnalyze(session, { threshold: 1 }));
 });
 
 test('isolateAnalyze: threshold is configurable', () => {
@@ -172,6 +196,24 @@ test('isolateAnalyze: handles a subagent whose parent is itself a subagent (nest
   assert.equal(d.subagentTotal, 1500);
   assert.equal(d.mainTotal, 100);
   assert.equal(d.inlinedCounterfactual, 1600);
+});
+
+test('isolateAnalyze: a subagent thread stays a subagent when one turn lost its lineage metadata', () => {
+  // `deriveSession` (capture.js) yields a null parent whenever a turn's `metadata.user_id`
+  // is absent or unparseable. One such turn inside a subagent thread must not re-label the
+  // thread — and hand its isolated tokens to the main window.
+  const d = isolateAnalyze([
+    ex('main', null, usage({ input: 1000 })),
+    ex('sub-a', null, usage({ input: 5000 })), // metadata unparseable on this turn
+    ex('sub-a', 'main', usage({ input: 5000 })),
+  ]);
+  assert.equal(d.subagentCount, 1);
+  assert.equal(d.subagentTotal, 10000);
+  assert.equal(d.mainTotal, 1000);
+  const sub = d.threads.find((t) => t.threadId === 'sub-a');
+  assert.equal(sub.isSubagent, true);
+  assert.equal(sub.parentSessionId, 'main');
+  assert.equal(sub.exchanges, 2);
 });
 
 test('isolateAnalyze: exchanges with no threadId are bucketed, not dropped', () => {

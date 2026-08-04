@@ -25,6 +25,7 @@
 //   • Honest "none": a session with no subagent threads says so, and emits no reco.
 
 import { resolveRoots, listSessions, pickLatestSession, loadExchanges } from './report.js';
+import { escHtml, fmtNum } from './format.js';
 
 /**
  * Default isolation threshold (issue #102: "a material fraction"). A session whose
@@ -48,7 +49,7 @@ export const DEFAULT_ISOLATION_THRESHOLD = 0.25;
 
 /**
  * @typedef {object} IsolationDiagnostic
- * @property {string | null} mainThreadId   The (first) main thread id, or null if none present.
+ * @property {string | null} mainThreadId   The heaviest main thread's id (threads are token-sorted), or null if none present.
  * @property {ThreadTotals[]} threads       One entry per distinct threadId, sorted (main first, then subagents).
  * @property {number} mainTotal             Σ inputTokens over main threads (the actual main-only figure).
  * @property {number} subagentTotal         Σ inputTokens over subagent threads (the isolated context).
@@ -59,18 +60,23 @@ export const DEFAULT_ISOLATION_THRESHOLD = 0.25;
  * @property {{ kind: 'route-to-subagent', text: string } | null} recommendation  Fires when isolation is material.
  */
 
+/** A captured count, or 0 — never an estimate. */
+function count(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
 /**
- * The prompt footprint of one exchange's `usage` — input + cacheRead + cacheCreation
- * (the disjoint parts of a single turn's prompt). Never estimates; null usage ⇒ 0.
+ * The prompt footprint of one exchange's `usage`, split into its disjoint parts —
+ * input + cacheRead + cacheCreation. Never estimates; null usage ⇒ all zero.
  * @param {Usage | null | undefined} u
- * @returns {{ prompt: number, input: number, cacheRead: number, cacheCreation: number }}
+ * @returns {{ input: number, cacheRead: number, cacheCreation: number }}
  */
 function promptFootprint(u) {
-  const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-  const input = n(u?.inputTokens);
-  const cacheRead = n(u?.cacheReadInputTokens);
-  const cacheCreation = n(u?.cacheCreationInputTokens);
-  return { prompt: input + cacheRead + cacheCreation, input, cacheRead, cacheCreation };
+  return {
+    input: count(u?.inputTokens),
+    cacheRead: count(u?.cacheReadInputTokens),
+    cacheCreation: count(u?.cacheCreationInputTokens),
+  };
 }
 
 /**
@@ -83,14 +89,26 @@ function promptFootprint(u) {
  * @param {Array<{ threadId: string | null, parentSessionId: string | null, usage: Usage | null, requestBytes?: number }>} exchanges
  * @param {{ threshold?: number }} [opts]
  * @returns {IsolationDiagnostic}
+ * @throws {RangeError} when `threshold` is given but is not a fraction in [0, 1].
  */
 export function isolateAnalyze(exchanges, opts = {}) {
-  const threshold = typeof opts.threshold === 'number' && Number.isFinite(opts.threshold) ? opts.threshold : DEFAULT_ISOLATION_THRESHOLD;
+  let threshold = DEFAULT_ISOLATION_THRESHOLD;
+  if (opts.threshold !== undefined) {
+    if (typeof opts.threshold !== 'number' || !Number.isFinite(opts.threshold) || opts.threshold < 0 || opts.threshold > 1) {
+      throw new RangeError(`threshold expects a fraction in [0, 1], got ${JSON.stringify(opts.threshold)}`);
+    }
+    threshold = opts.threshold;
+  }
   const list = Array.isArray(exchanges) ? exchanges : [];
 
   // Group by threadId (null bucketed under a stable sentinel). The subagent flag is
   // derived from parentSessionId — never from the id string — so a subagent whose id
   // happens to look "main-like" is still classified correctly.
+  //
+  // A thread is a subagent if ANY of its exchanges carries a parentSessionId, not just
+  // the first: `deriveSession` (capture.js) yields a null parent whenever a turn's
+  // `metadata.user_id` is absent or unparseable, so one such turn inside a subagent
+  // thread would otherwise re-label the whole thread — and its tokens — as main.
   /** @type {Map<string, { threadId: string, parentSessionId: string | null, exchanges: number, input: number, cacheRead: number, cacheCreation: number, requestBytes: number }>} */
   const byThread = new Map();
   const NULL_KEY = '(no thread id)';
@@ -98,15 +116,16 @@ export function isolateAnalyze(exchanges, opts = {}) {
     const key = e.threadId ?? NULL_KEY;
     let agg = byThread.get(key);
     if (!agg) {
-      agg = { threadId: e.threadId ?? NULL_KEY, parentSessionId: e.parentSessionId ?? null, exchanges: 0, input: 0, cacheRead: 0, cacheCreation: 0, requestBytes: 0 };
+      agg = { threadId: e.threadId ?? NULL_KEY, parentSessionId: null, exchanges: 0, input: 0, cacheRead: 0, cacheCreation: 0, requestBytes: 0 };
       byThread.set(key, agg);
     }
+    agg.parentSessionId ??= e.parentSessionId ?? null;
     agg.exchanges += 1;
     const fp = promptFootprint(e.usage);
     agg.input += fp.input;
     agg.cacheRead += fp.cacheRead;
     agg.cacheCreation += fp.cacheCreation;
-    agg.requestBytes += typeof e.requestBytes === 'number' && Number.isFinite(e.requestBytes) ? e.requestBytes : 0;
+    agg.requestBytes += count(e.requestBytes);
   }
 
   /** @type {ThreadTotals[]} */
@@ -132,9 +151,12 @@ export function isolateAnalyze(exchanges, opts = {}) {
   const inlinedCounterfactual = mainTotal + subagentTotal;
   const isolationRatio = inlinedCounterfactual > 0 ? subagentTotal / inlinedCounterfactual : null;
 
+  // Reco only on a real, measured payoff: subagent threads that actually carried context
+  // (`subagentTotal > 0`) whose share is at least the materiality threshold. Without the
+  // token guard a threshold of 0 would claim "isolated 0% of the inlinable context".
   /** @type {{ kind: 'route-to-subagent', text: string } | null} */
   let recommendation = null;
-  if (subThreads.length > 0 && isolationRatio != null && isolationRatio >= threshold) {
+  if (subagentTotal > 0 && isolationRatio != null && isolationRatio >= threshold) {
     recommendation = {
       kind: 'route-to-subagent',
       text:
@@ -159,21 +181,15 @@ export function isolateAnalyze(exchanges, opts = {}) {
 
 // ── formatting helpers (shared by the text + HTML renderers) ─────────────────
 
-/** Thousands-separated integer. */
+/** A token count as a comma-grouped integer, via the locale-stable shared formatter. */
 function fmt(n) {
-  return Math.round(n).toLocaleString('en-US');
+  return fmtNum(Math.round(n));
 }
 
 /** A percentage like "75%" (one decimal only when it is not a round number). */
 function fmtPct(r) {
   const pct = r * 100;
   return (Math.round(pct) === pct ? pct.toFixed(0) : pct.toFixed(1)) + '%';
-}
-
-const HTML_ENTITIES = Object.freeze({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' });
-/** Escape a value for HTML text/attribute context (a thread id is attacker-shaped input). */
-function escHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => HTML_ENTITIES[c]);
 }
 
 /**
@@ -199,7 +215,8 @@ export function renderIsolate(d, opts = {}) {
   } else {
     lines.push('per-thread input tokens (prompt: input + cache-read + cache-creation):');
     for (const t of d.threads) {
-      const tag = t.isSubagent ? 'subagent' : 'main';
+      // Padded to the widest label so the thread ids line up into a readable column.
+      const tag = (t.isSubagent ? 'subagent' : 'main').padEnd('subagent'.length);
       const parent = t.isSubagent ? ` ← ${t.parentSessionId}` : '';
       lines.push(
         `  ${tag}  ${t.threadId}${parent}  · ${t.exchanges} exch · ${fmt(t.inputTokens)} tok ` +
