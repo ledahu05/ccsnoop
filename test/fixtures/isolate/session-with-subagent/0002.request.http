@@ -1,0 +1,5 @@
+POST /v1/messages HTTP/1.1
+Content-Type: application/json
+Host: api.anthropic.com
+
+{"model":"claude-x","max_tokens":1024,"messages":[{"role":"user","content":"q"}]}

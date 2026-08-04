@@ -1,0 +1,2 @@
+{"turn":1,"thread_id":"ccsnoop-solo-cccc3333","parent_session_id":null,"request_blob":"0001.request.http","response_blob":"0001.response.sse","request_received_at":"2026-08-04T11:00:00Z","response_completed_at":"2026-08-04T11:00:01Z"}
+{"turn":2,"thread_id":"ccsnoop-solo-cccc3333","parent_session_id":null,"request_blob":"0002.request.http","response_blob":"0002.response.sse","request_received_at":"2026-08-04T11:00:05Z","response_completed_at":"2026-08-04T11:00:06Z"}
