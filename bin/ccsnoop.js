@@ -2,6 +2,8 @@
 // ccsnoop — single CLI entrypoint with argv-subcommand dispatch.
 // Live: init (spec §3.2) + start / stop / status (daemon lifecycle, §3.4) + report (§3.5).
 
+import fs from 'node:fs';
+
 import { start } from '../src/proxy.js';
 import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
@@ -11,8 +13,9 @@ import { floor } from '../src/floor.js';
 import { lifetime } from '../src/lifetime.js';
 import { isolate } from '../src/isolate.js';
 import { init, undoAllRoutes } from '../src/init.js';
+import { apply } from '../src/apply.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate', 'apply'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -49,6 +52,7 @@ async function main() {
   if (sub === 'floor') return runFloor(args);
   if (sub === 'lifetime') return runLifetime(args);
   if (sub === 'isolate') return runIsolate(args);
+  if (sub === 'apply') return runApply(args);
 }
 
 /**
@@ -253,6 +257,51 @@ function runFineTune(args) {
 }
 
 /**
+ * `apply` — the tiered-apply glue (issue #98, ADR-0004). Consumes a
+ * `fine-tune --json` report and turns its lever verdicts into action: presents
+ * a diff of the proposed safe-subset `settings.json` changes, then on `--yes`
+ * writes ONLY the safe subset (`permissions.deny`, `disabledMcpjsonServers`)
+ * via an idempotent read-modify-write merge. The advice levers (hooks,
+ * CLAUDE.md) are emitted as a paste-only block — never written. A restart
+ * reminder follows any write.
+ *
+ * Input: `--from <file|->` reads a captured report (file or `-` = stdin);
+ * without `--from`, runs `fine-tune` in-process on the capture (`--root` /
+ * `--sessions-dir` / `--session` resolve it, mirroring {@link runFineTune}).
+ * `--dry-run` prints the diff without writing; `--yes` approves the write;
+ * `--settings <path>` overrides the default `<cwd>/.claude/settings.json`.
+ * @param {string[]} args
+ */
+function runApply(args) {
+  const from = getFlag(args, '--from');
+  let report;
+  if (from !== undefined) {
+    const raw = from === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(from, 'utf8');
+    report = JSON.parse(raw);
+  } else {
+    // No captured report given — produce the contract in-process from a capture,
+    // the way the skill (#97) drives the loop: diagnose, then apply.
+    report = fineTune({
+      cwd: process.cwd(),
+      root: getFlag(args, '--root'),
+      sessionsDir: getFlag(args, '--sessions-dir'),
+      session: getFlag(args, '--session'),
+      latest: hasFlag(args, '--latest'),
+      all: hasFlag(args, '--all'),
+    }).json;
+  }
+  const result = apply({
+    report,
+    approved: hasFlag(args, '--yes'),
+    dryRun: hasFlag(args, '--dry-run'),
+    cwd: process.cwd(),
+    settingsFile: getFlag(args, '--settings'),
+  });
+  for (const line of result.lines) console.log(line);
+  process.exit(result.exitCode);
+}
+
+/**
  * `cache` — the cache-economy diagnostic (cache spec §6 / issue #87). One session: for
  * each turn where a cached prefix went cold, a per-transition card (turn → verdict →
  * cause → cost → reco) plus a lean session rollup. Text by default; `--html` renders the
@@ -450,6 +499,15 @@ Commands:
              --deny-allow <a>     drop a denylist name for this run only
              --json               emit the versioned tuning-report contract (issue #95)
              --include-tokens     with --json, backfill primary-session token totals
+  apply   Apply a fine-tune report's SAFE subset to .claude/settings.json (issue #98,
+          ADR-0004). Presents a diff; writes only on --yes; advice levers are paste-only.
+             --from <path|->     consume a captured report (file, or - for stdin)
+             --root <path>       without --from, diagnose this capture root (default ./.ccsnoop)
+             --sessions-dir <p>  without --from, dir holding session subdirs (overrides --root)
+             --session <id>      without --from, the session to diagnose (default: latest)
+             --yes               approve the safe-subset write (else diff-only)
+             --dry-run           print the diff without writing
+             --settings <path>   override the target settings.json (default ./.claude/settings.json)
   cache   Cache-economy diagnostic for one captured session (per-transition cards + rollup)
              --root <path>        capture root (default ./.ccsnoop)
              --sessions-dir <p>   dir holding session subdirs (overrides --root)

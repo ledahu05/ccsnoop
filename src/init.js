@@ -50,11 +50,14 @@ export function gitTopLevel(cwd) {
 /**
  * Strict-JSON read: parse `file` or return `fallback` when it is absent. A file
  * that exists but is *not* strict JSON throws — init never clobbers a settings
- * file it cannot understand (§3.2).
+ * file it cannot understand (§3.2). Exported so other modules reuse the same
+ * discipline; `ErrorCtor` defaults to {@link InitError} but `apply` passes its
+ * own {@link module:apply.ApplyError} so a refusal surfaces under the right name.
  * @param {string} file
  * @param {any} fallback
+ * @param {new (message?: string) => Error} [ErrorCtor]
  */
-function readJsonStrict(file, fallback) {
+export function readJsonStrict(file, fallback, ErrorCtor = InitError) {
   let raw;
   try {
     raw = fs.readFileSync(file, 'utf8');
@@ -64,12 +67,18 @@ function readJsonStrict(file, fallback) {
   try {
     return JSON.parse(raw);
   } catch (err) {
-    throw new InitError(`${file} is not valid JSON — refusing to overwrite it (${/** @type {Error} */ (err).message})`);
+    throw new ErrorCtor(`${file} is not valid JSON — refusing to overwrite it (${/** @type {Error} */ (err).message})`);
   }
 }
 
-/** Pretty-print `obj` to `file` (trailing newline), creating parent dirs. */
-function writeJson(file, obj) {
+/**
+ * Pretty-print `obj` to `file` (trailing newline), creating parent dirs. Exported
+ * so {@link module:apply.safeMergeSettings} writes with init's exact formatting
+ * (the strict read-modify-write pattern is one shared helper, not two copies).
+ * @param {string} file
+ * @param {any} obj
+ */
+export function writeJson(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(obj, null, 2) + '\n');
 }

@@ -175,6 +175,16 @@ Commands:
              --all                widen discovery across ~/.ccsnoop/routes.json
              --deny-extra <a,b>   add denylist names for this run only
              --deny-allow <a>     drop a denylist name for this run only
+             --json               emit the versioned tuning-report contract (issue #95)
+  apply   Apply a fine-tune report's SAFE subset to .claude/settings.json (#98, ADR-0004).
+          Presents a diff; writes only on --yes; advice levers (hooks, CLAUDE.md) are paste-only.
+             --from <path|->     consume a captured report (file, or - for stdin)
+             --root <path>       without --from, diagnose this capture root (default ./.ccsnoop)
+             --sessions-dir <p>  without --from, dir holding session subdirs (overrides --root)
+             --session <id>      without --from, the session to diagnose (default: latest)
+             --yes               approve the safe-subset write (else diff-only)
+             --dry-run           print the diff without writing
+             --settings <path>   override the target settings.json (default ./.claude/settings.json)
   cache   Cache-economy diagnostic for one captured session (per-transition cards + rollup)
              --root <path>        capture root (default ./.ccsnoop)
              --sessions-dir <p>   dir holding session subdirs (overrides --root)
