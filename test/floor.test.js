@@ -199,6 +199,53 @@ test('computeFloor is null-safe on an empty model', () => {
   assert.deepEqual(f.attribution, []);
 });
 
+test('computeFloor falls back to the default window on an unusable override — never a NaN %', () => {
+  const { model } = synthModel();
+  // A caller passing garbage (0, negative, NaN, a numeric STRING) must not produce a
+  // NaN/Infinity percentage; the conservative 200k default stands and is reported.
+  for (const windowTokens of [0, -5, NaN, Infinity, /** @type {any} */ ('6000'), null]) {
+    const f = computeFloor(model, { windowTokens });
+    assert.equal(f.windowTokens, DEFAULT_WINDOW_TOKENS, `window for ${String(windowTokens)}`);
+    assert.equal(f.headline.pctOfWindow, 2);
+  }
+});
+
+test('computeFloor reports a real zero-token headline, not "no usage"', () => {
+  // usage captured but every component 0 — distinct from usage absent (tokens null).
+  const f = computeFloor({
+    sessionId: 's',
+    exchanges: [{ usage: { inputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } }],
+  });
+  assert.equal(f.headline.tokens, 0, 'zero real tokens is a measurement, not a gap');
+  assert.equal(f.headline.pctOfWindow, 0);
+  assert.match(renderFloor(f).lines.join('\n'), /floor: 0 tokens/);
+});
+
+test('computeFloor attributes each CLAUDE.md source separately; a source-less one reads as managed', () => {
+  const withPath = 'Contents of ./a/CLAUDE.md (project instructions)' + 'A'.repeat(50);
+  const managed = 'CCSNOOP-BENCH-SENTINEL-CLAUDEMD-abc123 policy text' + 'B'.repeat(10);
+  const requestBlob = buildRequestBlob({
+    method: 'POST',
+    url: '/v1/messages',
+    rawHeaders: ['Content-Type', 'application/json'],
+    body: Buffer.from(
+      JSON.stringify({
+        system: [{ type: 'text', text: withPath }, { type: 'text', text: managed }],
+        messages: [],
+      })
+    ),
+  });
+  const f = computeFloor({ sessionId: 's', exchanges: [{ turn: 1, requestBlob, segments: [] }] });
+  const md = f.attribution.filter((a) => a.kind === 'claude-md');
+  assert.deepEqual(
+    md.map((a) => a.detail).sort(),
+    ['./a/CLAUDE.md', null],
+    'one block per source; no path → null detail'
+  );
+  assert.equal(md.find((a) => a.detail === null).bytes, txtBytes(managed));
+  assert.match(renderFloor(f).lines.join('\n'), /CLAUDE\.md \(managed\)/);
+});
+
 // ── renderFloor: text output ───────────────────────────────────────────────────
 
 test('renderFloor leads with the real token headline and labels the byte proxy', () => {
@@ -236,6 +283,33 @@ test('renderFloor: with no usage, headline is byte-proxy only and still renders'
   const out = lines.join('\n');
   assert.match(out, /proxy/i);
   assert.doesNotMatch(out, /%\s+of\s+a\s+\d.*window/, 'no window % when there are no real tokens');
+});
+
+test('renderFloor: nothing attributed says so instead of claiming 100% of zero bytes', () => {
+  // Reachable for real: a turn-1 request whose body never parsed (an aborted capture)
+  // still has usage tokens, but no static block can be attributed.
+  const f = computeFloor({ sessionId: 's', exchanges: [{ turn: 1, usage: { inputTokens: 9 }, requestBlob: 'junk' }] });
+  const out = renderFloor(f).lines.join('\n');
+  assert.match(out, /nothing attributed/i, 'the empty floor is named');
+  assert.doesNotMatch(out, /100%/, 'no bogus 100%-of-nothing total row');
+  assert.match(out, /floor: 9 tokens/, 'the real token headline still reports');
+});
+
+test('renderFloor: the table header, rules and rows all share one column layout', () => {
+  const { model } = synthModel();
+  const { lines } = renderFloor(computeFloor(model));
+  // The table starts at the header row and runs to the end; every line in it is one
+  // formatted row, so a misaligned header or total shows up as a differing width.
+  const start = lines.findIndex((l) => /^\s+block\s+bytes/.test(l));
+  assert.ok(start > -1, 'header row found');
+  const widths = new Set(lines.slice(start).map((l) => [...l].length));
+  assert.equal(widths.size, 1, `table rows differ in width: ${[...widths].join(', ')}`);
+});
+
+test('renderFloor omits the model line when the capture carried no model name', () => {
+  const f = computeFloor({ sessionId: 's', exchanges: [] });
+  assert.equal(f.model, null);
+  assert.ok(!renderFloor(f).lines.some((l) => l.startsWith('model:')));
 });
 
 // ── floor() end-to-end + CLI dispatch (self-activating fixture gate) ───────────
@@ -291,6 +365,37 @@ test('floor() resolves a session dir and reports turn-1 tokens + tools', () => {
 test('floor() throws on no captured sessions (mirrors report / fine-tune / cache)', () => {
   const root = mkTmpDir();
   assert.throws(() => floor({ cwd: '/nonexistent', root }), /no captured sessions found/);
+});
+
+test('floor() throws naming the available sessions when --session does not match', () => {
+  const root = mkTmpDir();
+  writeSession(path.join(root, 'sessions', 'real'), 'real', [{ name: 'Bash' }], { input_tokens: 1 });
+  assert.throws(
+    () => floor({ cwd: '/nonexistent', root, session: 'typo' }),
+    /session 'typo' not found \(have: real\)/
+  );
+});
+
+test('floor() defaults to the most-recent session when none is named', () => {
+  const root = mkTmpDir();
+  writeSession(path.join(root, 'sessions', 'older'), 'older', [{ name: 'Bash' }], { input_tokens: 10 });
+  const newer = writeSession(path.join(root, 'sessions', 'newer'), 'newer', [{ name: 'Bash' }], { input_tokens: 20 });
+  // mtime resolution is coarse; make the intended winner unambiguously newer.
+  const future = new Date(Date.now() + 60_000);
+  fs.utimesSync(newer, future, future);
+  assert.equal(floor({ cwd: '/nonexistent', root }).sessionId, 'newer');
+});
+
+test('ccsnoop floor rejects an unusable --window rather than silently scoring 200k', () => {
+  const sessionsDir = mkTmpDir();
+  writeSession(path.join(sessionsDir, 'w'), 'w', [{ name: 'Bash' }], { input_tokens: 100 });
+  for (const bad of ['abc', '0', '-1', '']) {
+    const r = spawnSync(process.execPath, [BIN, 'floor', '--sessions-dir', sessionsDir, '--window', bad], {
+      encoding: 'utf8',
+    });
+    assert.notEqual(r.status, 0, `--window '${bad}' should fail`);
+    assert.match(r.stderr, /--window expects a positive number of tokens/);
+  }
 });
 
 test('ccsnoop floor --sessions-dir prints the headline + ranked breakdown (exit 0)', () => {

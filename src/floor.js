@@ -138,7 +138,8 @@ export function computeFloor(model, opts = {}) {
   const cacheCreationInputTokens = u?.cacheCreationInputTokens ?? 0;
   const cacheReadInputTokens = u?.cacheReadInputTokens ?? 0;
   const tokens = hasUsage ? inputTokens + cacheCreationInputTokens + cacheReadInputTokens : null;
-  const pctOfWindow = hasUsage && windowTokens > 0 ? Math.round((tokens / windowTokens) * 100) : null;
+  // `windowTokens` is positive by construction above, so tokens is the only null case.
+  const pctOfWindow = tokens === null ? null : Math.round((tokens / windowTokens) * 100);
 
   // ── per-block attribution: one block per contributor, then rank by byte cost ─
   /** @type {{ kind: FloorBlock['kind'], label: string, detail: string | null, bytes: number }[]} */
@@ -214,9 +215,27 @@ function blockLabel(a) {
   }
 }
 
-/** Column widths of the per-block table; the header and every row share them. */
-const COL = { block: 42, bytes: 9, pct: 5 };
+/**
+ * Column widths of the per-block table; the header and every row share them. A row's
+ * percent cell is `pct` wide plus its trailing `%`, so the header cell — which has no
+ * `%` of its own — is padded to `pct + 1` to line up with it.
+ */
+const COL = { block: 42, bytes: 9, pct: 6 };
 const RULE = '─'.repeat(COL.block + 1 + COL.bytes + 2 + COL.pct + 1);
+
+/**
+ * One line of the per-block table in the shared columns: the block label, its
+ * right-aligned byte cell, and its right-aligned percent cell (rendered without the
+ * trailing `%` for the header). Cells are pre-rendered strings so the same formatter
+ * lays out the header, every block row and the total.
+ * @param {string} block
+ * @param {string} bytesCell
+ * @param {string} pctCell
+ * @returns {string}
+ */
+function tableRow(block, bytesCell, pctCell) {
+  return `  ${block.padEnd(COL.block)} ${bytesCell.padStart(COL.bytes)}  ${pctCell.padStart(COL.pct + 1)}`;
+}
 
 /**
  * Render a floor context as CLI text: the headline (real tokens + % of the window,
@@ -252,15 +271,20 @@ export function renderFloor(ctx) {
 
   // Per-block attribution, ranked by byte cost.
   lines.push('Per-block attribution — ranked by byte cost (proxy)');
-  lines.push(`  ${'block'.padEnd(COL.block)} ${'bytes'.padStart(COL.bytes)}  ${'% floor'.padStart(COL.pct)}`);
+  lines.push(tableRow('block', 'bytes', '% floor'));
   lines.push(`  ${RULE}`);
-  for (const a of ctx.attribution) {
-    lines.push(
-      `  ${blockLabel(a).padEnd(COL.block)} ${fmtBytes(a.bytes).padStart(COL.bytes)}  ${String(a.pctOfFloor).padStart(COL.pct)}%`
-    );
+  if (ctx.attribution.length === 0) {
+    // No blocks to rank — an empty session, or a turn-1 request whose body did not
+    // parse (an aborted capture). Say so rather than printing a "100% of 0" total.
+    lines.push('  (nothing attributed — no turn-1 request body was captured)');
   }
-  lines.push(`  ${RULE}`);
-  lines.push(`  ${'total'.padEnd(COL.block)} ${fmtBytes(ctx.totalBytes).padStart(COL.bytes)}  ${'100'.padStart(COL.pct)}%`);
+  for (const a of ctx.attribution) {
+    lines.push(tableRow(blockLabel(a), fmtBytes(a.bytes), `${a.pctOfFloor}%`));
+  }
+  if (ctx.attribution.length > 0) {
+    lines.push(`  ${RULE}`);
+    lines.push(tableRow('total', fmtBytes(ctx.totalBytes), '100%'));
+  }
   return { lines };
 }
 
