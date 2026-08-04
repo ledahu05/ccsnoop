@@ -24,7 +24,7 @@ import { chargeExchange, computeGain, EMPTY_GAIN, NULL_SOURCE } from '../src/fin
 import { canonicalize } from '../src/waste.js';
 import { buildRequestBlob } from '../src/capture.js';
 import { fineTune, renderFineTune } from '../src/finetune.js';
-import { buildLeverVerdicts, NULL_SOURCE as LEVERS_NULL_SOURCE } from '../src/finetune-levers.js';
+import { buildLeverVerdicts, NULL_SOURCE as LEVERS_NULL_SOURCE, EMPTY_LEVER_VERDICTS } from '../src/finetune-levers.js';
 
 const FIXTURES_DIR = fileURLToPath(new URL('./fixtures/finetune', import.meta.url));
 
@@ -496,4 +496,199 @@ test('no source file carries a raw NUL byte — git would treat the module as bi
     const buf = fs.readFileSync(path.join(srcDir, name));
     assert.ok(!buf.includes(0), `src/${name} contains a raw NUL byte`);
   }
+});
+
+// ── issue #100: byte-cost ranking of ALL tools / per-server MCP / CLAUDE.md ────
+//
+// The action table above rows only the *recoverable* levers (denied tools, the MCP
+// listing, hooks, CLAUDE.md, harness). The ranking exposes EVERY shipped tool / MCP
+// server (aggregated per-server from mcp__<server>__*) / CLAUDE.md source, sorted by
+// shipped bytes — so a maintainer can weigh a cut even when a tool is only sometimes
+// used and is therefore not in the deny intersection. It reuses the gain model's
+// already-computed bytes (no new accounting, never re-tokenized) and is always-on.
+
+test('byte-cost ranking lists every shipped tool (not only denied), per-server MCP, and CLAUDE.md — sorted by shipped', () => {
+  // Three built-in tools (only Workflow is denied), two MCP tool defs on one server
+  // (summed per server), and one CLAUDE.md source. The ranking must surface ALL of
+  // them — Bash and Read are not denied, proving the view is not the deny intersection.
+  const gain = {
+    tool: new Map([
+      ['Bash', { shipped: 5000, waste: 1000 }],
+      ['Workflow', { shipped: 4000, waste: 0 }],
+      ['Read', { shipped: 800, waste: 0 }],
+      ['mcp__stub__one', { shipped: 1200, waste: 0 }],
+      ['mcp__stub__two', { shipped: 800, waste: 0 }],
+    ]),
+    claudeMd: new Map([['./CLAUDE.md', { shipped: 1500, waste: 0 }]]),
+    hook: { shipped: 0, waste: 0 },
+    mcp: { shipped: 0, waste: 0 },
+    harness: { shipped: 0, waste: 0 },
+  };
+  const levers = {
+    systemBytes: 12000,
+    hook: { bytes: 0, aboveFloor: false, deny: false },
+    claudeMd: [{ source: './CLAUDE.md', bytes: 1500, pct: 12, excludable: true, deny: false }],
+  };
+  const { lines } = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: ['Bash', 'Workflow', 'Read', 'mcp__stub__one', 'mcp__stub__two'],
+    deny: ['Workflow'], // the only shipped tool on the built-in denylist
+    mcp: { sessionCount: 1, singleSession: true, servers: [{ name: 'stub', shippedSessions: 1, calledCount: 0, deny: false }] },
+    levers,
+    gain,
+  });
+  const joined = lines.join('\n');
+
+  // The ranking section is present.
+  assert.ok(/Byte-cost ranking/.test(joined), joined);
+
+  // ALL shipped built-in tools appear — Bash and Read are NOT denied, so their presence
+  // proves the ranking is not limited to the deny intersection.
+  const bashI = lines.findIndex((l) => /^  tool Bash\b/.test(l));
+  const wfI = lines.findIndex((l) => /^  tool Workflow\b/.test(l));
+  const stubI = lines.findIndex((l) => /^  MCP stub\b/.test(l));
+  const mdI = lines.findIndex((l) => /^  CLAUDE\.md \.\/CLAUDE\.md/.test(l));
+  const readI = lines.findIndex((l) => /^  tool Read\b/.test(l));
+  assert.ok([bashI, wfI, stubI, mdI, readI].every((i) => i >= 0), 'all five ranked entries present');
+  // Ranked by shipped bytes desc: Bash(5000) > Workflow(4000) > stub(2000) > CLAUDE.md(1500) > Read(800).
+  assert.ok(bashI < wfI && wfI < stubI && stubI < mdI && mdI < readI, 'entries in shipped-desc order');
+
+  // Per-server MCP bytes SUMMED: stub = 1200 + 800 = 2000 = 2.0K, with the tool count.
+  assert.ok(/^  MCP stub\s+2\.0K\s+0\s+2 tools$/m.test(joined), 'per-server MCP bytes sum correctly (2000) with tool count');
+  // CLAUDE.md source carries its % of the system context.
+  assert.ok(/^  CLAUDE\.md \.\/CLAUDE\.md\s+1\.5K\s+0\s+12% of system$/m.test(joined), 'CLAUDE.md ranked with % of system');
+  // The denied tool is marked; a non-denied tool is not.
+  assert.ok(/^  tool Workflow\s+3\.9K\s+0\s+deny$/m.test(joined), 'denied tool is marked in the ranking');
+  assert.ok(/^  tool Bash\s+4\.9K\s+1000$/m.test(joined), 'a non-denied tool carries no deny mark');
+});
+
+/** The ranked rows of a rendered diagnostic — every line between the rule and the blank. */
+function rankingRows(lines) {
+  const rule = lines.findIndex((l) => /^  ─+$/.test(l));
+  if (rule < 0) return [];
+  const rows = [];
+  for (let i = rule + 1; i < lines.length && lines[i] !== ''; i++) rows.push(lines[i]);
+  return rows;
+}
+
+/**
+ * A one-CLAUDE.md-source ctx for {@link renderFineTune}, parameterised by tool map +
+ * source. `shipped` defaults to the tool map's names (the by-construction case).
+ * @param {{ tool: Map<string, { shipped: number, waste: number }>, source?: string,
+ *   shipped?: string[], deny?: string[], servers?: any[] }} opts
+ */
+function rankCtx({ tool, source = './CLAUDE.md', shipped, deny = [], servers = [] }) {
+  return {
+    sessionId: 's',
+    requests: 1,
+    shipped: shipped ?? [...tool.keys()],
+    deny,
+    mcp: { sessionCount: 1, singleSession: true, servers },
+    levers: {
+      systemBytes: 12000,
+      hook: { bytes: 0, aboveFloor: false, deny: false },
+      claudeMd: [{ source, bytes: 1500, pct: 12, excludable: true, deny: false }],
+    },
+    gain: {
+      tool,
+      claudeMd: new Map([[source, { shipped: 1500, waste: 0 }]]),
+      hook: { shipped: 0, waste: 0 },
+      mcp: { shipped: 0, waste: 0 },
+      harness: { shipped: 0, waste: 0 },
+    },
+  };
+}
+
+test('byte-cost ranking keeps its columns aligned when an entry label overflows', () => {
+  // A real CLAUDE.md source is an absolute path — longer than the entry column. An
+  // over-long label must not shove the byte columns right, or the ranking stops being
+  // scannable exactly on the rows a maintainer most wants to compare.
+  const source = '/home/agent/workspace/deeply/nested/project/CLAUDE.md';
+  const { lines } = renderFineTune(rankCtx({ tool: new Map([['Bash', { shipped: 5000, waste: 1000 }]]), source }));
+  const rows = rankingRows(lines);
+  assert.equal(rows.length, 2, `one tool row + one CLAUDE.md row:\n${lines.join('\n')}`);
+  // Each row: 2-space indent, a fixed-width entry field, then the right-aligned bytes.
+  // An overflowing label pushes the figures right and fails this.
+  for (const row of rows) {
+    assert.match(row, /^ {2}.{36} {1,7}[\d.KM]+ {2}/, `row keeps the byte columns aligned: ${JSON.stringify(row)}`);
+  }
+  // The elided label still ends in the basename — the part that identifies the source.
+  const mdRow = rows.find((r) => /^ {2}CLAUDE\.md/.test(r)) ?? '';
+  assert.match(mdRow, /CLAUDE\.md\s/, `elided source keeps its basename: ${JSON.stringify(mdRow)}`);
+});
+
+test('byte-cost ranking ranks a shipped tool the gain model never charged (0 bytes, still listed)', () => {
+  // The tools lever's JSON items deliberately union `shipped` with the gain model's
+  // names so a shipped name can never vanish from the view that claims to list it
+  // (issue #95). The ranking claims to list EVERY shipped tool — same contract.
+  const { lines } = renderFineTune(
+    rankCtx({ tool: new Map([['Bash', { shipped: 5000, waste: 0 }]]), shipped: ['Bash', 'Uncharged'] })
+  );
+  assert.ok(
+    lines.some((l) => /^ {2}tool Uncharged\s+0\s+0$/.test(l)),
+    `a shipped-but-uncharged tool is ranked at 0 bytes:\n${lines.join('\n')}`
+  );
+});
+
+test('byte-cost ranking never drops a tool whose name only looks like an MCP name', () => {
+  // `mcp__lonely` has the mcp__ prefix but no `__<tool>` suffix, so it names no server.
+  // It is still a shipped tool costing bytes — it must be ranked, not silently dropped
+  // between the built-in branch and the per-server aggregate.
+  const { lines } = renderFineTune(
+    rankCtx({ tool: new Map([['mcp__lonely', { shipped: 4000, waste: 100 }]]) })
+  );
+  assert.ok(
+    lines.some((l) => /^ {2}tool mcp__lonely\s+3\.9K\s+100$/.test(l)),
+    `an unparseable mcp__ name is ranked as a tool:\n${lines.join('\n')}`
+  );
+});
+
+test('byte-cost ranking is omitted when nothing was captured to rank (no empty table)', () => {
+  // An EMPTY gain + empty levers (e.g. a session whose body never parsed) must not
+  // print a bare header with no rows. The whole section is absent.
+  const { lines } = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: EMPTY_GAIN,
+  });
+  assert.ok(!lines.some((l) => /Byte-cost ranking/.test(l)), 'no ranking section for an empty session');
+});
+
+test('fineTune end-to-end: a session shipping an mcp__<server>__* tool ranks it per-server', () => {
+  // A synthetic session (the "known tool set incl. ≥1 mcp__<server>__*" case) proving
+  // the wiring: the gain model carries the MCP tool def, and the ranking aggregates it
+  // per server — alongside every shipped built-in tool, denied ones marked.
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'rank');
+  fs.mkdirSync(dir, { recursive: true });
+  const body = {
+    model: 'claude-x',
+    system: [{ type: 'text', text: 'system prompt' }],
+    tools: [
+      { name: 'Bash' },
+      { name: 'Workflow' }, // on the built-in denylist → denied
+      { name: 'mcp__stub__t00' }, // an MCP tool def — aggregated per server in the ranking
+    ],
+    messages: [{ role: 'user', content: 'hi' }],
+  };
+  fs.writeFileSync(path.join(dir, '0001.request.http'), httpBody(body));
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), coldResponse());
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, thread_id: 'rank', request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
+  );
+  const res = fineTune({ cwd: '/nonexistent', root, session: 'rank' });
+  const joined = res.lines.join('\n');
+  // The gain model carried the MCP tool def under its mcp__ name.
+  assert.ok(res.gain.tool.has('mcp__stub__t00'), 'gain.tool carries the MCP tool def');
+  // The ranking aggregates it per server and lists the built-in tools too.
+  assert.ok(/Byte-cost ranking/.test(joined), 'ranking section present');
+  assert.ok(/^  MCP stub\b/m.test(joined), 'per-server MCP row present');
+  assert.ok(/^  tool Bash\b/m.test(joined), 'built-in tool Bash ranked (not only denied)');
+  assert.ok(/^  tool Workflow\b.*deny$/m.test(joined), 'denied tool marked');
 });
