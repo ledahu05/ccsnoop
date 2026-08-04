@@ -25,7 +25,12 @@ import { resolveRoots, listSessions, pickLatestSession, loadExchanges, toAnalysi
 
 /**
  * @typedef {object} CompactionEvent
- * @property {number} turn               The turn number that shrank (the compaction).
+ * @property {number} turn               The captured turn number that shrank (the compaction) —
+ *     the manifest's turn id, so it lines up with the cache diagnostic's cards.
+ * @property {number} turnIndex          The same turn's 1-based ordinal among the ANALYZED
+ *     (non-probe) turns — the "turns-to-first-compact" figure. Differs from `turn` when the
+ *     capture interleaves probes, which are not conversation turns and must not inflate the
+ *     lifetime (a lifetime of "4 turns" out of 3 analyzed would be a fabricated figure).
  * @property {number} segmentsDropped    `baselineLength − end` — segments removed.
  * @property {number} bytesDropped       Byte extent of the removed baseline tail (proxy;
  *     never re-tokenized — sums the substrate's already-sized segment bytes).
@@ -62,24 +67,21 @@ export function diagnoseLifetime(session) {
   const events = [];
   /** @type {number | null} */
   let sessionStartMs = null;
-  let started = false;
   let turnCount = 0;
 
   for (let i = 0; i < session.length; i++) {
     const w = perExchange[i];
     if (w.probe) continue; // a one-shot probe is not a conversation turn (cache spec §2.3)
     turnCount++;
-    if (!started) {
-      // The first non-probe turn's request_received_at is the session-start reference.
-      sessionStartMs = w.now;
-      started = true;
-    }
+    // The first non-probe turn's request_received_at is the session-start reference.
+    if (turnCount === 1) sessionStartMs = w.now;
     const end = w.segments.length;
     // Compaction: the turn shrank vs its prior-turn baseline (cache.js' TRUNCATED signal).
     // A warm compaction (cache held) still shrank, so it still counts as a lifetime event.
     if (w.hadBaseline && end < w.baselineLength) {
       events.push({
         turn: turnOf(session[i], i),
+        turnIndex: turnCount, // ordinal among analyzed turns — probes never inflate it
         segmentsDropped: w.baselineLength - end,
         bytesDropped: w.compactedDroppedBytes,
         receivedMs: w.now,
@@ -132,15 +134,31 @@ function fmtNum(n) {
 
 /**
  * A millisecond span as a minute phrase: whole minutes as an int ("3 min"), a fraction
- * otherwise ("3.5 min"). `null` ⇒ "unknown" (an honest missing-value, never a fabricated
- * number — wall-time is uncomputable when a timestamp was not captured).
- * @param {number | null} ms
+ * otherwise ("3.5 min").
+ * @param {number} ms
  * @returns {string}
  */
 function fmtMinutes(ms) {
-  if (ms == null) return 'unknown';
   const m = ms / 60000;
   return Number.isInteger(m) ? `${m} min` : `${Math.round(m * 10) / 10} min`;
+}
+
+/**
+ * The measured span of the effective lifetime — "2 turns" or "2 turns / 3 min". The single
+ * source of truth for BOTH renderers, so the text and HTML surfaces can never disagree.
+ *
+ * The turns figure is the first compaction's ordinal among the ANALYZED turns (probes
+ * excluded), so it always reconciles with the "N turn(s) analyzed" header. The wall-time
+ * clause is omitted entirely when no timestamp was captured — the turns figure still
+ * stands and the minutes figure is not invented.
+ *
+ * @param {CompactionEvent} first  The first compaction.
+ * @param {number | null} wallMs   Wall-time from the session start, or `null` if uncomputable.
+ * @returns {string}
+ */
+function lifetimeSpan(first, wallMs) {
+  const turns = `${first.turnIndex} turn${first.turnIndex === 1 ? '' : 's'}`;
+  return wallMs != null ? `${turns} / ${fmtMinutes(wallMs)}` : turns;
 }
 
 /**
@@ -168,11 +186,8 @@ export function renderLifetime(diag, opts = {}) {
 
   if (diag.firstCompaction) {
     const fc = diag.firstCompaction;
-    // The wall-time clause is omitted (not rendered as "unknown") when no timestamp was
-    // captured — the turns figure still stands, the minutes figure is not invented.
-    const timeClause =
-      diag.firstCompactionWallMs != null ? ` / ${fmtMinutes(diag.firstCompactionWallMs)}` : '';
-    lines.push(`effective lifetime = ${fc.turn} turn${fc.turn === 1 ? '' : 's'}${timeClause} before the window was first compacted`);
+    const span = lifetimeSpan(fc, diag.firstCompactionWallMs);
+    lines.push(`effective lifetime = ${span} before the window was first compacted`);
     lines.push(
       `  first compaction at turn ${fc.turn}` +
         ` · ${fmtNum(totalBytesDropped)} bytes dropped across ${diag.compactionCount} event${diag.compactionCount === 1 ? '' : 's'}`
@@ -224,7 +239,7 @@ function renderLifetimeHtml(diag, { sessionId, totalBytesDropped }) {
     : '<p class="muted">no compaction — the context window was never truncated this session.</p>';
 
   const headline = diag.firstCompaction
-    ? `<p class="lifetime">effective lifetime = <b>${escHtml(diag.firstCompaction.turn)}</b> turn(s) / <b>${escHtml(fmtMinutes(diag.firstCompactionWallMs))}</b> before the window was first compacted</p>` +
+    ? `<p class="lifetime">effective lifetime = <b>${escHtml(lifetimeSpan(diag.firstCompaction, diag.firstCompactionWallMs))}</b> before the window was first compacted</p>` +
       `<p class="meta">first compaction at turn ${escHtml(diag.firstCompaction.turn)} · ${escHtml(fmtNum(totalBytesDropped))} bytes dropped across ${escHtml(diag.compactionCount)} event(s)</p>`
     : '<p class="lifetime">effective lifetime: <b>no compaction</b> — the context window was never truncated this session.</p>';
 

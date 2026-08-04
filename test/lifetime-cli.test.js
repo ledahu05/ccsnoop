@@ -110,14 +110,19 @@ test('lifetime(): --root default discovery finds the latest session', () => {
   assert.equal(res.diagnostic.compactionCount, 1);
 });
 
-test('lifetime(): --latest is accepted (same as the default, no corpus mode)', () => {
+test('ccsnoop lifetime --latest is accepted and reports the same session as the default', () => {
+  // `--latest` carries no plumbing (with no corpus mode the newest session IS the
+  // default), so what matters is that passing it is not rejected and does not change
+  // the answer — assert against the flagless run rather than restating the output.
   const root = mkTmpDir();
   writeSession(path.join(root, 'sessions', 'lat'), [
     { body: GROW3, recv: '2026-07-28T07:50:00Z', done: '2026-07-28T07:50:01Z' },
     { body: SHRINK, recv: '2026-07-28T07:53:00Z', done: '2026-07-28T07:53:01Z' },
   ]);
-  const res = lifetime({ cwd: '/nonexistent', sessionsDir: root, session: 'lat' });
-  assert.equal(res.diagnostic.compactionCount, 1);
+  const run = (args) => spawnSync(process.execPath, [BIN, 'lifetime', '--sessions-dir', root, ...args], { encoding: 'utf8' });
+  const withFlag = run(['--latest']);
+  assert.equal(withFlag.status, 0, `stderr: ${withFlag.stderr}`);
+  assert.equal(withFlag.stdout, run([]).stdout);
 });
 
 test('lifetime(): an unknown --session names the sessions that do exist', () => {
