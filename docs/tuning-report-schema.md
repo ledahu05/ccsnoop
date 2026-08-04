@@ -52,8 +52,9 @@ reusing `$schema` / `schemaVersion` / `session` / `unit`. A consumer switches on
 ## The safe / advice split (GAP A — the contract's reason to exist)
 
 The headline requirement. Today `fine-tune` builds one monolithic `settings.json` and
-the **safe (auto-write) vs advice (paste-only)** distinction ([ADR-0004][adr]) is
-implicit in the code path, never serialized. The skill cannot infer the tier from a
+the **safe (auto-write) vs advice (paste-only)** distinction ([spec Part 3][spec] — a
+lever's claim tracks its evidence: only levers with **dynamic proof** may say
+"unused → remove") is implicit in the code path, never serialized. The skill cannot infer the tier from a
 single block. So the contract produces the split **inside `fine-tune`**, in two mirrored
 places:
 
@@ -73,7 +74,7 @@ places:
 block the text renderer emits. The contract serializes a distinction the code already
 makes — it does not invent a second block. (Asserted by the test suite.)
 
-[adr]: ../docs/adr
+[spec]: fine-tune-spec.md
 
 ---
 
@@ -108,7 +109,7 @@ makes — it does not invent a second block. (Asserted by the test suite.)
 
 | field | meaning |
 | ----- | ------- |
-| `shipped` | Σ `shipped` across every lever + the floor — the gross per-request byte size. Size context only. |
+| `shipped` | Σ the lever-level `shipped` figures + the floor — gross per-request byte size, size context only. Note the scope: the MCP lever contributes its **deferred-listing block** only, so per-server `mcp__*` tool-def bytes (`safeLevers[mcp].items[].shipped`) are *not* included here. Sum those separately if you want them. |
 | `recoverable` | Σ `waste` over the **actionable** levers only (denied tools, MCP under guard, above-floor hooks, excludable-above-floor CLAUDE.md). The conservative, cache-aware headline. The floor and non-actionable waste are **never** counted. |
 
 ### `floor`
@@ -140,7 +141,14 @@ emitted (spec §3.1); pre-validated by construction, so no threshold and no
 false-positive guard.
 
 - `names` — the denied tool names (denylist order; deterministic).
+- `allowed` — names the run's `--deny-allow` override dropped: shipped tools the base
+  denylist *would* have denied. Always present (`[]` when no override was used).
+  **Read this before concluding "nothing intersects the denylist"** — a `verdict` of
+  `none` with a non-empty `allowed` means the levers matched and were waived for the
+  run, not that the session is clean.
 - `items` — **every shipped built-in tool**, each `{ name, shipped, waste, deny }`.
+  A name the gain model charged no bytes for still gets a `0/0` row, so
+  `names ⊆ items` always holds.
   The gain model carries per-name bytes for *all* shipped tools, not just the denied
   ones — so a consumer sees the full picture plus which names are recoverable (`deny: true`).
   `mcp__*` tool defs are excluded (they belong to the MCP lever). Order: denied first
@@ -247,7 +255,7 @@ error) contributes nothing.
       "lever": "tools", "tier": "safe", "verdict": "deny", "action": "permissions.deny",
       "evidence": "shipped ∩ built-in denylist (data/builtin-denylist.json) — pre-validated by construction; …",
       "shipped": 57509, "waste": 0,
-      "names": ["Workflow", "ScheduleWakeup", "ReportFindings"],
+      "names": ["Workflow", "ScheduleWakeup", "ReportFindings"], "allowed": [],
       "items": [
         { "name": "Workflow", "shipped": 21525, "waste": 0, "deny": true },
         { "name": "Bash", "shipped": 11694, "waste": 0, "deny": false }

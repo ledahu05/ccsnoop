@@ -116,37 +116,55 @@ function sumMcpServerBytes(toolMap) {
   return acc;
 }
 
+/** True for a built-in tool name — an `mcp__*` def belongs to the MCP lever, not this one. */
+function isBuiltinTool(name) {
+  return !name.startsWith('mcp__');
+}
+
 /**
  * The built-in tools lever (safe tier). `permissions.deny` is the intersection with
  * the pre-validated denylist — always emitted (spec §3.1). Items list EVERY shipped
- * built-in tool with a `deny` flag (the gain model already carries per-name bytes for
- * all of them, not just the denied ones), so a consumer sees the full shipped-tool
- * picture plus which names are recoverable. MCP tool defs (`mcp__*`) belong to the MCP
- * lever, not this one.
- * @param {{ deny: string[], gain: import('./finetune-gain.js').GainModel }} ctx
+ * built-in tool with a `deny` flag, so a consumer sees the full shipped-tool picture
+ * plus which names are recoverable. MCP tool defs (`mcp__*`) belong to the MCP lever.
+ *
+ * Items are keyed off the union of `shipped`, `deny` and the gain model's tool names.
+ * Through {@link module:finetune.fineTune} those three agree by construction (all
+ * three walk the same `tool:<name>` segments), but the union makes `names ⊆ items`
+ * hold for ANY caller: a denied name whose bytes the gain model never charged still
+ * gets a `0/0` row rather than vanishing from the table it is named in.
+ *
+ * `allowed` names the shipped denylist entries that `--deny-allow` dropped for this
+ * run (T7). Without it a consumer cannot tell "nothing intersects the denylist" from
+ * "it matched and was allowed away" — the same distinction the text renderer spells
+ * out in its Tools note.
+ *
+ * @param {{ shipped: string[], deny: string[], denyAllowed: string[],
+ *   gain: import('./finetune-gain.js').GainModel }} ctx
  */
-function buildToolsEntry({ deny, gain }) {
-  const denySet = new Set(deny);
-  const all = [...gain.tool.entries()]
-    .filter(([name]) => !name.startsWith('mcp__'))
-    .map(([name, g]) => ({ name, shipped: g.shipped, waste: g.waste, deny: denySet.has(name) }));
+function buildToolsEntry({ shipped, deny, denyAllowed, gain }) {
+  const denied = deny.filter(isBuiltinTool);
+  const denySet = new Set(denied);
+  const itemOf = (name) => {
+    const g = gain.tool.get(name) ?? { shipped: 0, waste: 0 };
+    return { name, shipped: g.shipped, waste: g.waste, deny: denySet.has(name) };
+  };
   // Denied tools first (denylist order — deterministic), then the rest by name.
-  const denied = deny.map((n) => all.find((i) => i.name === n)).filter(Boolean);
-  const rest = all
-    .filter((i) => !i.deny)
-    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  const items = [...denied, ...rest];
+  const rest = [...new Set([...shipped, ...gain.tool.keys()])]
+    .filter((name) => isBuiltinTool(name) && !denySet.has(name))
+    .sort();
+  const items = [...denied, ...rest].map(itemOf);
   return {
     lever: 'tools',
     tier: 'safe',
-    verdict: deny.length > 0 ? 'deny' : 'none',
+    verdict: denied.length > 0 ? 'deny' : 'none',
     action: 'permissions.deny',
     evidence:
       'shipped ∩ built-in denylist (data/builtin-denylist.json) — pre-validated by ' +
       'construction; no threshold, no false-positive guard.',
     shipped: items.reduce((s, i) => s + i.shipped, 0),
-    waste: denied.reduce((s, i) => s + i.waste, 0),
-    names: [...deny],
+    waste: items.filter((i) => i.deny).reduce((s, i) => s + i.waste, 0),
+    names: [...denied],
+    allowed: [...denyAllowed],
     items,
   };
 }
@@ -256,7 +274,7 @@ function buildClaudeMdEntry({ levers, gain }) {
   };
 }
 
-/** A finite non-negative integer from a possibly-absent usage field. */
+/** A finite number from a possibly-absent usage field; anything else counts as 0. */
 function tok(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
@@ -292,6 +310,11 @@ function sumTokens(exchanges) {
  * corpus evidence. With `opts.includeTokens`, a `tokens` block (primary-session
  * `usage`) is attached; otherwise the contract is byte-only.
  *
+ * `shipped` (every built-in tool the primary session ships) and `denyAllowed` (names
+ * `--deny-allow` dropped for this run) both feed the tools lever — see
+ * {@link buildToolsEntry}. Each defaults to `[]`, which costs a consumer only detail,
+ * never a wrong verdict.
+ *
  * @param {{ sessionId: string, requests: number, scope?: 'corpus' | 'single',
  *   shipped: string[], deny: string[], denyAllowed?: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus,
@@ -302,10 +325,10 @@ function sumTokens(exchanges) {
  * @returns {Record<string, any>}
  */
 export function buildJsonReport(ctx, opts = {}) {
-  const { sessionId, requests, scope = 'corpus', deny, mcp, levers, gain, exchanges } = ctx;
-  const { mcpDeny, claudeMdExclude, hook, recoverable } = summarizeLevers({ deny, mcp, levers, gain });
+  const { sessionId, requests, scope = 'corpus', shipped = [], deny, denyAllowed = [], mcp, levers, gain, exchanges } = ctx;
+  const { mcpDeny, claudeMdExclude, hook, hookDeny, recoverable } = summarizeLevers({ deny, mcp, levers, gain });
 
-  const toolsEntry = buildToolsEntry({ deny, gain });
+  const toolsEntry = buildToolsEntry({ shipped, deny, denyAllowed, gain });
   const mcpEntry = buildMcpEntry({ mcp, gain, perServer: sumMcpServerBytes(gain.tool), mcpDeny });
   const hooksEntry = buildHooksEntry({ hook, gain });
   const claudeMdEntry = buildClaudeMdEntry({ levers, gain });
@@ -316,11 +339,13 @@ export function buildJsonReport(ctx, opts = {}) {
   // settings.auto = the safe subset the skill may write on approval (built-in deny
   // always present, spec §3.1; MCP deny only under the guard). settings.advice = the
   // paste-only keys (hooks / claudeMdExcludes), each only when its lever acts.
-  const auto = { permissions: { deny } };
-  if (mcpDeny.length > 0) auto.disabledMcpjsonServers = mcpDeny;
+  // Arrays are COPIED in: the report is a self-contained value a consumer may keep or
+  // mutate, so it must never alias the caller's `deny` / the summary's own arrays.
+  const auto = { permissions: { deny: [...deny] } };
+  if (mcpDeny.length > 0) auto.disabledMcpjsonServers = [...mcpDeny];
   const advice = {};
-  if (hook.deny) advice.hooks = { SessionStart: [] };
-  if (claudeMdExclude.length > 0) advice.claudeMdExcludes = claudeMdExclude;
+  if (hookDeny) advice.hooks = { SessionStart: [] };
+  if (claudeMdExclude.length > 0) advice.claudeMdExcludes = [...claudeMdExclude];
 
   /** @type {Record<string, any>} */
   const report = {

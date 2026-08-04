@@ -22,8 +22,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { fineTune, denyIntersection } from '../src/finetune.js';
-import { loadBuiltinDenylist } from '../src/finetune.js';
+import { fineTune, denyIntersection, loadBuiltinDenylist } from '../src/finetune.js';
 import {
   buildJsonReport,
   SCHEMA_URL,
@@ -42,9 +41,19 @@ function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-ftjson-'));
 }
 
-/** Write a minimal captured session dir with a chosen tools[] (mirrors FT1's helper). */
-function writeSession(root, id, tools) {
-  const dir = path.join(root, 'sessions', id);
+const DEFAULT_USAGE = {
+  input_tokens: 1234,
+  output_tokens: 56,
+  cache_read_input_tokens: 700,
+  cache_creation_input_tokens: 200,
+};
+
+/**
+ * Write one minimal captured exchange (request blob + SSE response + manifest) into
+ * `dir`, shipping `tools` and reporting `usage`. The single place the fixture shape
+ * lives, so `--root` and `--sessions-dir` layouts share it.
+ */
+function writeSessionDir(dir, id, tools, usage = DEFAULT_USAGE) {
   fs.mkdirSync(dir, { recursive: true });
   const req = buildRequestBlob({
     method: 'POST',
@@ -62,14 +71,25 @@ function writeSession(root, id, tools) {
   fs.writeFileSync(path.join(dir, '0001.request.http'), req);
   fs.writeFileSync(
     path.join(dir, '0001.response.sse'),
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":1234,"output_tokens":56,"cache_read_input_tokens":700,"cache_creation_input_tokens":200}}}\n\n' +
-      'data: {"type":"message_delta","usage":{"output_tokens":56}}\n\n'
+    `data: {"type":"message_start","message":{"usage":${JSON.stringify(usage)}}}\n\n`
   );
   fs.writeFileSync(
     path.join(dir, 'manifest.jsonl'),
     JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
   );
   return dir;
+}
+
+/** A capture root (`<root>/sessions/<id>/`) holding one session — the `--root` layout. */
+function writeSession(root, id, tools, usage) {
+  return writeSessionDir(path.join(root, 'sessions', id), id, tools, usage);
+}
+
+/** A fresh sessions dir holding `<id>/` directly — the `--sessions-dir` layout. */
+function writeSessionsDir(id, tools, usage) {
+  const sessionsDir = mkTmpDir();
+  writeSessionDir(path.join(sessionsDir, id), id, tools, usage);
+  return sessionsDir;
 }
 
 /** A gain model with a couple of tool entries charged (built-in + an MCP tool def). */
@@ -270,6 +290,88 @@ test('tools items list every shipped built-in tool with a deny flag', () => {
   assert.equal(bash.deny, false);
 });
 
+test('every denied name has an items row even when the gain model charged it nothing', () => {
+  // `names ⊆ items` must hold for any caller: a denied name with no byte row would
+  // leave a consumer naming a tool it cannot cost.
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: ['Bash', 'Workflow'],
+    deny: ['Workflow'],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: EMPTY_GAIN, // no per-tool bytes at all
+  });
+  const tools = r.safeLevers.find((l) => l.lever === 'tools');
+  assert.deepEqual(
+    tools.items.map((i) => i.name),
+    ['Workflow', 'Bash']
+  );
+  assert.deepEqual(tools.items[0], { name: 'Workflow', shipped: 0, waste: 0, deny: true });
+  for (const n of tools.names) assert.ok(tools.items.some((i) => i.name === n));
+});
+
+test('tools.allowed records the names --deny-allow dropped for this run', () => {
+  // Without it a consumer cannot tell "nothing intersects the denylist" from
+  // "it matched and was allowed away" — the text renderer spells that out.
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: ['Workflow'],
+    deny: [],
+    denyAllowed: ['Workflow'],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: gainWith([['Workflow', 5300, 1100]]),
+  });
+  const tools = r.safeLevers.find((l) => l.lever === 'tools');
+  assert.deepEqual(tools.allowed, ['Workflow']);
+  // Allowed away ⇒ not denied: no verdict, no key, no recoverable bytes.
+  assert.equal(tools.verdict, 'none');
+  assert.deepEqual(tools.names, []);
+  assert.deepEqual(r.settings.auto.permissions, { deny: [] });
+  assert.equal(r.totals.recoverable, 0);
+});
+
+test('tools.allowed is empty (never absent) when no override was applied', () => {
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: ['Workflow'],
+    deny: ['Workflow'],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: gainWith([['Workflow', 5300, 1100]]),
+  });
+  assert.deepEqual(r.safeLevers.find((l) => l.lever === 'tools').allowed, []);
+});
+
+test('the report never aliases the caller arrays it was built from', () => {
+  const deny = ['Workflow'];
+  const claudeMd = [{ source: './CLAUDE.md', bytes: 8000, pct: 50, excludable: true, deny: true }];
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'corpus',
+    shipped: ['Workflow'],
+    deny,
+    mcp: {
+      sessionCount: 3,
+      singleSession: false,
+      servers: [{ name: 'alpha', shippedSessions: 3, calledCount: 0, deny: true }],
+    },
+    levers: { systemBytes: 100, hook: { bytes: 8000, aboveFloor: true, deny: true }, claudeMd },
+    gain: gainWith([['Workflow', 5300, 1100]]),
+  });
+  const snapshot = JSON.parse(JSON.stringify(r));
+  deny.push('MUTATED');
+  claudeMd.push({ source: './other.md', bytes: 9000, pct: 9, excludable: true, deny: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), snapshot);
+});
+
 // ── per-MCP-server byte attribution (GAP B — sum mcp__<server>__* segments) ───
 
 test('per-MCP-server bytes are summed from mcp__<server>__* tool segments', () => {
@@ -467,40 +569,15 @@ test('fineTune({includeTokens:true}) backfills token totals from usage', () => {
   writeSession(root, 's', [{ name: 'Bash' }]);
   const res = fineTune({ cwd: '/nonexistent', root, session: 's', includeTokens: true });
   assert.equal(res.json.tokens.input, 1234);
-  assert.equal(res.json.tokens.output, 56); // max across message_start + message_delta
+  assert.equal(res.json.tokens.output, 56);
+  assert.equal(res.json.tokens.cacheRead, 700);
+  assert.equal(res.json.tokens.cacheCreation, 200);
 });
 
 // ── CLI smoke (AC #5: exits 0, parses, required fields present) ───────────────
 
 test('ccsnoop fine-tune --json exits 0 and emits parseable JSON to stdout', () => {
-  const sessionsDir = mkTmpDir();
-  writeSession(path.join(sessionsDir, '..'), 'cli-json', [{ name: 'Bash' }, { name: 'Workflow' }]);
-  // Re-create directly under sessionsDir so --sessions-dir resolves it.
-  fs.rmSync(path.join(sessionsDir, '..', 'sessions'), { recursive: true, force: true });
-  const dir = path.join(sessionsDir, 'cli-json');
-  fs.mkdirSync(dir, { recursive: true });
-  const req = buildRequestBlob({
-    method: 'POST',
-    url: '/v1/messages',
-    rawHeaders: ['Content-Type', 'application/json'],
-    body: Buffer.from(
-      JSON.stringify({
-        model: 'claude-x',
-        system: [{ type: 'text', text: 'system prompt' }],
-        tools: [{ name: 'Bash' }, { name: 'Workflow' }],
-        messages: [{ role: 'user', content: 'hi' }],
-      })
-    ),
-  });
-  fs.writeFileSync(path.join(dir, '0001.request.http'), req);
-  fs.writeFileSync(
-    path.join(dir, '0001.response.sse'),
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
-  );
-  fs.writeFileSync(
-    path.join(dir, 'manifest.jsonl'),
-    JSON.stringify({ turn: 1, thread_id: 'cli-json', request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
-  );
+  const sessionsDir = writeSessionsDir('cli-json', [{ name: 'Bash' }, { name: 'Workflow' }]);
   const r = spawnSync(process.execPath, [BIN, 'fine-tune', '--sessions-dir', sessionsDir, '--json'], {
     encoding: 'utf8',
   });
@@ -513,31 +590,7 @@ test('ccsnoop fine-tune --json exits 0 and emits parseable JSON to stdout', () =
 });
 
 test('--json --include-tokens surfaces the tokens block on stdout', () => {
-  const sessionsDir = mkTmpDir();
-  const dir = path.join(sessionsDir, 'cli-tok');
-  fs.mkdirSync(dir, { recursive: true });
-  const req = buildRequestBlob({
-    method: 'POST',
-    url: '/v1/messages',
-    rawHeaders: ['Content-Type', 'application/json'],
-    body: Buffer.from(
-      JSON.stringify({
-        model: 'claude-x',
-        system: [{ type: 'text', text: 'system prompt' }],
-        tools: [{ name: 'Workflow' }],
-        messages: [{ role: 'user', content: 'hi' }],
-      })
-    ),
-  });
-  fs.writeFileSync(path.join(dir, '0001.request.http'), req);
-  fs.writeFileSync(
-    path.join(dir, '0001.response.sse'),
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":42,"output_tokens":2}}}\n\n'
-  );
-  fs.writeFileSync(
-    path.join(dir, 'manifest.jsonl'),
-    JSON.stringify({ turn: 1, thread_id: 'cli-tok', request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
-  );
+  const sessionsDir = writeSessionsDir('cli-tok', [{ name: 'Workflow' }], { input_tokens: 42, output_tokens: 2 });
   const r = spawnSync(
     process.execPath,
     [BIN, 'fine-tune', '--sessions-dir', sessionsDir, '--json', '--include-tokens'],
@@ -549,31 +602,7 @@ test('--json --include-tokens surfaces the tokens block on stdout', () => {
 });
 
 test('default (no --json) output is still the human text table, unchanged', () => {
-  const sessionsDir = mkTmpDir();
-  const dir = path.join(sessionsDir, 'cli-text');
-  fs.mkdirSync(dir, { recursive: true });
-  const req = buildRequestBlob({
-    method: 'POST',
-    url: '/v1/messages',
-    rawHeaders: ['Content-Type', 'application/json'],
-    body: Buffer.from(
-      JSON.stringify({
-        model: 'claude-x',
-        system: [{ type: 'text', text: 'system prompt' }],
-        tools: [{ name: 'Workflow' }],
-        messages: [{ role: 'user', content: 'hi' }],
-      })
-    ),
-  });
-  fs.writeFileSync(path.join(dir, '0001.request.http'), req);
-  fs.writeFileSync(
-    path.join(dir, '0001.response.sse'),
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
-  );
-  fs.writeFileSync(
-    path.join(dir, 'manifest.jsonl'),
-    JSON.stringify({ turn: 1, thread_id: 'cli-text', request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
-  );
+  const sessionsDir = writeSessionsDir('cli-text', [{ name: 'Workflow' }]);
   const r = spawnSync(process.execPath, [BIN, 'fine-tune', '--sessions-dir', sessionsDir], {
     encoding: 'utf8',
   });
