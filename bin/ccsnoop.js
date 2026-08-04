@@ -7,9 +7,10 @@ import * as daemon from '../src/daemon.js';
 import { generateReport } from '../src/report.js';
 import { fineTune } from '../src/finetune.js';
 import { cache } from '../src/cache.js';
+import { lifetime } from '../src/lifetime.js';
 import { init, undoAllRoutes } from '../src/init.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'lifetime'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -43,6 +44,7 @@ async function main() {
   if (sub === 'report') return runReport(args);
   if (sub === 'fine-tune') return runFineTune(args);
   if (sub === 'cache') return runCache(args);
+  if (sub === 'lifetime') return runLifetime(args);
 }
 
 /**
@@ -272,6 +274,30 @@ function runCache(args) {
 }
 
 /**
+ * `lifetime` — the effective context-lifetime metric (issue #101, part of epic #93).
+ * Promotes compaction (the cache diagnostic's TRUNCATED signal) to a standalone metric:
+ * compaction count, turns/wall-time to the first compaction, and per-event bytes-dropped.
+ * One session; text by default, `--html` for a self-contained document. Flags/dispatch
+ * mirror {@link runCache}; discovery is the shared report resolver. No corpus mode.
+ * @param {string[]} args
+ */
+function runLifetime(args) {
+  // `--latest` is accepted for symmetry with report/fine-tune/cache but needs no
+  // plumbing: with no corpus mode, the most-recent session already IS the default.
+  const result = lifetime({
+    cwd: process.cwd(),
+    root: getFlag(args, '--root'),
+    sessionsDir: getFlag(args, '--sessions-dir'),
+    session: getFlag(args, '--session'),
+  });
+  if (hasFlag(args, '--html')) {
+    process.stdout.write(result.html + '\n');
+  } else {
+    for (const line of result.lines) console.log(line);
+  }
+}
+
+/**
  * Read a `--flag value` pair from argv.
  * @param {string[]} args
  * @param {string} name
@@ -347,6 +373,13 @@ Commands:
              --session <id>       session to diagnose (default: latest)
              --latest             most-recent session (same as the default; no corpus mode)
              --ttl <seconds>      TEMPORAL threshold (default 3600 = 1 h)
+             --html               render the same data as a self-contained HTML document
+  lifetime  Effective context-lifetime metric for one captured session (compaction count,
+           turns/wall-time to the first compaction, per-event bytes-dropped)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to diagnose (default: latest)
+             --latest             most-recent session (same as the default; no corpus mode)
              --html               render the same data as a self-contained HTML document`);
 }
 

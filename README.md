@@ -52,6 +52,9 @@ The report shows you the waste; two more commands help you **act on it**:
 - **`ccsnoop cache`** — for each turn where the prompt cache went cold, explains
   *why* it expired, *what it cost*, and *what to do differently*. See
   [`docs/cache.md`](docs/cache.md).
+- **`ccsnoop lifetime`** — surfaces compaction as a first-class signal: *how many
+  turns / minutes* the context window lasted before it was first compacted, and *how
+  many bytes* each compaction dropped.
 
 **What it is *not*:**
 
@@ -390,6 +393,7 @@ Run `ccsnoop <command> [options]`. `--help` prints this same list.
 | `report` | Render a captured session to a self-contained static HTML file. | `--root <path>` capture root (default `./.ccsnoop`)<br>`--sessions-dir <p>` dir holding session subdirs (overrides `--root`)<br>`--session <id>` session to render (default: latest)<br>`--all` widen discovery across `~/.ccsnoop/routes.json`<br>`--out <path>` output file (default `<session-dir>/report.html`)<br>`--bloat-floor <n>` bloat: absolute byte floor (default `4096`)<br>`--bloat-multiplier <n>` bloat: sibling-outlier multiplier (default `3`) |
 | `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP deny)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run |
 | `cache`  | Cache-economy diagnostic for one captured session (per-transition cards + rollup). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--ttl <seconds>` TEMPORAL threshold (default `3600`)<br>`--html` render as a self-contained HTML document |
+| `lifetime` | Effective context-lifetime metric for one captured session (compaction count, turns/wall-time to the first compaction, per-event bytes-dropped). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--html` render as a self-contained HTML document |
 
 ---
 

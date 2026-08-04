@@ -333,6 +333,10 @@ function medianOf(xs) {
  *     detect a cold turn (a prior prefix the cache stopped serving), to cap the structural
  *     region at re-written baseline content, and to recognize compaction (a turn that
  *     shrank vs its baseline → STRUCTURAL·TRUNCATED).
+ * @property {number} compactedDroppedBytes  Byte extent of the baseline tail a compaction
+ *     dropped (`Σ baseline[end..baselineLength).bytes`, `0` when the turn did not shrink).
+ *     The context-lifetime metric's "bytes-dropped" (issue #101); the cache diagnostic's
+ *     TRUNCATED signal in bytes. Never re-tokenized — sums already-sized segment extents.
  * @property {UsageDiffResidual | null} residual  Diff-derived byte attribution of the
  *     write mass (re-written region vs genuinely-new content), so a turn's
  *     `cache_creation` total can be split (cache spec §4). `null` without a baseline.
@@ -368,6 +372,7 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
       hadBaseline: false,
       mutationSite: null,
       baselineLength: 0, // no prior turn ⇒ no baseline extent
+      compactedDroppedBytes: 0, // no prior turn ⇒ nothing was dropped
       residual: null, // no prior turn ⇒ no re-write to attribute
     };
   }
@@ -429,6 +434,18 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
   const newBytes = current.filter((s) => s.kind === 'new').reduce((sum, s) => sum + s.bytes, 0);
   const residual = { rewrittenBytes: reusedUncachedBytes, newBytes, total: reusedUncachedBytes + newBytes };
 
+  // Compaction: this turn shrank vs its baseline (a tail was dropped) — the same
+  // signal the cache diagnostic reads as STRUCTURAL·TRUNCATED (`end < baselineLength`,
+  // cache spec §3 / issue #84). The removed tail's byte extent (issue #101: the
+  // "bytes-dropped" lifetime metric) is the Σ of the baseline segments past `end`.
+  // NOT a re-tokenization — these baseline segments are already sized (spec §2.4b); we
+  // only sum their existing `.bytes`. 0 when the turn did not shrink.
+  const end = current.length;
+  let compactedDroppedBytes = 0;
+  if (end < baseline.length) {
+    for (let i = end; i < baseline.length; i++) compactedDroppedBytes += baseline[i].bytes;
+  }
+
   return {
     segments: current,
     cacheBoundary,
@@ -438,6 +455,7 @@ export function classifySegments(current, baseline, usage, config = DEFAULT_WAST
     hadBaseline: true,
     mutationSite,
     baselineLength: baseline.length,
+    compactedDroppedBytes,
     residual,
   };
 }
@@ -535,6 +553,7 @@ export function computeWaste(exchanges, overrides = {}) {
       hadBaseline: cls.hadBaseline,
       mutationSite: cls.mutationSite,
       baselineLength: cls.baselineLength,
+      compactedDroppedBytes: cls.compactedDroppedBytes, // lifetime metric (issue #101)
       residual: cls.residual,
       now,
       idleMs,
@@ -567,6 +586,8 @@ export function computeWaste(exchanges, overrides = {}) {
  * @property {boolean} hadBaseline        A prior same-lineage request existed.
  * @property {string | null} mutationSite First divergent slot (structural culprit candidate).
  * @property {number} baselineLength      Segment count of the baseline (`0` without one).
+ * @property {number} compactedDroppedBytes  Byte extent of the baseline tail a compaction
+ *     dropped (`0` when the turn did not shrink); the lifetime metric's bytes-dropped (#101).
  * @property {UsageDiffResidual | null} residual  Write-mass attribution (re-written vs new).
  * @property {number | null} now          This turn's reference instant, injected from the
  *     captured `request_received_at` (epoch ms); `null` for probe turns.
