@@ -61,6 +61,50 @@ function assertNotUnderCcsnoop(file) {
 }
 
 /**
+ * Validate and dedupe an incoming list of names. A shape we could not write
+ * verbatim into settings.json (a bare string, a nested object, a number) is
+ * REFUSED rather than silently skipped — a malformed report must never read as
+ * "nothing to do". Duplicates are collapsed here, so a report that repeats a
+ * name cannot append it twice.
+ * @param {any} list
+ * @param {string} label  The settings path, for the error message.
+ * @returns {string[]}
+ */
+function safeNames(list, label) {
+  if (list == null) return [];
+  if (!Array.isArray(list) || list.some((n) => typeof n !== 'string')) {
+    throw new ApplyError(`${label} must be an array of strings`);
+  }
+  return [...new Set(list)];
+}
+
+/**
+ * Union `incoming` into the array at `container[key]`, existing-first, mutating
+ * `container` (always a clone by the time we get here). Returns the names
+ * actually added, or `null` when the union is already complete.
+ *
+ * An existing value that is present but not an array is REFUSED: replacing a
+ * value we cannot merge would be an overwrite, and "merge, never overwrite"
+ * holds one level down too.
+ * @param {Record<string, any>} container
+ * @param {string} key
+ * @param {string[]} incoming
+ * @param {string} label  The settings path, for the error message.
+ * @returns {string[] | null}
+ */
+function unionInto(container, key, incoming, label) {
+  const existing = container[key] ?? [];
+  if (!Array.isArray(existing)) {
+    throw new ApplyError(`existing ${label} is not an array — refusing to overwrite it`);
+  }
+  const present = new Set(existing);
+  const newOnes = incoming.filter((n) => !present.has(n));
+  if (newOnes.length === 0) return null;
+  container[key] = [...existing, ...newOnes];
+  return newOnes;
+}
+
+/**
  * The pure merge of the safe subset into `existing` settings (ADR-0004 safe
  * tier). Returns the merged object, the per-key additions, and whether anything
  * changed — without I/O and without mutating either input.
@@ -69,7 +113,8 @@ function assertNotUnderCcsnoop(file) {
  * UNIONED with the existing arrays (deduped, existing-first order); every other
  * key in `existing` (foreign or ccsnoop) is preserved untouched. Unknown keys
  * in the incoming subset are REFUSED — the advice tier (`hooks`,
- * `claudeMdExcludes`) can never reach the writer through this function.
+ * `claudeMdExcludes`) can never reach the writer through this function. So is
+ * any malformed value, incoming or existing, that we would have to clobber.
  *
  * @param {Record<string, any>} existing   The current settings.json object.
  * @param {Record<string, any>} safeSubset The contract's `settings.auto` block.
@@ -104,33 +149,41 @@ export function computeMergeSettings(existing, safeSubset) {
   /** @type {{ permissionsDeny?: string[], disabledMcpjsonServers?: string[] }} */
   const added = {};
 
-  const denyIn = safeSubset.permissions?.deny;
-  if (Array.isArray(denyIn) && denyIn.length > 0) {
-    const perm =
-      merged.permissions && typeof merged.permissions === 'object' && !Array.isArray(merged.permissions)
-        ? merged.permissions
-        : (merged.permissions = {});
-    const existingDeny = Array.isArray(perm.deny) ? perm.deny : [];
-    const present = new Set(existingDeny);
-    const newOnes = denyIn.filter((n) => !present.has(n));
-    if (newOnes.length > 0) {
-      added.permissionsDeny = newOnes;
-      perm.deny = [...existingDeny, ...newOnes];
+  // Validate both incoming lists up front, so a malformed report is refused
+  // whether or not the other lever happens to have something to add.
+  const denyIn = safeNames(safeSubset.permissions?.deny, 'permissions.deny');
+  const mcpIn = safeNames(safeSubset.disabledMcpjsonServers, 'disabledMcpjsonServers');
+
+  if (denyIn.length > 0) {
+    if (merged.permissions != null && (typeof merged.permissions !== 'object' || Array.isArray(merged.permissions))) {
+      throw new ApplyError('existing permissions is not an object — refusing to overwrite it');
     }
+    merged.permissions ??= {};
+    const newOnes = unionInto(merged.permissions, 'deny', denyIn, 'permissions.deny');
+    if (newOnes) added.permissionsDeny = newOnes;
   }
 
-  const mcpIn = safeSubset.disabledMcpjsonServers;
-  if (Array.isArray(mcpIn) && mcpIn.length > 0) {
-    const existingMcp = Array.isArray(merged.disabledMcpjsonServers) ? merged.disabledMcpjsonServers : [];
-    const present = new Set(existingMcp);
-    const newOnes = mcpIn.filter((n) => !present.has(n));
-    if (newOnes.length > 0) {
-      added.disabledMcpjsonServers = newOnes;
-      merged.disabledMcpjsonServers = [...existingMcp, ...newOnes];
-    }
+  if (mcpIn.length > 0) {
+    const newOnes = unionInto(merged, 'disabledMcpjsonServers', mcpIn, 'disabledMcpjsonServers');
+    if (newOnes) added.disabledMcpjsonServers = newOnes;
   }
 
   return { merged, added, changed: Object.keys(added).length > 0 };
+}
+
+/**
+ * Read `file` as a settings object, or `{}` when absent — init's strict
+ * discipline ({@link module:init.readJsonStrict}) plus the object check the
+ * merge needs: a file holding an array or a scalar is refused, never clobbered.
+ * @param {string} file
+ * @returns {Record<string, any>}
+ */
+function readSettingsObject(file) {
+  const existing = readJsonStrict(file, {}, ApplyError);
+  if (existing == null || typeof existing !== 'object' || Array.isArray(existing)) {
+    throw new ApplyError(`${file} is not a JSON object — refusing to overwrite it`);
+  }
+  return existing;
 }
 
 /**
@@ -147,11 +200,7 @@ export function computeMergeSettings(existing, safeSubset) {
  */
 export function safeMergeSettings(file, safeSubset) {
   assertNotUnderCcsnoop(file);
-  const existing = readJsonStrict(file, {}, ApplyError);
-  if (existing == null || typeof existing !== 'object' || Array.isArray(existing)) {
-    throw new ApplyError(`${file} is not a JSON object — refusing to overwrite it`);
-  }
-  const { merged, added, changed } = computeMergeSettings(existing, safeSubset);
+  const { merged, added, changed } = computeMergeSettings(readSettingsObject(file), safeSubset);
   if (changed) writeJson(file, merged);
   return { file, merged, added, changed };
 }
@@ -182,7 +231,7 @@ function renderAdvice(advice) {
     lines.push('  (none)');
   } else {
     lines.push('```json');
-    // 2-space indent under the fence — readable when pasted alongside the diff.
+    // Pretty-printed so the block is paste-ready straight into settings.json.
     lines.push(JSON.stringify(advice, null, 2));
     lines.push('```');
   }
@@ -206,7 +255,7 @@ function renderAdvice(advice) {
  * @param {boolean} [opts.dryRun]             Print the diff without writing.
  * @param {string} [opts.cwd]                 Repo root (default `process.cwd()`).
  * @param {string} [opts.settingsFile]        Override the settings.json path.
- * @returns {{ exitCode: number, wrote: boolean, changed: boolean,
+ * @returns {{ wrote: boolean, changed: boolean,
  *   diff: { key: string, added: string[] }[], advice: Record<string, any>,
  *   settingsFile: string, lines: string[] }}
  */
@@ -222,11 +271,7 @@ export function apply({ report, approved = false, dryRun = false, cwd, settingsF
 
   // Compute the diff up front (read-only) — validates the safe subset (foreign-
   // key refusal) and lets us present changes before writing.
-  const existing = readJsonStrict(file, {}, ApplyError);
-  if (existing == null || typeof existing !== 'object' || Array.isArray(existing)) {
-    throw new ApplyError(`${file} is not a JSON object — refusing to overwrite it`);
-  }
-  const { added, changed } = computeMergeSettings(existing, safeSubset);
+  const { added, changed } = computeMergeSettings(readSettingsObject(file), safeSubset);
   const diff = diffEntries(added);
 
   const lines = [`ccsnoop apply — proposed safe-subset changes to ${file}:`];
@@ -254,5 +299,5 @@ export function apply({ report, approved = false, dryRun = false, cwd, settingsF
     lines.push('re-run with --yes to apply these changes');
   }
 
-  return { exitCode: 0, wrote, changed, diff, advice, settingsFile: file, lines };
+  return { wrote, changed, diff, advice, settingsFile: file, lines };
 }

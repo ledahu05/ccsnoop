@@ -13,7 +13,7 @@ import { floor } from '../src/floor.js';
 import { lifetime } from '../src/lifetime.js';
 import { isolate } from '../src/isolate.js';
 import { init, undoAllRoutes } from '../src/init.js';
-import { apply } from '../src/apply.js';
+import { apply, ApplyError } from '../src/apply.js';
 
 const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate', 'apply'];
 
@@ -276,8 +276,14 @@ function runApply(args) {
   const from = getFlag(args, '--from');
   let report;
   if (from !== undefined) {
-    const raw = from === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(from, 'utf8');
-    report = JSON.parse(raw);
+    // Name the source in the failure — an unreadable path or a truncated pipe is
+    // the likely mistake here, and a bare ENOENT/SyntaxError hides which.
+    const source = from === '-' ? 'stdin' : from;
+    try {
+      report = JSON.parse(fs.readFileSync(from === '-' ? 0 : from, 'utf8'));
+    } catch (err) {
+      throw new ApplyError(`cannot read a tuning report from ${source} — ${/** @type {Error} */ (err).message}`);
+    }
   } else {
     // No captured report given — produce the contract in-process from a capture,
     // the way the skill (#97) drives the loop: diagnose, then apply.
@@ -298,7 +304,6 @@ function runApply(args) {
     settingsFile: getFlag(args, '--settings'),
   });
   for (const line of result.lines) console.log(line);
-  process.exit(result.exitCode);
 }
 
 /**

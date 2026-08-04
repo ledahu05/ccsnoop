@@ -137,6 +137,66 @@ test('an unknown permissions sub-key is refused (only permissions.deny is writab
   );
 });
 
+test('a name repeated in the incoming list is added once, not twice', () => {
+  const { merged, added } = computeMergeSettings({}, {
+    permissions: { deny: ['Workflow', 'Workflow'] },
+    disabledMcpjsonServers: ['Atlassian', 'Atlassian'],
+  });
+  assert.deepEqual(merged.permissions.deny, ['Workflow'], 'union dedupes within the incoming list too');
+  assert.deepEqual(merged.disabledMcpjsonServers, ['Atlassian']);
+  assert.deepEqual(added.permissionsDeny, ['Workflow']);
+});
+
+test('a non-array deny in the subset is refused, not silently ignored', () => {
+  assert.throws(
+    () => computeMergeSettings({}, { permissions: { deny: 'Workflow' } }),
+    /permissions\.deny must be an array of strings/,
+  );
+  assert.throws(
+    () => computeMergeSettings({}, { disabledMcpjsonServers: 'Atlassian' }),
+    /disabledMcpjsonServers must be an array of strings/,
+  );
+});
+
+test('a non-string name in the subset is refused rather than written into settings.json', () => {
+  assert.throws(
+    () => computeMergeSettings({}, { permissions: { deny: [{ tool: 'Workflow' }] } }),
+    /permissions\.deny must be an array of strings/,
+  );
+  assert.throws(
+    () => computeMergeSettings({}, { disabledMcpjsonServers: ['ok', 42] }),
+    /disabledMcpjsonServers must be an array of strings/,
+  );
+});
+
+test('an existing permissions block of the wrong shape is refused, never overwritten', () => {
+  // "merge, never overwrite" applies one level down too: replacing a value we
+  // cannot understand would silently destroy the user's settings.
+  assert.throws(
+    () => computeMergeSettings({ permissions: ['Bash'] }, { permissions: { deny: ['Workflow'] } }),
+    /existing permissions is not an object/,
+  );
+  assert.throws(
+    () => computeMergeSettings({ permissions: { deny: 'Read' } }, { permissions: { deny: ['Workflow'] } }),
+    /existing permissions\.deny is not an array/,
+  );
+  assert.throws(
+    () => computeMergeSettings({ disabledMcpjsonServers: 'Old' }, { disabledMcpjsonServers: ['New'] }),
+    /existing disabledMcpjsonServers is not an array/,
+  );
+});
+
+test('an existing block of the wrong shape is left alone when nothing targets it', () => {
+  // Only the keys apply actually writes are shape-checked — a malformed key it
+  // never touches must not block an unrelated merge.
+  const { merged } = computeMergeSettings(
+    { permissions: ['Bash'] },
+    { disabledMcpjsonServers: ['Atlassian'] },
+  );
+  assert.deepEqual(merged.permissions, ['Bash'], 'untargeted malformed key preserved verbatim');
+  assert.deepEqual(merged.disabledMcpjsonServers, ['Atlassian']);
+});
+
 test('computeMergeSettings never mutates the existing object it was given', () => {
   const existing = { permissions: { deny: ['Read'] } };
   const snapshot = JSON.parse(JSON.stringify(existing));
@@ -295,6 +355,39 @@ test('an empty safe subset writes nothing and emits no reminder', () => {
   assert.doesNotMatch(res.lines.join('\n'), /restart/i);
 });
 
+test('advice is surfaced in the preview too — it is the human\'s to paste, approval or not', () => {
+  const dir = mkTmp();
+  const res = apply({
+    report: report({ hooks: true, claudeMdExcludes: ['./CLAUDE.md'] }),
+    settingsFile: path.join(dir, 'settings.json'),
+  });
+  const out = res.lines.join('\n');
+  assert.match(out, /paste-only/i);
+  assert.match(out, /claudeMdExcludes/);
+});
+
+test('a report with no settings block yields an empty diff and empty advice', () => {
+  const dir = mkTmp();
+  const file = path.join(dir, 'settings.json');
+  const res = apply({ report: { kind: 'tuning-report' }, settingsFile: file, approved: true });
+  assert.equal(res.wrote, false);
+  assert.deepEqual(res.diff, []);
+  assert.match(res.lines.join('\n'), /\(none\)/);
+  assert.ok(!fs.existsSync(file));
+});
+
+test('a settings.auto that is an array is refused, not treated as a subset', () => {
+  const dir = mkTmp();
+  assert.throws(
+    () => apply({
+      report: { settings: { auto: ['permissions'] } },
+      settingsFile: path.join(dir, 'settings.json'),
+      approved: true,
+    }),
+    /safe subset must be a settings object/,
+  );
+});
+
 test('apply preserves pre-existing settings keys when it writes the safe subset', () => {
   const dir = mkTmp();
   const file = path.join(dir, 'settings.json');
@@ -378,6 +471,46 @@ test('ccsnoop apply --from - reads the report from stdin', () => {
   );
   assert.equal(r.status, 0, `stderr: ${r.stderr}`);
   assert.deepEqual(readJson(settingsFile).permissions, { deny: ['Workflow'] });
+});
+
+test('ccsnoop apply --from a missing file fails with a message naming the source', () => {
+  const dir = mkTmp();
+  const r = spawnSync(
+    process.execPath,
+    [BIN, 'apply', '--from', path.join(dir, 'nope.json'), '--settings', path.join(dir, 'settings.json')],
+    { encoding: 'utf8' },
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /cannot read a tuning report from .*nope\.json/);
+  assert.doesNotMatch(r.stderr, /at .*apply\.js/, 'a user-facing refusal, not a stack dump');
+});
+
+test('ccsnoop apply --from a file of invalid JSON fails cleanly', () => {
+  const dir = mkTmp();
+  const reportFile = path.join(dir, 'report.json');
+  fs.writeFileSync(reportFile, '{ truncated');
+  const r = spawnSync(
+    process.execPath,
+    [BIN, 'apply', '--from', reportFile, '--settings', path.join(dir, 'settings.json')],
+    { encoding: 'utf8' },
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /cannot read a tuning report/);
+});
+
+test('ccsnoop apply refuses a --settings path inside the capture tree', () => {
+  const dir = mkTmp();
+  const reportFile = path.join(dir, 'report.json');
+  fs.writeFileSync(reportFile, JSON.stringify(report({ deny: ['Workflow'] })));
+  const target = path.join(dir, '.ccsnoop', 'settings.json');
+  const r = spawnSync(
+    process.execPath,
+    [BIN, 'apply', '--from', reportFile, '--settings', target, '--yes'],
+    { encoding: 'utf8' },
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /refusing to write settings under \.ccsnoop/);
+  assert.ok(!fs.existsSync(target));
 });
 
 test('ccsnoop apply with no --from runs fine-tune on the capture and applies it', () => {

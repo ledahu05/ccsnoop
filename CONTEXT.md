@@ -33,4 +33,3 @@ _Avoid_: unconfirmed tier, manual tier
 **Apply**:
 The tiered-apply glue (`ccsnoop apply` / `src/apply.js`, #98) that turns a `fine-tune --json` report into action under ADR-0004: presents a diff of the safe-subset `settings.json` changes, writes ONLY the safe subset on explicit approval (`--yes`) via an idempotent read-modify-write merge (merge, never overwrite; refuse foreign keys; never touch `.ccsnoop/`), emits the advice levers as paste-only output, and emits a restart reminder after any write. Consumes the contract's tier split directly — does not re-derive tiers.
 _Avoid_: auto-tuner, settings patcher
-
