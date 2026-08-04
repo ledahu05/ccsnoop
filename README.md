@@ -356,6 +356,16 @@ $ ccsnoop stop
 stopped (pid 304)
 ```
 
+> **`stop` only kills the daemon — it is *not* `init --undo`.** The
+> `ANTHROPIC_BASE_URL` line stays in every init'd `settings.local.json`, and any
+> Claude Code session launched while a repo was init'd has that URL **cached
+> in-process for its whole lifetime**. So once the daemon is gone, those sessions
+> retry on `ConnectionRefused`. `stop` warns when it detects such sessions and
+> lists the PIDs/repos to restart. To also un-route every repo in one go (so a
+> *relaunched* session isn't left pointing at the dead port), use
+> `ccsnoop stop --clean` — but **already-running sessions must still be restarted**;
+> neither `stop` nor `--clean` can reach env they cached at launch.
+
 **Delete captured data.** Captures live in each repo under `.ccsnoop/`. To throw a
 repo's captures away, delete that folder:
 
@@ -375,7 +385,7 @@ Run `ccsnoop <command> [options]`. `--help` prints this same list.
 | -------- | ------------ | ------- |
 | `init`   | Activate capture for the current repo (writes the `.claude/settings.local.json` env, gitignores `.ccsnoop/`, registers the route). Restart Claude Code after. | `--force` overwrite a foreign `ANTHROPIC_BASE_URL`<br>`--undo` revert exactly what a prior init added |
 | `start`  | Start the capture-proxy daemon (detached; returns immediately). | `--port <n>` listen port (persisted to `~/.ccsnoop/config.json`)<br>`--sessions-dir <p>` capture root (default `~/.ccsnoop/sessions`) |
-| `stop`   | Stop the daemon (drain, then terminate). | — |
+| `stop`   | Stop the daemon (drain, then terminate). Warns about live sessions still routed through it. | `--clean` also un-route every registered repo (`init --undo` for all) |
 | `status` | Report daemon status (running → exit `0`, stopped → exit `1`). | — |
 | `report` | Render a captured session to a self-contained static HTML file. | `--root <path>` capture root (default `./.ccsnoop`)<br>`--sessions-dir <p>` dir holding session subdirs (overrides `--root`)<br>`--session <id>` session to render (default: latest)<br>`--all` widen discovery across `~/.ccsnoop/routes.json`<br>`--out <path>` output file (default `<session-dir>/report.html`)<br>`--bloat-floor <n>` bloat: absolute byte floor (default `4096`)<br>`--bloat-multiplier <n>` bloat: sibling-outlier multiplier (default `3`) |
 | `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP deny)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run |
@@ -416,6 +426,22 @@ term in one sentence:
   at startup — quit it completely and reopen it.
 - **`init` wasn't run in this repo.** Capture is per-repo. `cd` into the repo and run
   `ccsnoop init` there; confirm a `.ccsnoop/` folder appears once you use Claude Code.
+
+**`ConnectionRefused` looping in a session after `ccsnoop stop`.** Claude Code
+reads `ANTHROPIC_BASE_URL` once, at launch, and caches it for the session's whole
+lifetime (and so do every subagent/hook/git process it spawns). `stop` kills the
+daemon but cannot touch that in-process env, so any session launched while a repo
+was init'd keeps pointing at the now-dead port and retries forever:
+
+```
+* Unable to connect to API (ConnectionRefused) · Retrying in 10s  attempt 5/10
+```
+
+`stop` detects this and prints the offending PIDs/repos. Fix it by **restarting
+those sessions**. To also clear the stale URL for *future* launches, un-route the
+repo with `ccsnoop init --undo` (or `ccsnoop stop --clean` for every repo at
+once) — but that only helps sessions you relaunch afterwards, not the ones
+already running.
 
 **Port already in use.** If another program is on port `41377`, `start` refuses
 rather than guessing another port:

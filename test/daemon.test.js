@@ -8,12 +8,40 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import * as daemon from '../src/daemon.js';
+import { init } from '../src/init.js';
 
 const BIN = fileURLToPath(new URL('../bin/ccsnoop.js', import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function mkHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-daemon-'));
+}
+
+/** A fresh git repo in a temp dir (for the `stop --clean` CLI tests). */
+function mkRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-stop-repo-'));
+  const r = spawnSync('git', ['init', '-q'], { cwd: dir });
+  assert.equal(r.status, 0, 'git init failed');
+  return dir;
+}
+
+/** Grab an ephemeral free port (released before the caller binds it). */
+function freePort() {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.listen(0, '127.0.0.1', () => {
+      const p = /** @type {net.AddressInfo} */ (s.address()).port;
+      s.close(() => resolve(p));
+    });
+  });
+}
+
+/** Safety net: ensure no daemon is left running under `home`. */
+function killDaemon(home) {
+  const pid = daemon.readPid(home);
+  if (pid && daemon.isAlive(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
 }
 
 /** A pid guaranteed to be dead (or at least not this process's live daemon). */
@@ -206,6 +234,112 @@ test('stop SIGKILLs a process that ignores SIGTERM', async () => {
   assert.equal(daemon.isAlive(child.pid), false);
 });
 
+// ── scanLiveRoutes / stranded-session scan (issue #90, gap 2) ────────────────
+
+/** Build a fake `/proc` tree from `{pid, env, cwd}` entries (cwd optional). */
+function fakeProc(entries) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-proc-'));
+  for (const e of entries) {
+    const d = path.join(root, String(e.pid));
+    fs.mkdirSync(d, { recursive: true });
+    const envVars = Object.entries(e.env).map(([k, v]) => `${k}=${v}`);
+    fs.writeFileSync(path.join(d, 'environ'), envVars.join('\0'));
+    if (e.cwd) fs.symlinkSync(e.cwd, path.join(d, 'cwd'));
+  }
+  return root;
+}
+
+test('scanLiveRoutes finds a process holding the daemon port+token, with its cwd', () => {
+  const proc = fakeProc([
+    { pid: 12345, env: { ANTHROPIC_BASE_URL: 'http://localhost:41377/5805dc48' }, cwd: '/home/x/repo' },
+  ]);
+  const found = daemon.scanLiveRoutes(41377, { procRoot: proc, selfPid: 1 });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].pid, 12345);
+  assert.equal(found[0].cwd, '/home/x/repo');
+  assert.equal(found[0].token, '5805dc48');
+  assert.equal(found[0].url, 'http://localhost:41377/5805dc48');
+});
+
+test('scanLiveRoutes also matches 127.0.0.1', () => {
+  const proc = fakeProc([
+    { pid: 2, env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:41377/abc12345' }, cwd: '/r' },
+  ]);
+  const found = daemon.scanLiveRoutes(41377, { procRoot: proc, selfPid: 1 });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].token, 'abc12345');
+});
+
+test('scanLiveRoutes ignores a wrong port, a foreign URL, a URL under another var, and non-numeric dirs', () => {
+  const proc = fakeProc([
+    { pid: 10, env: { ANTHROPIC_BASE_URL: 'http://localhost:9999/5805dc48' }, cwd: '/a' }, // wrong port
+    { pid: 11, env: { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' }, cwd: '/b' },      // foreign
+    { pid: 12, env: { OTHER: 'x' }, cwd: '/c' },                                           // no base url
+    { pid: 13, env: { DEBUG_URL: 'http://localhost:41377/5805dc48' }, cwd: '/d' },         // right URL, wrong var
+  ]);
+  // A non-numeric dir entry must be skipped without error.
+  fs.mkdirSync(path.join(proc, 'self'));
+  fs.writeFileSync(path.join(proc, 'self', 'environ'), '');
+  assert.deepEqual(daemon.scanLiveRoutes(41377, { procRoot: proc, selfPid: 1 }), []);
+});
+
+test('scanLiveRoutes does not throw on a missing cwd symlink (reports empty cwd)', () => {
+  const proc = fakeProc([
+    { pid: 20, env: { ANTHROPIC_BASE_URL: 'http://localhost:41377/5805dc48' } }, // no cwd link
+  ]);
+  const found = daemon.scanLiveRoutes(41377, { procRoot: proc, selfPid: 1 });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].cwd, '');
+});
+
+test('scanLiveRoutes is a no-op without /proc and never reports the calling process', () => {
+  assert.deepEqual(daemon.scanLiveRoutes(41377, { procRoot: '/no/such/proc', selfPid: 1 }), []);
+
+  const proc = fakeProc([
+    { pid: 42, env: { ANTHROPIC_BASE_URL: 'http://localhost:41377/5805dc48' }, cwd: '/r' },
+  ]);
+  assert.deepEqual(
+    daemon.scanLiveRoutes(41377, { procRoot: proc, selfPid: 42 }),
+    [],
+    'the calling process is excluded',
+  );
+});
+
+test('summarizeStranded groups by cwd with sorted pids', () => {
+  const summary = daemon.summarizeStranded([
+    { pid: 5, cwd: '/a', token: 't1', url: 'u' },
+    { pid: 3, cwd: '/a', token: 't1', url: 'u' }, // same cwd → grouped
+    { pid: 9, cwd: '/b', token: 't2', url: 'u' },
+    { pid: 7, cwd: '', token: 't3', url: 'u' },    // blank cwd bucketed
+  ]);
+  assert.equal(summary.count, 3);
+  const a = summary.groups.find((g) => g.cwd === '/a');
+  assert.deepEqual(a.pids, [3, 5], 'pids sorted ascending within a cwd');
+  assert.ok(summary.groups.find((g) => g.cwd === '(unknown cwd)' && g.pids[0] === 7));
+});
+
+test('stop returns stranded sessions (injected scan) on the not-running path', async () => {
+  const home = mkHome();
+  const sentinel = [{ pid: 1, cwd: '/x', token: 't', url: 'u' }];
+  const res = await daemon.stop(home, { scanLiveRoutes: () => sentinel });
+  assert.equal(res.stopped, false);
+  assert.equal(res.line, 'not running');
+  assert.equal(res.stranded, sentinel, 'scan runs even when nothing was running');
+});
+
+test('stop returns stranded sessions (injected scan) after a real kill', async () => {
+  const home = mkHome();
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+  await sleep(100);
+  daemon.writePid(home, child.pid);
+  const sentinel = [{ pid: 2, cwd: '/y', token: 't2', url: 'u2' }];
+  const exited = new Promise((r) => child.on('exit', r));
+  const res = await daemon.stop(home, { graceMs: 3000, pollMs: 25, scanLiveRoutes: () => sentinel });
+  await exited;
+  assert.equal(res.stopped, true);
+  assert.equal(res.stranded, sentinel, 'scan ran after the kill');
+});
+
 // ── end-to-end through the CLI ───────────────────────────────────────────────
 
 /** Run the CLI to completion; resolve { code, stdout, stderr }. */
@@ -286,5 +420,51 @@ test('CLI: start (detached) → status → stop, on an ephemeral port', async ()
     if (pid && daemon.isAlive(pid)) {
       try { process.kill(pid, 'SIGKILL'); } catch {}
     }
+  }
+});
+
+// ── stop --clean (issue #90, gap 1) ──────────────────────────────────────────
+
+test('CLI: stop --clean un-routes every registered repo', async () => {
+  const home = mkHome();
+  const repo = mkRepo();
+  // Register a route + write settings into the repo (init needs no daemon).
+  init({ cwd: repo, home });
+  assert.equal(daemon.countRoutes(home), 1);
+  assert.ok(fs.existsSync(path.join(repo, '.claude', 'settings.local.json')));
+
+  const port = await freePort();
+  try {
+    assert.equal((await runCli(['start', '--home', home, '--port', String(port)])).code, 0);
+    const stop = await runCli(['stop', '--clean', '--home', home]);
+    assert.equal(stop.code, 0, stop.stderr);
+    assert.match(stop.stdout, /un-routing 1 repo/);
+    assert.equal(daemon.countRoutes(home), 0, 'route removed by --clean');
+    assert.ok(
+      !fs.existsSync(path.join(repo, '.claude', 'settings.local.json')),
+      'init-created settings removed',
+    );
+  } finally {
+    killDaemon(home);
+  }
+});
+
+test('CLI: plain stop leaves routes intact (only the daemon dies)', async () => {
+  const home = mkHome();
+  const repo = mkRepo();
+  init({ cwd: repo, home });
+
+  const port = await freePort();
+  try {
+    assert.equal((await runCli(['start', '--home', home, '--port', String(port)])).code, 0);
+    const stop = await runCli(['stop', '--home', home]);
+    assert.equal(stop.code, 0, stop.stderr);
+    assert.equal(daemon.countRoutes(home), 1, 'default stop does NOT un-route (spec §3.4)');
+    assert.ok(
+      fs.existsSync(path.join(repo, '.claude', 'settings.local.json')),
+      'settings left intact by a plain stop',
+    );
+  } finally {
+    killDaemon(home);
   }
 });

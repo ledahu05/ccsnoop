@@ -111,6 +111,146 @@ function isZombie(pid) {
 }
 
 /**
+ * A live process still holding a ccsnoop-shaped `ANTHROPIC_BASE_URL` in its env
+ * — a session a `stop` just stranded (issue #90).
+ * @typedef {Object} StrandedRoute
+ * @property {number} pid
+ * @property {string} cwd   Working tree (empty if `/proc/<pid>/cwd` was unreadable).
+ * @property {string} token The 8-hex route token cached in the URL.
+ * @property {string} url   The full `http://localhost:<port>/<token>` base URL.
+ */
+
+/**
+ * The result of {@link stop}.
+ * @typedef {Object} StopResult
+ * @property {boolean} stopped   True iff a live daemon was actually terminated.
+ * @property {StrandedRoute[]} stranded Live sessions still routed at the daemon's port.
+ * @property {string} line
+ * @property {number} exitCode
+ * @property {number} [pid]     Present only when a daemon was actually stopped.
+ * @property {boolean} [killed] Present only when SIGKILL escalation was used.
+ */
+
+/**
+ * One stranded working tree in a {@link StrandedSummary}: a session's main
+ * process plus the children that inherited its cached env.
+ * @typedef {Object} StrandedGroup
+ * @property {string} cwd
+ * @property {number[]} pids
+ * @property {string} token
+ */
+
+/**
+ * {@link summarizeStranded}'s output: stranded sessions collapsed by cwd.
+ * @typedef {Object} StrandedSummary
+ * @property {number} count          Number of distinct cwds (sessions).
+ * @property {StrandedGroup[]} groups
+ */
+
+/**
+ * The URL a live Claude Code session caches after `ccsnoop init`:
+ * `http://localhost:<port>/<token>` (§3.2/§3.3), also accepting `127.0.0.1`.
+ * Parameterised by port so {@link scanLiveRoutes} only flags sessions pointing
+ * at the daemon we actually control.
+ * @param {number} port
+ * @returns {RegExp}
+ */
+function liveRouteUrlRe(port) {
+  // Anchor to the env-var name so a ccsnoop-shaped URL appearing in some OTHER
+  // env var (a debug/log value) can't false-positive: environ is NUL-separated
+  // `KEY=VALUE`, so `ANTHROPIC_BASE_URL=` always precedes the cached URL. Group 1
+  // = the base URL, group 2 = the token. `:<port>/` is anchored by the colon
+  // before and the slash + 8-hex token after, so port 4137 never matches 41377.
+  return new RegExp(
+    `ANTHROPIC_BASE_URL=(https?://(?:localhost|127\\.0\\.0\\.1):${port}/([0-9a-f]{8}))`,
+  );
+}
+
+/**
+ * Scan `/proc/<pid>/environ` for live processes still holding a ccsnoop-shaped
+ * `ANTHROPIC_BASE_URL` at `localhost:<port>` — i.e. the Claude Code sessions a
+ * `stop` just stranded (issue #90, gap 2). CC caches that env at launch and
+ * never re-reads it, so once the daemon dies these sessions retry on
+ * `ConnectionRefused` forever; this lists them so the user knows which sessions
+ * to restart.
+ *
+ * Returns `{pid, cwd, token, url}` per match. Linux-only via `/proc`; where
+ * `/proc` is absent (macOS/Windows, or an injected test root) this is a no-op
+ * returning `[]`. Processes whose environ we cannot read (owned by another user,
+ * kernel threads, already-reaped) are skipped silently, and the calling process
+ * is excluded. NB: a session launched under an older port (before `start --port`
+ * changed it) carries that older port and won't be flagged — the scan keys off
+ * the *current* configured port only.
+ *
+ * @param {number} port
+ * @param {object} [opts]
+ * @param {string} [opts.procRoot] Injectable `/proc` root (testing/isolation).
+ * @param {number} [opts.selfPid]  pid to exclude (default `process.pid`).
+ * @returns {StrandedRoute[]}
+ */
+export function scanLiveRoutes(port, opts = {}) {
+  const procRoot = opts.procRoot ?? '/proc';
+  const selfPid = opts.selfPid ?? process.pid;
+  const re = liveRouteUrlRe(port);
+  /** @type {StrandedRoute[]} */
+  const found = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(procRoot);
+  } catch {
+    return found; // no /proc → nothing to scan (non-Linux, or an absent test root)
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue; // only numeric pid directories
+    const pid = Number(name);
+    if (pid === selfPid) continue;
+    let raw;
+    try {
+      raw = fs.readFileSync(path.join(procRoot, name, 'environ'), 'utf8');
+    } catch {
+      continue; // gone, kernel thread, or not readable (another user's process)
+    }
+    const match = raw.match(re);
+    if (!match) continue;
+    let cwd = '';
+    try {
+      cwd = fs.readlinkSync(path.join(procRoot, name, 'cwd'));
+    } catch {
+      cwd = ''; // unreadable cwd — still report the pid, just without a path
+    }
+    found.push({ pid, cwd, token: match[2], url: match[1] });
+  }
+  return found;
+}
+
+/**
+ * Group raw {@link scanLiveRoutes} hits by working directory — a Claude Code
+ * main process and the subagents/hooks it spawns all inherit the same cached
+ * `ANTHROPIC_BASE_URL`, so one *session* ≈ one cwd. Used by `stop` to render a
+ * concise stranded-session warning instead of a pid-per-child dump (issue #90).
+ *
+ * @param {StrandedRoute[]} stranded
+ * @returns {StrandedSummary}
+ *   `count` is the number of distinct cwds (sessions); pids are sorted ascending.
+ */
+export function summarizeStranded(stranded) {
+  /** @type {Map<string, { pids: number[], token: string }>} */
+  const byCwd = new Map();
+  for (const s of stranded) {
+    const key = s.cwd || '(unknown cwd)';
+    const g = byCwd.get(key);
+    if (g) g.pids.push(s.pid);
+    else byCwd.set(key, { pids: [s.pid], token: s.token });
+  }
+  const groups = [...byCwd.entries()].map(([cwd, g]) => ({
+    cwd,
+    pids: g.pids.slice().sort((a, b) => a - b),
+    token: g.token,
+  }));
+  return { count: groups.length, groups };
+}
+
+/**
  * Liveness check via `process.kill(pid, 0)` (spec §3.4). `EPERM` means the
  * process exists but is owned by someone else — still alive. A pid that exists
  * only as an unreaped zombie counts as dead (it is no longer serving).
@@ -347,19 +487,29 @@ export async function start(home, opts = {}) {
  * ~5s → `SIGKILL` if still alive → remove the pidfile. Leaves `config.json` and
  * `routes.json` intact. No/stale pidfile → `not running`, exit 0.
  *
+ * After the kill, scans for live Claude Code sessions still pointing at the
+ * daemon's port (issue #90) and returns them as `stranded`; the CLI turns a
+ * non-empty list into a "restart these sessions" warning. Un-routing repos is
+ * *not* done here — the spec wants routes to survive a restart — that lives
+ * behind the opt-in `stop --clean` in the CLI.
+ *
  * @param {string} home
  * @param {object} [opts]
  * @param {number} [opts.graceMs] Drain window before SIGKILL (default 5000).
  * @param {number} [opts.pollMs]  Liveness poll interval (default 100).
+ * @param {function(number): StrandedRoute[]} [opts.scanLiveRoutes]
+ *   Injectable stranded-session scanner (default {@link scanLiveRoutes}).
+ * @returns {Promise<StopResult>}
  */
 export async function stop(home, opts = {}) {
   const graceMs = opts.graceMs ?? 5000;
   const pollMs = opts.pollMs ?? 100;
+  const scan = opts.scanLiveRoutes ?? scanLiveRoutes;
 
   const pid = readPid(home);
   if (!pid || !isAlive(pid)) {
     removePid(home); // clean a stale pidfile
-    return { stopped: false, line: 'not running', exitCode: 0 };
+    return { stopped: false, stranded: scan(configuredPort(home)), line: 'not running', exitCode: 0 };
   }
 
   try {
@@ -389,6 +539,7 @@ export async function stop(home, opts = {}) {
     stopped: true,
     pid,
     killed,
+    stranded: scan(configuredPort(home)),
     line: `stopped (pid ${pid})`,
     exitCode: 0,
   };
