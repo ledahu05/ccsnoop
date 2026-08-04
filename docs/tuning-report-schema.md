@@ -47,6 +47,43 @@ $schema · schemaVersion · kind · unit · session · note · totals
 `fine-tune` sets `kind: "tuning-report"`; `floor` would set e.g. `kind: "floor-report"`
 reusing `$schema` / `schemaVersion` / `session` / `unit`. A consumer switches on `kind`.
 
+### `tuning-session` — the before/after floor delta (`ccsnoop verify --json`)
+
+[`ccsnoop verify`](../src/verify.js) (`#96`, part of `#94`) reuses the same envelope with
+`kind: "tuning-session"` and `unit: "tokens"`. Given two captured sessions (a **before**
+and an **after** — one tuning session), it computes the turn-1 floor ([`floor`](../src/floor.js),
+`#99`) on each and diffs them, proving whether the tuning lowered the floor. ccsnoop
+**emits** the pairing; it does not decide which two sessions pair (the skill in `#97` does).
+
+```
+{
+  "$schema":       "https://ccsnoop.dev/schemas/tuning-report/v1.json",
+  "schemaVersion": 1,
+  "kind":          "tuning-session",
+  "unit":          "tokens",
+  "session":       { "before": <id>, "after": <id> },     // the durable pairing
+  "window":        <tokens>,                               // scored identically on both sides
+  "note":          "<real-tokens vs byte-proxy explanation>",
+  "before":        { id, headline, attribution },          // each side IS a floor context
+  "after":         { id, headline, attribution },
+  "delta": {
+    "tokens": { before, after, absolute, relative, source },  // real captured usage; null when a side has none
+    "bytes":  { before, after, absolute, relative, source, blocks[] },  // byte proxy + per-block breakdown
+    "verdict": "lowered" | "raised" | "flat",
+    "basis":  "tokens" | "bytes"                              // bytes only when a side lacks usage
+  }
+}
+```
+
+- **`delta.tokens.absolute`** = `after − before` (negative ⇒ floor lowered); **`relative`**
+  = `round(Δ / before * 100)`, `null` on a zero before baseline.
+- **`delta.bytes.blocks[]`** matches contributors across the two floors
+  (`{ kind, label, detail, beforeBytes, afterBytes, delta, direction }`), ranked by absolute
+  change; `direction` is `grew` / `shrank` / `flat`.
+- The token headline is real captured `usage` (never re-tokenized); every per-block figure
+  is a labelled byte proxy. When one side has no captured usage, `delta.tokens.absolute` is
+  `null` and the `verdict` falls back to the byte proxy (`basis: "bytes"`).
+
 ---
 
 ## The safe / advice split (GAP A — the contract's reason to exist)

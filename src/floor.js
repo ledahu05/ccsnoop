@@ -48,11 +48,12 @@ export const DEFAULT_WINDOW_TOKENS = 200000;
 /**
  * A byte count as a compact human string (e.g. 8192 → "8.0K"). Mirrors the proxy the
  * rest of the diagnostics use — renders an already-computed byte length, never a
- * re-tokenized estimate.
+ * re-tokenized estimate. Exported so `verify`'s before/after byte cells format
+ * identically to `floor`'s table — one byte proxy, one rendering.
  * @param {number} bytes
  * @returns {string}
  */
-function fmtBytes(bytes) {
+export function fmtBytes(bytes) {
   if (bytes < 1024) return `${bytes}`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}K`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}M`;
@@ -61,10 +62,11 @@ function fmtBytes(bytes) {
 /**
  * An integer with a comma thousands separator (3000 → "3,000"). Tokens are the
  * headline's real unit; grouping them keeps the figure legible next to "200,000".
+ * Exported so `verify`'s before/after token cells format identically to `floor`'s.
  * @param {number} n
  * @returns {string}
  */
-function fmtTokens(n) {
+export function fmtTokens(n) {
   return Math.round(n)
     .toString()
     .replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -195,10 +197,15 @@ export function computeFloor(model, opts = {}) {
 
 /**
  * The display label for one attribution block (e.g. `tool: Read`, `CLAUDE.md <path>`).
- * @param {FloorBlock} a
+ * Exported so `verify` labels the same contributors with the same strings `floor` does
+ * — a delta row must read exactly like the rows it is the difference of. Typed on the
+ * structural fields it reads (`kind` / `label` / `detail`), so a `FloorBlock` and a
+ * verify `BlockDelta` (which carries `beforeBytes` / `afterBytes` instead of `bytes`)
+ * both fit without restating the full attribution shape.
+ * @param {{ kind: FloorBlock['kind'], label: string, detail: string | null }} a
  * @returns {string}
  */
-function blockLabel(a) {
+export function blockLabel(a) {
   switch (a.kind) {
     case 'tool':
       return `tool: ${a.label}`;

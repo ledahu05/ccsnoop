@@ -30,6 +30,7 @@ import {
   HOOK_INTENT_CAVEAT,
 } from './finetune-levers.js';
 import { computeGain, EMPTY_GAIN, NULL_SOURCE } from './finetune-gain.js';
+import { fitLabel } from './format.js';
 import { buildJsonReport, summarizeLevers, sumMcpServerBytes } from './finetune-json.js';
 import { DEFAULT_WASTE_CONFIG } from './waste.js';
 
@@ -62,33 +63,15 @@ const TABLE_WIDTH = COL.lever + 1 + COL.entry + 1 + COL.bytes + 2 + COL.bytes + 
 /**
  * Column widths of the byte-cost ranking table (issue #100). The header and every row
  * pass through {@link rankRow} with these widths — and every label through
- * {@link fitEntry}, which pads OR elides to exactly `entry` characters, so a label can
- * never drift out of alignment with the figures under it. The `note` column is trailing
- * free-form text (a deny flag, a tool count, "% of system") — not padded, so it needs
- * no width.
+ * {@link module:format.fitLabel}, which pads OR elides to exactly `entry` characters,
+ * so a label can never drift out of alignment with the figures under it. The `note`
+ * column is trailing free-form text (a deny flag, a tool count, "% of system") — not
+ * padded, so it needs no width.
  */
 const RANK = { entry: 36, bytes: 8 };
 
 /** Width of the ranking table's horizontal rule — entry + shipped + waste columns. */
 const RANK_RULE = '─'.repeat(RANK.entry + 1 + RANK.bytes + 2 + RANK.bytes);
-
-/** Leading characters kept when a label is elided — enough to hold `CLAUDE.md /hom…`. */
-const RANK_ELIDE_HEAD = 14;
-
-/**
- * An entry label in exactly {@link RANK.entry} characters: padded when it fits, else
- * middle-elided. A CLAUDE.md source is an absolute path and routinely overruns the
- * column; padEnd alone would shove the byte columns right on precisely the rows a
- * maintainer wants to compare. Eliding the MIDDLE keeps both the kind prefix
- * (`tool` / `MCP` / `CLAUDE.md`) and the tail that identifies the entry (a basename).
- * @param {string} label
- * @returns {string}
- */
-function fitEntry(label) {
-  if (label.length <= RANK.entry) return label.padEnd(RANK.entry);
-  const tail = RANK.entry - RANK_ELIDE_HEAD - 1; // 1 for the ellipsis
-  return `${label.slice(0, RANK_ELIDE_HEAD)}…${label.slice(label.length - tail)}`;
-}
 
 /**
  * One line of the byte-cost ranking table (issue #100): an indented entry label, then
@@ -103,7 +86,7 @@ function fitEntry(label) {
  */
 function rankRow(entry, shippedCell, wasteCell, note) {
   return (
-    `  ${fitEntry(entry)} ${shippedCell.padStart(RANK.bytes)}  ${wasteCell.padStart(RANK.bytes)}  ${note}`
+    `  ${fitLabel(entry, RANK.entry)} ${shippedCell.padStart(RANK.bytes)}  ${wasteCell.padStart(RANK.bytes)}  ${note}`
   ).trimEnd();
 }
 
