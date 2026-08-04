@@ -96,29 +96,39 @@ export function summarizeLevers({ deny, mcp, levers, gain }) {
  * segments the gain model already attributes individually). A deferred-only server
  * has no such segments → 0, which is honest (its schema isn't shipped) — not "free".
  *
+ * `tools` counts the definitions summed into a server, so a caller can say "N tools"
+ * without walking the map again and re-deriving the server of each name — one place
+ * decides which name belongs to which server ({@link mcpServerOf}).
+ *
  * @param {Map<string, { shipped: number, waste: number }>} toolMap
- * @returns {Map<string, { shipped: number, waste: number }>}
+ * @returns {Map<string, { shipped: number, waste: number, tools: number }>}
  */
 export function sumMcpServerBytes(toolMap) {
-  /** @type {Map<string, { shipped: number, waste: number }>} */
+  /** @type {Map<string, { shipped: number, waste: number, tools: number }>} */
   const acc = new Map();
   for (const [name, g] of toolMap) {
     const server = mcpServerOf(name);
     if (server === null) continue; // a built-in tool, not an MCP tool def
     let e = acc.get(server);
     if (!e) {
-      e = { shipped: 0, waste: 0 };
+      e = { shipped: 0, waste: 0, tools: 0 };
       acc.set(server, e);
     }
     e.shipped += g.shipped;
     e.waste += g.waste;
+    e.tools += 1;
   }
   return acc;
 }
 
-/** True for a built-in tool name — an `mcp__*` def belongs to the MCP lever, not this one. */
+/**
+ * True for a built-in tool name. A name belongs to the MCP lever exactly when it
+ * names a server ({@link mcpServerOf}) — an `mcp__`-prefixed name that parses to no
+ * server (e.g. `mcp__lonely`, no `__<tool>` suffix) is nobody's MCP tool def, so it
+ * stays a built-in here rather than falling between the two levers unlisted.
+ */
 function isBuiltinTool(name) {
-  return !name.startsWith('mcp__');
+  return mcpServerOf(name) === null;
 }
 
 /**

@@ -563,6 +563,87 @@ test('byte-cost ranking lists every shipped tool (not only denied), per-server M
   assert.ok(/^  tool Bash\s+4\.9K\s+1000$/m.test(joined), 'a non-denied tool carries no deny mark');
 });
 
+/** The ranked rows of a rendered diagnostic — every line between the rule and the blank. */
+function rankingRows(lines) {
+  const rule = lines.findIndex((l) => /^  ─+$/.test(l));
+  if (rule < 0) return [];
+  const rows = [];
+  for (let i = rule + 1; i < lines.length && lines[i] !== ''; i++) rows.push(lines[i]);
+  return rows;
+}
+
+/**
+ * A one-CLAUDE.md-source ctx for {@link renderFineTune}, parameterised by tool map +
+ * source. `shipped` defaults to the tool map's names (the by-construction case).
+ * @param {{ tool: Map<string, { shipped: number, waste: number }>, source?: string,
+ *   shipped?: string[], deny?: string[], servers?: any[] }} opts
+ */
+function rankCtx({ tool, source = './CLAUDE.md', shipped, deny = [], servers = [] }) {
+  return {
+    sessionId: 's',
+    requests: 1,
+    shipped: shipped ?? [...tool.keys()],
+    deny,
+    mcp: { sessionCount: 1, singleSession: true, servers },
+    levers: {
+      systemBytes: 12000,
+      hook: { bytes: 0, aboveFloor: false, deny: false },
+      claudeMd: [{ source, bytes: 1500, pct: 12, excludable: true, deny: false }],
+    },
+    gain: {
+      tool,
+      claudeMd: new Map([[source, { shipped: 1500, waste: 0 }]]),
+      hook: { shipped: 0, waste: 0 },
+      mcp: { shipped: 0, waste: 0 },
+      harness: { shipped: 0, waste: 0 },
+    },
+  };
+}
+
+test('byte-cost ranking keeps its columns aligned when an entry label overflows', () => {
+  // A real CLAUDE.md source is an absolute path — longer than the entry column. An
+  // over-long label must not shove the byte columns right, or the ranking stops being
+  // scannable exactly on the rows a maintainer most wants to compare.
+  const source = '/home/agent/workspace/deeply/nested/project/CLAUDE.md';
+  const { lines } = renderFineTune(rankCtx({ tool: new Map([['Bash', { shipped: 5000, waste: 1000 }]]), source }));
+  const rows = rankingRows(lines);
+  assert.equal(rows.length, 2, `one tool row + one CLAUDE.md row:\n${lines.join('\n')}`);
+  // Each row: 2-space indent, a fixed-width entry field, then the right-aligned bytes.
+  // An overflowing label pushes the figures right and fails this.
+  for (const row of rows) {
+    assert.match(row, /^ {2}.{36} {1,7}[\d.KM]+ {2}/, `row keeps the byte columns aligned: ${JSON.stringify(row)}`);
+  }
+  // The elided label still ends in the basename — the part that identifies the source.
+  const mdRow = rows.find((r) => /^ {2}CLAUDE\.md/.test(r)) ?? '';
+  assert.match(mdRow, /CLAUDE\.md\s/, `elided source keeps its basename: ${JSON.stringify(mdRow)}`);
+});
+
+test('byte-cost ranking ranks a shipped tool the gain model never charged (0 bytes, still listed)', () => {
+  // The tools lever's JSON items deliberately union `shipped` with the gain model's
+  // names so a shipped name can never vanish from the view that claims to list it
+  // (issue #95). The ranking claims to list EVERY shipped tool — same contract.
+  const { lines } = renderFineTune(
+    rankCtx({ tool: new Map([['Bash', { shipped: 5000, waste: 0 }]]), shipped: ['Bash', 'Uncharged'] })
+  );
+  assert.ok(
+    lines.some((l) => /^ {2}tool Uncharged\s+0\s+0$/.test(l)),
+    `a shipped-but-uncharged tool is ranked at 0 bytes:\n${lines.join('\n')}`
+  );
+});
+
+test('byte-cost ranking never drops a tool whose name only looks like an MCP name', () => {
+  // `mcp__lonely` has the mcp__ prefix but no `__<tool>` suffix, so it names no server.
+  // It is still a shipped tool costing bytes — it must be ranked, not silently dropped
+  // between the built-in branch and the per-server aggregate.
+  const { lines } = renderFineTune(
+    rankCtx({ tool: new Map([['mcp__lonely', { shipped: 4000, waste: 100 }]]) })
+  );
+  assert.ok(
+    lines.some((l) => /^ {2}tool mcp__lonely\s+3\.9K\s+100$/.test(l)),
+    `an unparseable mcp__ name is ranked as a tool:\n${lines.join('\n')}`
+  );
+});
+
 test('byte-cost ranking is omitted when nothing was captured to rank (no empty table)', () => {
   // An EMPTY gain + empty levers (e.g. a session whose body never parsed) must not
   // print a bare header with no rows. The whole section is absent.

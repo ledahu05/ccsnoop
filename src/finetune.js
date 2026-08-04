@@ -22,7 +22,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadSession, resolveRoots, listSessions, pickLatestSession } from './report.js';
-import { sessionMcpProfile, aggregateMcpCorpus } from './finetune-mcp.js';
+import { sessionMcpProfile, aggregateMcpCorpus, mcpServerOf } from './finetune-mcp.js';
 import {
   sessionLeverProfile,
   buildLeverVerdicts,
@@ -61,14 +61,34 @@ const TABLE_WIDTH = COL.lever + 1 + COL.entry + 1 + COL.bytes + 2 + COL.bytes + 
 
 /**
  * Column widths of the byte-cost ranking table (issue #100). The header and every row
- * pass through {@link rankRow} with these widths, so a label cannot drift out of
- * alignment with the figures under it. The `note` column is trailing free-form text
- * (a deny flag, a tool count, "% of system") — not padded, so it needs no width.
+ * pass through {@link rankRow} with these widths — and every label through
+ * {@link fitEntry}, which pads OR elides to exactly `entry` characters, so a label can
+ * never drift out of alignment with the figures under it. The `note` column is trailing
+ * free-form text (a deny flag, a tool count, "% of system") — not padded, so it needs
+ * no width.
  */
 const RANK = { entry: 36, bytes: 8 };
 
 /** Width of the ranking table's horizontal rule — entry + shipped + waste columns. */
 const RANK_RULE = '─'.repeat(RANK.entry + 1 + RANK.bytes + 2 + RANK.bytes);
+
+/** Leading characters kept when a label is elided — enough to hold `CLAUDE.md /hom…`. */
+const RANK_ELIDE_HEAD = 14;
+
+/**
+ * An entry label in exactly {@link RANK.entry} characters: padded when it fits, else
+ * middle-elided. A CLAUDE.md source is an absolute path and routinely overruns the
+ * column; padEnd alone would shove the byte columns right on precisely the rows a
+ * maintainer wants to compare. Eliding the MIDDLE keeps both the kind prefix
+ * (`tool` / `MCP` / `CLAUDE.md`) and the tail that identifies the entry (a basename).
+ * @param {string} label
+ * @returns {string}
+ */
+function fitEntry(label) {
+  if (label.length <= RANK.entry) return label.padEnd(RANK.entry);
+  const tail = RANK.entry - RANK_ELIDE_HEAD - 1; // 1 for the ellipsis
+  return `${label.slice(0, RANK_ELIDE_HEAD)}…${label.slice(label.length - tail)}`;
+}
 
 /**
  * One line of the byte-cost ranking table (issue #100): an indented entry label, then
@@ -83,7 +103,7 @@ const RANK_RULE = '─'.repeat(RANK.entry + 1 + RANK.bytes + 2 + RANK.bytes);
  */
 function rankRow(entry, shippedCell, wasteCell, note) {
   return (
-    `  ${entry.padEnd(RANK.entry)} ${shippedCell.padStart(RANK.bytes)}  ${wasteCell.padStart(RANK.bytes)}  ${note}`
+    `  ${fitEntry(entry)} ${shippedCell.padStart(RANK.bytes)}  ${wasteCell.padStart(RANK.bytes)}  ${note}`
   ).trimEnd();
 }
 
@@ -108,32 +128,43 @@ function rankRow(entry, shippedCell, wasteCell, note) {
  * sometimes used and is therefore absent from the deny intersection. MCP per-server
  * bytes close the known gap that the lever's deferred-listing figure is one number.
  *
+ * Tool names are the UNION of `shipped` and the gain model's charged names — the same
+ * contract the JSON tools lever holds (`names ⊆ items`, issue #95). Through
+ * {@link fineTune} the two agree by construction (both walk the same `tool:<name>`
+ * segments), but the union means a shipped name can never vanish from the view that
+ * claims to list every one: an uncharged name gets a `0/0` row instead.
+ *
  * @param {{ gain: import('./finetune-gain.js').GainModel,
  *   levers: import('./finetune-levers.js').LeverVerdicts,
- *   deny: string[], mcpDeny: string[] }} ctx
+ *   shipped: string[], deny: string[], mcpDeny: string[] }} ctx
  * @returns {RankEntry[]}
  */
-function buildByteCostRanking({ gain, levers, deny, mcpDeny }) {
+function buildByteCostRanking({ gain, levers, shipped, deny, mcpDeny }) {
   const denySet = new Set(deny);
   const mcpDenySet = new Set(mcpDeny);
   /** @type {RankEntry[]} */
   const entries = [];
 
-  // Built-in tools — one entry per shipped tool name. `mcp__*` tool defs belong to the
-  // per-server aggregate below, not here (they are the MCP lever, not the tools lever).
-  for (const [name, g] of gain.tool) {
-    if (name.startsWith('mcp__')) continue;
+  // Every tool name the session shipped or the gain model charged, with its bytes.
+  /** @type {Map<string, { shipped: number, waste: number }>} */
+  const toolBytes = new Map();
+  for (const name of [...shipped, ...gain.tool.keys()]) {
+    toolBytes.set(name, gain.tool.get(name) ?? { shipped: 0, waste: 0 });
+  }
+
+  // Built-in tools — one entry per name. A name that parses to an MCP server belongs to
+  // the per-server aggregate below (the MCP lever, not the tools lever); an `mcp__` name
+  // that names NO server is nobody's tool def, so it ranks here rather than nowhere.
+  for (const [name, g] of toolBytes) {
+    if (mcpServerOf(name) !== null) continue;
     entries.push({ entry: `tool ${name}`, shipped: g.shipped, waste: g.waste, note: denySet.has(name) ? 'deny' : '' });
   }
 
   // MCP — per-server, the mcp__<server>__* tool-def segments summed. A deferred-only
   // server ships name-only (no segments), so it does not appear here — its cost is the
   // deferred-listing figure already shown in the action table, honestly not free.
-  const perServer = sumMcpServerBytes(gain.tool);
-  for (const [server, g] of perServer) {
-    let defCount = 0;
-    for (const name of gain.tool.keys()) if (name.startsWith(`mcp__${server}__`)) defCount += 1;
-    const note = `${defCount} tool${defCount === 1 ? '' : 's'}${mcpDenySet.has(server) ? ' · deny' : ''}`;
+  for (const [server, g] of sumMcpServerBytes(toolBytes)) {
+    const note = `${g.tools} tool${g.tools === 1 ? '' : 's'}${mcpDenySet.has(server) ? ' · deny' : ''}`;
     entries.push({ entry: `MCP ${server}`, shipped: g.shipped, waste: g.waste, note });
   }
 
@@ -466,7 +497,7 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   // Always-on (the data is already in the gain model — no new accounting, no flag) but
   // omitted entirely when nothing was captured to rank, so an empty session prints no
   // bare header. Bytes are the canonical byte-length proxy (never re-tokenized).
-  const ranking = buildByteCostRanking({ gain, levers, deny, mcpDeny });
+  const ranking = buildByteCostRanking({ gain, levers, shipped, deny, mcpDeny });
   if (ranking.length > 0) {
     lines.push('');
     lines.push('Byte-cost ranking — every shipped tool / MCP server (per-server) / CLAUDE.md source, by shipped bytes (byte proxy)');

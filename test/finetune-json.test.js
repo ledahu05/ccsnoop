@@ -312,6 +312,31 @@ test('every denied name has an items row even when the gain model charged it not
   for (const n of tools.names) assert.ok(tools.items.some((i) => i.name === n));
 });
 
+test('a shipped mcp__ name that parses to no server stays a built-in tool item', () => {
+  // `mcp__lonely` has the prefix but no `__<tool>` suffix, so it names no server: it
+  // is nobody's MCP tool def. Classifying on the prefix alone would drop it from the
+  // tools lever AND from every per-server aggregate — bytes shipped but never listed.
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: ['Bash', 'mcp__lonely'],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: gainWith([
+      ['Bash', 1000, 0],
+      ['mcp__lonely', 4000, 100],
+    ]),
+  });
+  const tools = r.safeLevers.find((l) => l.lever === 'tools');
+  const lonely = tools.items.find((i) => i.name === 'mcp__lonely');
+  assert.deepEqual(lonely, { name: 'mcp__lonely', shipped: 4000, waste: 100, deny: false });
+  // Its bytes are counted exactly once — in the tools lever, not a phantom server.
+  assert.equal(tools.shipped, 5000);
+  assert.deepEqual(r.safeLevers.find((l) => l.lever === 'mcp').items, []);
+});
+
 test('tools.allowed records the names --deny-allow dropped for this run', () => {
   // Without it a consumer cannot tell "nothing intersects the denylist" from
   // "it matched and was allowed away" — the text renderer spells that out.
