@@ -158,7 +158,10 @@ Commands:
   start    Start the capture-proxy daemon (detached; returns immediately)
              --port <n>           listen port (persisted to ~/.ccsnoop/config.json)
              --sessions-dir <p>   capture root (default ~/.ccsnoop/sessions)
-  stop     Stop the daemon (drain, then terminate)
+  stop     Stop the daemon (drain, then terminate). Warns about live Claude Code
+           sessions still routed through it — restart those, or they'll retry on
+           ConnectionRefused.
+             --clean              also un-route every registered repo (init --undo for all)
   status   Report daemon status (running → exit 0, stopped → exit 1)
   report   Render a captured session to a self-contained static HTML file
              --root <path>        capture root (default ./.ccsnoop)
@@ -177,8 +180,9 @@ Commands:
              --deny-extra <a,b>   add denylist names for this run only
              --deny-allow <a>     drop a denylist name for this run only
              --json               emit the versioned tuning-report contract (issue #95)
-  apply   Apply a fine-tune report's SAFE subset to .claude/settings.json (#98, ADR-0004).
-          Presents a diff; writes only on --yes; advice levers (hooks, CLAUDE.md) are paste-only.
+             --include-tokens     with --json, backfill primary-session token totals
+  apply   Apply a fine-tune report's SAFE subset to .claude/settings.json (issue #98,
+          ADR-0004). Presents a diff; writes only on --yes; advice levers are paste-only.
              --from <path|->     consume a captured report (file, or - for stdin)
              --root <path>       without --from, diagnose this capture root (default ./.ccsnoop)
              --sessions-dir <p>  without --from, dir holding session subdirs (overrides --root)
@@ -193,6 +197,38 @@ Commands:
              --latest             most-recent session (same as the default; no corpus mode)
              --ttl <seconds>      TEMPORAL threshold (default 3600 = 1 h)
              --html               render the same data as a self-contained HTML document
+  floor   Turn-1 baseline metric + ranked per-block attribution (the default context window)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to score (default: latest)
+             --latest             most-recent session (same as the default; no corpus mode)
+             --window <tokens>    context window for the headline % (default 200000)
+  lifetime  Effective context-lifetime metric for one captured session (compaction count,
+           turns/wall-time to the first compaction, per-event bytes-dropped)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to diagnose (default: latest)
+             --latest             most-recent session (same as the default; no corpus mode)
+             --html               render the same data as a self-contained HTML document
+  isolate Subagent context-isolation for one captured session (isolated vs main + counterfactual)
+             --root <path>        capture root (default ./.ccsnoop)
+             --sessions-dir <p>   dir holding session subdirs (overrides --root)
+             --session <id>       session to analyze (default: latest)
+             --threshold <f>      isolation ratio that fires the reco, in [0,1] (default 0.25)
+             --html               render the same data as a self-contained HTML document
+  verify  Before/after floor delta for two captured sessions (a tuning session): did the
+          tuning lower the turn-1 floor, and by how much? Computes floor (#99) on each
+          side and diffs. A pure offline reader of sessions/; the daemon is not required.
+             --before <id>       the baseline session (required)
+             --after <id>        the tuned session (required)
+             --root <path>       capture root (default ./.ccsnoop)
+             --sessions-dir <p>  dir holding session subdirs (overrides --root)
+             --window <tokens>   context window for the headline % (default 200000)
+             --json              emit the versioned tuning-session contract (kind: tuning-session)
+  skill   The publishable context-tuning skill (#97, epic #94). Installs into this repo's
+          .claude/skills/ so it drives ccsnoop's capture → diagnose → apply → verify loop.
+             install             copy the bundled skill into .claude/skills/context-tuning/
+             --force             overwrite files that differ from the bundle (default: refuse)
 ```
 
 ---
@@ -306,9 +342,11 @@ signals, in beginner terms:
 
 ## 5. Diagnostics
 
-Beyond the HTML report, two commands read your captures and tell you how to spend
-fewer tokens. Neither needs the daemon running — both are offline readers of the same
-files `report` reads.
+Beyond the HTML report, a family of offline readers work off the same captured files
+`report` reads — none needs the daemon running. `fine-tune`, `cache`, `floor`, `lifetime`,
+and `isolate` each diagnose a different angle of what a session shipped; `apply` and
+`verify` then act on the diagnosis — the last two steps of the
+[context-tuning loop (§11)](#11-the-context-tuning-skill).
 
 ### `ccsnoop fine-tune` — trim what Claude Code sends
 
@@ -375,6 +413,76 @@ reco: Subagents isolated 75.3% of the inlinable context … Route context-heavy 
 A session with no subagents reports that honestly and emits no reco. Bytes appear only as a
 labelled fallback column, never as the headline currency.
 
+### `ccsnoop floor` — the default context window
+
+The "default context window" *is* the turn-1 floor: everything Claude Code ships before
+you've done any real work — the system prompt, every tool definition, every CLAUDE.md
+source, every MCP tool, the `SessionStart` hook output. `floor` isolates that first
+exchange and attributes it block by block, ranked by byte cost, so you can see which
+static blocks own the baseline you can never drop below. The headline is **real turn-1
+input tokens** read from the captured `usage` (never re-tokenized), framed as a % of a
+context window (`--window`, default `200000`); the per-block table is a byte proxy.
+
+```console
+$ ccsnoop floor
+ccsnoop floor — session <id> (turn 1 of 7)
+model: <model>
+
+Headline
+  floor: <n> tokens  (<p>% of a 200,000-token window; pass --window to override)
+  proxy: <n> bytes — the turn-1 prompt's static blocks, by byte length (never re-tokenized)
+
+Per-block attribution — ranked by byte cost (proxy)
+  block            bytes  % floor
+  ────────────────────────────────────────────────
+  system            …       …
+  tools             …       …
+  …
+```
+
+`floor` is the measurement behind `verify`, and the "incompressible system floor" lever
+`fine-tune` reports is the same number, computed the same way.
+
+### `ccsnoop lifetime` — how long the window lasted
+
+`lifetime` surfaces **compaction as a first-class signal**: how many turns (and how much
+wall-time) the context window survived before it was first compacted, how many compactions
+the session incurred in total, and how many bytes each one dropped. It reframes "my context
+blew up" into a number you can track from session to session. Add `--html` for a
+self-contained document.
+
+```console
+$ ccsnoop lifetime
+session <id> · <n> turns · <h>m
+first compaction at turn <n> (<m>m) — dropped <n> bytes
+compactions: <n>   total dropped: <n> bytes
+```
+
+### `ccsnoop verify` — did the tuning move the floor?
+
+The close-the-loop step. `verify` takes two captures — a **before** and an **after** that
+together form one *tuning session* — computes the turn-1 `floor` on each, and diffs them.
+The headline delta is **real turn-1 tokens** from each side's captured `usage`; the
+per-block delta is a byte proxy matched block-by-block. The verdict is one word —
+**lowered / raised / flat** — so "did this tuning actually shrink the floor?" gets an
+answer, not a guess. A pure offline reader; the daemon is not required.
+
+```console
+$ ccsnoop verify --before <id-before> --after <id-after>
+ccsnoop verify — before/after floor delta
+before: <id-before>    after: <id-after>
+window: 200,000 tokens — scored identically on both sides
+
+Headline — real turn-1 tokens from captured usage
+  before: <n> tokens  (<p>% of window)
+  after:  <n> tokens  (<p>% of window)
+  delta:  −<n> tokens  (lowered)
+```
+
+`apply` and `verify` are the last two steps of the context-tuning loop — see
+[§11](#11-the-context-tuning-skill) for the end-to-end flow, or install the skill that
+drives it with `ccsnoop skill install`.
+
 ---
 
 ## 6. Turning it off / undoing
@@ -436,9 +544,13 @@ Run `ccsnoop <command> [options]`. `--help` prints this same list.
 | `status` | Report daemon status (running → exit `0`, stopped → exit `1`). | — |
 | `report` | Render a captured session to a self-contained static HTML file. | `--root <path>` capture root (default `./.ccsnoop`)<br>`--sessions-dir <p>` dir holding session subdirs (overrides `--root`)<br>`--session <id>` session to render (default: latest)<br>`--all` widen discovery across `~/.ccsnoop/routes.json`<br>`--out <path>` output file (default `<session-dir>/report.html`)<br>`--bloat-floor <n>` bloat: absolute byte floor (default `4096`)<br>`--bloat-multiplier <n>` bloat: sibling-outlier multiplier (default `3`) |
 | `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP deny)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run<br>`--json` emit the versioned `tuning-report/v1` contract ([schema](docs/tuning-report-schema.md))<br>`--include-tokens` with `--json`, backfill primary-session token totals |
+| `apply` | Apply a fine-tune report's SAFE subset to `.claude/settings.json` (#98, ADR-0004). Presents a diff; writes only on `--yes`; advice levers are paste-only. | `--from <path\|->` consume a captured report (file, or `-` for stdin)<br>`--root <path>` without `--from`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` without `--from` (default: latest)<br>`--yes` approve the safe-subset write (else diff-only)<br>`--dry-run` print the diff without writing<br>`--settings <path>` override the target (default `./.claude/settings.json`) |
 | `cache`  | Cache-economy diagnostic for one captured session (per-transition cards + rollup). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--ttl <seconds>` TEMPORAL threshold (default `3600`)<br>`--html` render as a self-contained HTML document |
+| `floor` | Turn-1 baseline metric + ranked per-block attribution (the default context window). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to score (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--window <tokens>` context window for the headline % (default `200000`) |
 | `lifetime` | Effective context-lifetime metric for one captured session (compaction count, turns/wall-time to the first compaction, per-event bytes-dropped). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--html` render as a self-contained HTML document |
 | `isolate` | Subagent context-isolation for one captured session (isolated vs main + an if-inlined counterfactual). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to analyze (default: latest)<br>`--threshold <f>` isolation ratio that fires the reco, in `[0,1]` (default `0.25`)<br>`--html` render as a self-contained HTML document |
+| `verify` | Before/after turn-1 floor delta for two captured sessions (a tuning session): did the tuning lower the floor, and by how much? Pure offline. | `--before <id>` baseline session (required)<br>`--after <id>` tuned session (required)<br>`--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--window <tokens>` context window for the headline % (default `200000`)<br>`--json` emit the versioned `tuning-session` contract |
+| `skill` | The publishable context-tuning skill (#97, epic #94). Installs into this repo's `.claude/skills/` to drive the capture → diagnose → apply → verify loop. | `install` copy the bundled skill into `.claude/skills/context-tuning/`<br>`--force` overwrite files that differ from the bundle (default: refuse) |
 
 ---
 
