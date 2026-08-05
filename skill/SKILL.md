@@ -1,6 +1,6 @@
 ---
 name: context-tuning
-description: Tune this repo's Claude Code context — measure what each session ships, trim it, and prove the trim worked. Drives ccsnoop's loop (capture → diagnose → apply → verify). Triggers on "tune my context", "trim context window", "apply ccsnoop fine-tune", "lower my floor", "context tuning", "what's wasting my context".
+description: Drive ccsnoop's context-tuning loop over this repo — capture → diagnose → apply (tiered) → verify — to trim what each Claude Code session ships and prove the trim worked. Use when the user wants to tune or trim their context window, apply a ccsnoop fine-tune, or lower their turn-1 floor.
 ---
 
 # Context tuning — drive ccsnoop's tuning loop over this repo
@@ -58,6 +58,10 @@ The bootstrap detector's `--json` reports where captures land (`captureDir`, e.g
 `<repo>/.ccsnoop`) and the matched `routeToken`. Tell the user the `captureDir` (it
 is also the session root you'll pick verify's `--before`/`--after` ids from later).
 
+**Done when** a fresh capture of that work exists under `captureDir` (a new
+`<session_id>/`) and reflects real effort — not an empty or throwaway session. Until
+then, you wait; never diagnose from a thin or missing capture.
+
 ### 2. Diagnose — `ccsnoop fine-tune --json`
 
 This is the skill's primary input: the machine-readable contract (the `#95`
@@ -69,21 +73,13 @@ $ ccsnoop fine-tune --json > report.json
 
 Read `report.json`. **First check `schemaVersion` (pin `1`) and `$schema`** — if the
 version is not `1`, stop and tell the user the report is from a contract version
-this skill does not know; never guess at unknown fields. Then read the verdicts.
+this skill does not know; never guess at unknown fields.
 
-The contract partitions the verdicts into two tiers — **this is the one thing you
-must get right** (see ADR-0004, summarized below):
-
-- **`safeLevers`** (`tools`, `mcp`) — carry **dynamic proof** of waste (a tool never
-  called; an MCP server shipped across ≥3 sessions and never invoked). The skill
-  may **write** these on approval.
-- **`adviceLevers`** (`hooks`, `claudeMd`) — **no dynamic proof** (injected every
-  session by construction; cost known, disuse not). The skill **surfaces these
-  paste-only — never writes them.**
-
-The matching `settings.auto` / `settings.advice` blocks reconstruct the exact
-paste-ready `settings.json` the human-facing `ccsnoop fine-tune` emits. Do not
-re-derive which lever is which — read the tier from the contract.
+Then read the verdicts. The contract already partitions them into two tiers — **the
+one thing you must get right.** Read the tier straight off the report
+(`safeLevers` / `adviceLevers`, `settings.auto` / `settings.advice`); the
+**Authority model** below maps each lever to its tier and settings key. Do not
+re-derive which lever carries proof — the contract serialized that distinction for you.
 
 Present the user a short, honest summary: what's recoverable (`totals.recoverable`,
 a byte proxy), which tools/MCPs are provably unused (safe), and which hooks /
@@ -99,17 +95,15 @@ implements the idempotent, strict read-modify-write merge under ADR-0004:
 $ ccsnoop apply --from report.json --dry-run    # show the safe-subset diff
 ```
 
-Show the user the diff. The safe subset is `permissions.deny` (uncalled built-in
-tools) and `disabledMcpjsonServers` (unused MCP servers). On **explicit user
-approval only**, write it:
+Show the user the diff (the **safe** subset only — the **Authority model** below
+says which keys that is). On **explicit user approval only**, write it:
 
 ```console
 $ ccsnoop apply --from report.json --yes
 ```
 
-Then surface the **advice** levers (`settings.advice`: hooks, `claudeMdExcludes`)
-as a **paste-ready block** — `ccsnoop apply` prints it. You may explain them, but
-you do not write them. The user pastes what they want, by hand.
+`ccsnoop apply` then prints the **advice** levers as a **paste-ready block**. You
+may explain them, but you never write them — the user pastes what they want, by hand.
 
 After any write: **remind the user to restart Claude Code.** Settings changes
 recompile the shipped tool set next session.
@@ -129,18 +123,21 @@ labelled byte proxy. Read `delta.verdict` (`lowered` / `raised` / `flat`) and re
 it plainly. If the floor did not move, say so — then re-diagnose the *after*
 capture and iterate. Verify is the unit of *"did this tuning actually work?"*
 
-## Authority model (ADR-0004 — the one-page version)
+## Authority model (ADR-0004 — the single source for the tier split)
 
-The tiers are a property of the **evidence**, not a policy knob:
+The tiers are a property of the **evidence**, not a policy knob. Every lever, its
+proof, its tier, and the settings key it writes — once, here:
 
-- **Safe tier** (dynamic proof → auto-writable on a presented diff + explicit
-  approval): `permissions.deny`, `disabledMcpjsonServers`.
-- **Advice tier** (no proof → paste-only, **never** written): `hooks.SessionStart`,
-  `claudeMdExcludes`.
+| Lever | Proof | Tier | Settings key |
+| ----- | ----- | ---- | ------------ |
+| built-in tools | **dynamic** — name ∩ denylist AND never called | **safe** | `permissions.deny` |
+| MCP | **dynamic** — shipped ≥ 3 sessions, never called | **safe** | `disabledMcpjsonServers` |
+| SessionStart hooks | none — injected every session | **advice** | `hooks.SessionStart` |
+| CLAUDE.md | none — injected every session | **advice** | `claudeMdExcludes` |
 
-You never write blind: a diff is shown, and only `--yes` writes. Applying twice is
-identical to applying once (idempotent merge; foreign keys refused; `.ccsnoop/`
-never touched).
+**Safe** = written only on a presented diff + explicit `--yes`. **Advice** = surfaced
+paste-only, **never** written. Applying twice is identical to applying once
+(idempotent merge; foreign keys refused; `.ccsnoop/` never touched).
 
 ## Redaction discipline (spec §1.3 — non-negotiable)
 
