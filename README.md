@@ -22,6 +22,7 @@ context window?"*, ccsnoop shows you — byte for byte.
 8. [Concepts](#8-concepts)
 9. [Troubleshooting](#9-troubleshooting)
 10. [Privacy & safety](#10-privacy--safety)
+11. [The context-tuning skill](#11-the-context-tuning-skill)
 
 ---
 
@@ -547,6 +548,40 @@ system prompt, and the full contents of any files it read. Secret request header
   contents and prompts. Treat a capture or report like a copy of your source and
   conversation — because that is what it is. To dispose of one, delete the repo's
   `.ccsnoop/` folder.
+
+---
+
+## 11. The context-tuning skill
+
+ccsnoop captures and diagnoses. The **context-tuning skill** is the thin,
+project-scoped layer that drives the loop — **capture → diagnose → apply (tiered) →
+verify** — and guides you into it no matter what state ccsnoop is in. It does not
+re-measure, and it never runs installs for you: every consequential action is a
+`ccsnoop` command.
+
+Install it into the repo you want to tune, then restart Claude Code:
+
+```console
+$ ccsnoop skill install
+```
+
+This drops the skill into `.claude/skills/context-tuning/` (idempotent — re-run after
+upgrading ccsnoop; `--force` overwrites files you've edited). Then ask Claude Code in
+that repo: *"tune my Claude Code context"* or *"apply my ccsnoop fine-tune."*
+
+The skill checks ccsnoop's state first (installed? daemon up? this repo wired for
+capture?) and tells you the single command that advances it — through to the loop:
+
+1. **Capture** — do real work in Claude Code; ccsnoop captures in the background.
+2. **Diagnose** — `ccsnoop fine-tune --json`.
+3. **Apply** — `ccsnoop apply --from <report> --dry-run` to review the safe-subset
+   diff, then `--yes` to write it on approval. Hooks and CLAUDE.md are surfaced
+   paste-only (ADR-0004: only levers with *dynamic proof* of waste are auto-applied).
+4. **Verify** — re-capture, then `ccsnoop verify --before <id> --after <id>` to see
+   whether the turn-1 floor actually moved.
+
+Full design — the bootstrap state machine and the skill ↔ CLI contract:
+[`docs/context-tuning-skill.md`](docs/context-tuning-skill.md).
 
 ---
 

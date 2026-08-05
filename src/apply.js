@@ -21,6 +21,7 @@
 import path from 'node:path';
 
 import { readJsonStrict, writeJson } from './init.js';
+import { assertNotUnderCcsnoop } from './guard.js';
 
 /** The settings keys apply is allowed to write (the ADR-0004 safe subset). */
 const SAFE_TOP_KEYS = ['permissions', 'disabledMcpjsonServers'];
@@ -51,13 +52,13 @@ export function defaultSettingsFile(cwd = process.cwd()) {
 /**
  * Refuse a path inside a `.ccsnoop/` capture tree — capture data is inviolable
  * (ADR-0004; mirrors `init`'s "never touch captured data"). Guards a manual
- * `--settings` override from pointing into the capture root.
+ * `--settings` override from pointing into the capture root. Shared with
+ * `ccsnoop skill install` via {@link module:guard.assertNotUnderCcsnoop}, which
+ * both writers call with their own Error subclass and noun.
  * @param {string} file
  */
-function assertNotUnderCcsnoop(file) {
-  if (path.resolve(file).split(path.sep).includes('.ccsnoop')) {
-    throw new ApplyError(`refusing to write settings under .ccsnoop/ (capture data) — ${file}`);
-  }
+function assertSettingsNotUnderCcsnoop(file) {
+  assertNotUnderCcsnoop(file, ApplyError, 'settings');
 }
 
 /**
@@ -199,7 +200,7 @@ function readSettingsObject(file) {
  * @returns {{ file: string, merged: Record<string, any>, added: object, changed: boolean }}
  */
 export function safeMergeSettings(file, safeSubset) {
-  assertNotUnderCcsnoop(file);
+  assertSettingsNotUnderCcsnoop(file);
   const { merged, added, changed } = computeMergeSettings(readSettingsObject(file), safeSubset);
   if (changed) writeJson(file, merged);
   return { file, merged, added, changed };
@@ -264,7 +265,7 @@ export function apply({ report, approved = false, dryRun = false, cwd, settingsF
     throw new ApplyError('apply requires a tuning-report contract (the `fine-tune --json` report)');
   }
   const file = settingsFile ?? defaultSettingsFile(cwd);
-  assertNotUnderCcsnoop(file);
+  assertSettingsNotUnderCcsnoop(file);
 
   const safeSubset = report.settings?.auto ?? {};
   const advice = report.settings?.advice ?? {};

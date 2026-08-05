@@ -13,7 +13,8 @@
   "files": [
     "bin",
     "src",
-    "data"
+    "data",
+    "skill"
   ],
   "scripts": {
     "start": "node bin/ccsnoop.js start",

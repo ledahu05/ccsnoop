@@ -20,6 +20,40 @@ _Avoid_: route id, key, slug
 The machine-level file `~/.ccsnoop/routes.json` mapping route token → capture root. Written (upsert) by `ccsnoop init`, read by the daemon per request.
 _Avoid_: config, routing table
 
+## Discipline & instruments
+
+**Context tuning**:
+The discipline of measuring then trimming what Claude Code ships in every request — `settings.json`, CLAUDE.md, MCP servers, hooks, the tool set — so less of the context window is spent on payload that does no work. The goal of the publishable skill.
+_Avoid_: fine-tuning, optimization, calibration
+
+**Diagnostic surface**:
+An offline reader of captures that turns the raw bytes into one cut of context-tuning evidence (e.g. `report`, `fine-tune`, `cache`, and the proposed `floor`, `cost`, `audit`). An *instrument* of context tuning, never the whole answer.
+_Avoid_: command, feature, tool
+
+**Model fine-tuning (ML)**:
+Training a model's weights. The explicit antagonist — *not* what ccsnoop does. Listed only to disambiguate "fine-tune", which ccsnoop overloads.
+_Avoid_: (none — kept as the canonical name for the thing we do not mean)
+
+**Context-tuning skill**:
+The project-installable orchestration that drives the context-tuning loop — capture → diagnose → apply → verify — over ccsnoop. A thin layer on top of ccsnoop: it does not re-measure, it drives the instrument. Project-scoped: `ccsnoop skill install` drops it into a repo's `.claude/skills/context-tuning/`; it consumes `fine-tune --json` (#95) and delegates apply (#98) and verify (#96) to the CLI.
+_Avoid_: the plugin, the wrapper, the extension
+
+**Bootstrap state**:
+The four-state gate the skill detects before entering the loop — `absent` (ccsnoop not on PATH → point to install), `daemon-down` (`status` down → `start`), `un-init` (no route for this repo → `init` + restart), `ready` (enter the loop). The detector is standalone (node builtins only) and points, never executes installs. Lives in `skill/scripts/bootstrap.mjs`.
+_Avoid_: doctor, health-check, readiness
+
+**Safe lever**:
+A context-tuning lever with *dynamic proof* of disuse (a built-in tool never called, an MCP server never invoked). Reversible, so the skill may auto-apply it on explicit approval of a presented diff.
+_Avoid_: proven lever, auto lever
+
+**Advice lever**:
+A lever *without* dynamic proof (SessionStart hook output, CLAUDE.md content) — its output is injected every session by construction, so cost is known but disuse is not. Advice-only: the skill prepares a paste-ready block, never writes it.
+_Avoid_: manual lever
+
+**Tuning session**:
+A before/after pair of captures linked across the restart that applies a tuning — the unit of *"did this tuning actually lower the floor?"* Without it, there is no verify step, only guesswork.
+_Avoid_: tuning run, A/B pair
+
 ## Fine-tune authority (ADR-0004)
 
 **Safe tier** (auto-writable):
