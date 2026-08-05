@@ -15,8 +15,9 @@ import { isolate } from '../src/isolate.js';
 import { verify } from '../src/verify.js';
 import { init, undoAllRoutes } from '../src/init.js';
 import { apply, ApplyError } from '../src/apply.js';
+import { installSkill, SkillError } from '../src/skill.js';
 
-const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate', 'apply', 'verify'];
+const SUBCOMMANDS = ['init', 'start', 'stop', 'status', 'report', 'fine-tune', 'cache', 'floor', 'lifetime', 'isolate', 'apply', 'verify', 'skill'];
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -55,6 +56,7 @@ async function main() {
   if (sub === 'isolate') return runIsolate(args);
   if (sub === 'apply') return runApply(args);
   if (sub === 'verify') return runVerify(args);
+  if (sub === 'skill') return runSkill(args);
 }
 
 /**
@@ -306,6 +308,33 @@ function runApply(args) {
     settingsFile: getFlag(args, '--settings'),
   });
   for (const line of result.lines) console.log(line);
+}
+
+/**
+ * `skill` — the publishable context-tuning skill (#97, epic #94). `skill install`
+ * copies the bundled skill artifact into `<cwd>/.claude/skills/context-tuning/`
+ * (idempotent; refuses to overwrite files that differ from the bundle unless
+ * `--force`). The skill is project-scoped and thin: it drives ccsnoop's loop
+ * (capture → diagnose → apply → verify) and guides the user through ccsnoop's
+ * bootstrap states. It does not re-measure, and it never runs installs.
+ * @param {string[]} args
+ */
+function runSkill(args) {
+  const action = args[0];
+  if (action !== 'install') {
+    console.error(`ccsnoop skill: unknown action '${action ?? '(none)'}' — try \`ccsnoop skill install\``);
+    process.exit(1);
+  }
+  try {
+    const result = installSkill({ cwd: process.cwd(), force: hasFlag(args.slice(1), '--force') });
+    for (const line of result.lines) console.log(line);
+  } catch (err) {
+    if (err instanceof SkillError) {
+      console.error(`ccsnoop: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -587,7 +616,11 @@ Commands:
              --root <path>       capture root (default ./.ccsnoop)
              --sessions-dir <p>  dir holding session subdirs (overrides --root)
              --window <tokens>   context window for the headline % (default 200000)
-             --json              emit the versioned tuning-session contract (kind: tuning-session)`);
+             --json              emit the versioned tuning-session contract (kind: tuning-session)
+  skill   The publishable context-tuning skill (#97, epic #94). Installs into this repo's
+          .claude/skills/ so it drives ccsnoop's capture → diagnose → apply → verify loop.
+             install             copy the bundled skill into .claude/skills/context-tuning/
+             --force             overwrite files that differ from the bundle (default: refuse)`);
 }
 
 main().catch((err) => {
