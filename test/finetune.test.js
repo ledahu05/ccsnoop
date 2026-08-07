@@ -39,13 +39,14 @@ function mkTmpDir() {
 /** A corpus with no MCP server in it — the FT4 lever's no-op input (see finetune-mcp.test.js). */
 const EMPTY_MCP_CORPUS = { sessionCount: 0, singleSession: false, servers: [] };
 
-// The 9 v1 denylist names in spec order (data/builtin-denylist.json).
+// The 10 v1 denylist names in spec order (data/builtin-denylist.json).
 const V1_NAMES = [
   'Workflow',
   'Artifact',
   'AskUserQuestion',
   'ScheduleWakeup',
   'ReportFindings',
+  'EnterWorktree',
   'CronCreate',
   'CronDelete',
   'CronList',
@@ -84,11 +85,11 @@ function writeFinetuneSession(root, id, tools) {
 
 // ── loadBuiltinDenylist (AC #3: committed file + shape validation) ────────────
 
-test('loadBuiltinDenylist reads the committed 9-entry v1 denylist in spec order', () => {
+test('loadBuiltinDenylist reads the committed 10-entry v1 denylist in spec order', () => {
   // The committed file lives at the repo data path the loader defaults to.
   assert.equal(DEFAULT_DENYLIST_PATH, path.join(REPO_ROOT, 'data', 'builtin-denylist.json'));
   const list = loadBuiltinDenylist();
-  assert.equal(list.length, 9, 'v1 ships exactly 9 entries');
+  assert.equal(list.length, 10, 'v1 ships exactly 10 entries');
   assert.deepEqual(
     list.map((e) => e.name),
     V1_NAMES,

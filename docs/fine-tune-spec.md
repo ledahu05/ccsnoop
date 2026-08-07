@@ -130,9 +130,9 @@ A single reused cost floor (`bloatFloorBytes`, existing) gates hooks + CLAUDE.md
 
 **Location:** versioned data file `data/builtin-denylist.json` — **not** a hardcoded constant. Each entry is an object `{name, category, note}` so the diagnostic can show a reason; only `name` is emitted (bare names, T1).
 
-**Inclusion criterion:** built-in tools that (a) are **not core primitives** (Read/Write/Edit/Bash/Grep/Glob/TodoWrite/… — *never* in the list), and (b) **gate a distinct opt-in capability** — orchestration, artifact publishing, scheduling, structured UI, review output. Schema heaviness is the *symptom* that surfaces them, not the criterion. (`TodoWrite` is excluded — a universal tracking primitive, not an opt-in capability.)
+**Inclusion criterion:** built-in tools that (a) are **not core primitives** (Read/Write/Edit/Bash/Grep/Glob/TodoWrite/… — *never* in the list), and (b) are **opt-in by contract** — their own description gates invocation behind explicit user instruction ("use this tool ONLY when explicitly instructed … by the user directly, or by project instructions"). This is verifiable at a glance from the description, depends on no byte threshold, and is distinct from a "big and rarely useful" judgment: schema heaviness is the *symptom* that surfaces a candidate (orchestration, artifact publishing, scheduling, structured UI, review output, worktree isolation), not the test. Whoever needs such a tool knows to ask for it — and knows to drop the deny line. (`TodoWrite` is excluded — a universal tracking primitive, not opt-in by contract.)
 
-**v1 content (9 entries):**
+**v1 content (10 entries):**
 
 | name | category | note |
 |------|----------|------|
@@ -141,10 +141,13 @@ A single reused cost floor (`bloatFloorBytes`, existing) gates hooks + CLAUDE.md
 | AskUserQuestion | structured UI | structured prompts |
 | ScheduleWakeup | scheduling | /loop self-pacing |
 | ReportFindings | review output | code-review |
+| EnterWorktree | isolation | opt-in by contract — explicit user instruction required |
 | CronCreate | scheduling | cron jobs |
 | CronDelete | scheduling | cron jobs |
 | CronList | scheduling | cron jobs |
 | RemoteTrigger | scheduling | remote trigger |
+
+> **Note on the deferred scheduling entries.** `CronCreate`, `CronDelete`, `CronList`, and `RemoteTrigger` ship **name-only** in the deferred-tools listing (a `<system-reminder>`), not as schemas in `tools[]`. The lever-1 intersection (`shipped ∩ denylist`) reads only `tools[]`, so it **cannot structurally reach them** — they never appear in `shipped`, hence never in `permissions.deny`. They are kept as forward-markers (a future deferred-listing lever would name them) rather than removed, and noted here so the list does not imply a lever-1 gain it does not produce. See [#108](https://github.com/ledahu05/ccsnoop/issues/108).
 
 **Override — two paths, no new config schema:**
 1. **Persistent** — edit `data/builtin-denylist.json` in your checkout (it is the source of truth).
