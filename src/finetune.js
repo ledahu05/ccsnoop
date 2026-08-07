@@ -30,9 +30,17 @@ import {
   HOOK_INTENT_CAVEAT,
 } from './finetune-levers.js';
 import { computeGain, EMPTY_GAIN, NULL_SOURCE } from './finetune-gain.js';
+import {
+  sessionSkillProfile,
+  aggregateSkillCorpus,
+  EMPTY_SKILL_CORPUS,
+  SKILL_OVERRIDE_ACTION,
+  SKILLS_GUARD_MIN_SESSIONS,
+} from './finetune-skills.js';
 import { fitLabel } from './format.js';
 import { buildJsonReport, summarizeLevers, sumMcpServerBytes } from './finetune-json.js';
 import { DEFAULT_WASTE_CONFIG } from './waste.js';
+import { SKILLS_CATALOG } from './finetune-system.js';
 
 /** The single reused cost floor (spec §3.5) gating the hooks + CLAUDE.md levers. */
 const BLOAT_FLOOR = DEFAULT_WASTE_CONFIG.bloatFloorBytes;
@@ -365,17 +373,40 @@ export function applyDenylistOverride(denylist, { extra, allow } = {}) {
  * "none intersect the built-in denylist" note never claims a name did not match
  * when it matched and was allowed away for the run.
  *
+ * The **skills catalog** (ADR-0005 lever 5a, issue #118) is the one lever that does not get
+ * a row of its own: it acts on the bytes the `catalog` row already shows, so the row gains
+ * the action and the per-skill detail lines instead. A second row would double the shipped
+ * total of a session that ships one catalog.
+ *
  * @param {{ sessionId: string, requests: number, shipped: string[], deny: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus,
+ *   skills?: import('./finetune-skills.js').SkillCorpus,
  *   levers?: import('./finetune-levers.js').LeverVerdicts,
  *   gain?: import('./finetune-gain.js').GainModel,
  *   denyAllowed?: string[] }} ctx
  * @returns {{ lines: string[], settingsJson: string }}
  */
-export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers = EMPTY_LEVER_VERDICTS, gain = EMPTY_GAIN, denyAllowed = [] }) {
+export function renderFineTune({
+  sessionId,
+  requests,
+  shipped,
+  deny,
+  mcp,
+  skills = EMPTY_SKILL_CORPUS,
+  levers = EMPTY_LEVER_VERDICTS,
+  gain = EMPTY_GAIN,
+  denyAllowed = [],
+}) {
   // The acting levers + the conservative recoverable headline come from the shared
   // summary the JSON contract also uses — one source of truth across both surfaces.
-  const { hook, mcpDeny, claudeMdExclude, recoverable } = summarizeLevers({ deny, mcp, levers, gain });
+  const { hook, mcpDeny, claudeMdExclude, skillOverrides, skillsWaste, recoverable } = summarizeLevers({
+    deny,
+    mcp,
+    skills,
+    levers,
+    gain,
+  });
+  const skillNames = Object.keys(skillOverrides);
 
   /** @type {{ lever: string, label: string, shipped: number, waste: number | null, action: string }[]} */
   const rows = [];
@@ -419,12 +450,18 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   }
 
   // Catalog populations (issue #116) — the `<system-reminder>` listings CC injects.
-  // Shown as byte cost with NO action: naming them is what #116 delivered, acting on
-  // them (`skillOverrides`, ADR-0005 lever 5a) is a later slice, and claiming a gain
-  // before the action exists is exactly the unproven advice ADR-0004 bars. Before #116
-  // most of these bytes were reported as MCP.
+  // Two of the three are byte cost with NO action: claiming a gain before an action exists
+  // is exactly the unproven advice ADR-0004 bars. Before #116 most of these bytes were
+  // reported as MCP.
+  //
+  // The skills catalog is the exception since #118: lever 5a acts on THESE bytes, so the row
+  // carries the verdict (and the per-skill detail lines below) rather than getting a second
+  // row that would count the same bytes twice.
   for (const [population, g] of gain.catalog ?? []) {
-    if (g.shipped > 0) pushRow('catalog', population, g.shipped, null, 'cost only (no lever yet)');
+    if (g.shipped === 0) continue;
+    const acting = population === SKILLS_CATALOG && skillNames.length > 0;
+    const action = acting ? `${SKILL_OVERRIDE_ACTION} ✓ (${skillNames.length})` : 'cost only (no lever yet)';
+    pushRow('catalog', population, g.shipped, acting ? skillsWaste : null, action);
   }
 
   // Harness — the incompressible floor (system[] preamble). Shown for context; its
@@ -458,6 +495,23 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
         lines.push(`    ${s.name.padEnd(26)} ${detail}`);
       }
     }
+    // Per-skill detail under the skills-catalog row — the verdict is per entry, so each
+    // skill is shown with the evidence that decided it: the bytes a `name-only` recovers,
+    // the invocation count that spared it, or the reason no `skillOverrides` entry can
+    // reach it (a plugin skill — lever 5b, advice tier). Printed only when the lever
+    // ACTS: a catalog with no verdict would otherwise dump one "not qualifying" line per
+    // skill under a row that says "cost only", which is a paragraph to say nothing. That
+    // case gets the one-line note below instead.
+    if (r.label === SKILLS_CATALOG && skillNames.length > 0) {
+      for (const s of skills.skills) {
+        const detail = s.override
+          ? `${SKILL_OVERRIDE_ACTION} ✓ (${fmtBytes(s.bytes)})`
+          : !s.reachable
+            ? 'no skillOverrides reaches it (plugin/scoped — advice tier)'
+            : `keep (invoked ${s.invokedCount}/${skills.sessionCount})`;
+        lines.push(`    ${s.name.padEnd(26)} ${detail}`);
+      }
+    }
   }
   // A lever with nothing to cost gets a one-line note instead of a row.
   //
@@ -477,6 +531,16 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   }
   if (hook.bytes === 0) {
     lines.push('Hooks: (no SessionStart hook output seen)');
+  }
+  // A catalog that ships skills but earns no verdict says WHY in one line — thin evidence
+  // reads nothing like "every skill is in use", and the reader needs to know which it is
+  // before concluding the catalog is already lean.
+  if (skills.skills.length > 0 && skillNames.length === 0) {
+    const thin = skills.singleSession || skills.sessionCount < SKILLS_GUARD_MIN_SESSIONS;
+    const why = thin
+      ? `${skills.sessionCount}/${SKILLS_GUARD_MIN_SESSIONS} sessions of evidence — capture more, or drop --session/--latest`
+      : 'every skill was model-invoked, or is a plugin skill no skillOverrides reaches';
+    lines.push(`Skills: ${skills.skills.length} listed, none qualifies for ${SKILL_OVERRIDE_ACTION} (${why})`);
   }
   lines.push('─'.repeat(TABLE_WIDTH));
   lines.push(tableRow('Total', '', fmtBytes(totalShipped), fmtBytes(recoverable), ''));
@@ -501,7 +565,7 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   lines.push('');
   // Cache-invalidation warning above any block that changes the prompt prefix —
   // tools[], MCP load, the hook output, or an excluded CLAUDE.md file all do.
-  if (deny.length > 0 || mcpDeny.length > 0 || hook.deny || claudeMdExclude.length > 0) {
+  if (deny.length > 0 || mcpDeny.length > 0 || hook.deny || claudeMdExclude.length > 0 || skillNames.length > 0) {
     lines.push('⚠ Applying this block invalidates the cache (tools[] / system content changes → prefix broken).');
   }
   // Pure, comment-free, paste-ready JSON. permissions.deny is always present
@@ -509,6 +573,7 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
   // acts (omitted otherwise, so the block keeps the minimal shape).
   const block = { permissions: { deny } };
   if (mcpDeny.length > 0) block.disabledMcpjsonServers = mcpDeny;
+  if (skillNames.length > 0) block.skillOverrides = skillOverrides;
   if (hook.deny) block.hooks = { SessionStart: [] };
   if (claudeMdExclude.length > 0) block.claudeMdExcludes = claudeMdExclude;
   const settingsJson = JSON.stringify(block, null, 2);
@@ -550,7 +615,9 @@ function uniqueById(sessions) {
  * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, latest?: boolean, all?: boolean,
  *   denyExtra?: string[], denyAllow?: string[], denylistPath?: string, includeTokens?: boolean }} [opts]
  * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[],
- *   mcp: import('./finetune-mcp.js').McpCorpus, levers: import('./finetune-levers.js').LeverVerdicts,
+ *   mcp: import('./finetune-mcp.js').McpCorpus,
+ *   skills: import('./finetune-skills.js').SkillCorpus,
+ *   levers: import('./finetune-levers.js').LeverVerdicts,
  *   gain: import('./finetune-gain.js').GainModel, lines: string[], settingsJson: string,
  *   json: Record<string, any> }}
  */
@@ -594,9 +661,16 @@ export function fineTune(opts = {}) {
 
   // MCP corpus (FT4) — over the chosen session in single-session mode, over the
   // whole corpus otherwise. On the fly each run; nothing persisted.
-  const mcpSessions = singleSession ? [chosen] : uniqueById(sessions);
-  const profiles = mcpSessions.map((s) => sessionMcpProfile(s.dir, s.id));
+  const corpusSessions = singleSession ? [chosen] : uniqueById(sessions);
+  const profiles = corpusSessions.map((s) => sessionMcpProfile(s.dir, s.id));
   const mcp = aggregateMcpCorpus(profiles, { singleSession });
+
+  // Skills corpus (lever 5a, issue #118) — the same corpus, the same guard: shipped in the
+  // turn-1 catalog across ≥ 3 sessions and never invoked by the model ⇒ `name-only`.
+  const skills = aggregateSkillCorpus(
+    corpusSessions.map((s) => sessionSkillProfile(s.dir, s.id)),
+    { singleSession }
+  );
 
   // Hooks + CLAUDE.md levers (FT5) — static by construction (injected every
   // session), so profiled on the chosen (primary) session, the same single-session
@@ -615,6 +689,7 @@ export function fineTune(opts = {}) {
     shipped,
     deny,
     mcp,
+    skills,
     levers,
     gain,
     denyAllowed,
@@ -633,6 +708,7 @@ export function fineTune(opts = {}) {
       deny,
       denyAllowed,
       mcp,
+      skills,
       levers,
       gain,
       exchanges: model.exchanges,
@@ -646,6 +722,7 @@ export function fineTune(opts = {}) {
     shipped,
     deny,
     mcp,
+    skills,
     levers,
     gain,
     lines,

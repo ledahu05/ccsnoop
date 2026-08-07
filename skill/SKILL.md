@@ -132,12 +132,21 @@ proof, its tier, and the settings key it writes — once, here:
 | ----- | ----- | ---- | ------------ |
 | built-in tools | **dynamic** — name ∩ denylist AND never called | **safe** | `permissions.deny` |
 | MCP | **dynamic** — shipped ≥ 3 sessions, never called | **safe** | `disabledMcpjsonServers` |
+| skills catalog | **dynamic** — a corpus of ≥ 3 sessions listing it, never invoked *by the model* | **safe** | `skillOverrides` (always `name-only`) |
 | SessionStart hooks | none — injected every session | **advice** | `hooks.SessionStart` |
 | CLAUDE.md | none — injected every session | **advice** | `claudeMdExcludes` |
 
 **Safe** = written only on a presented diff + explicit `--yes`. **Advice** = surfaced
 paste-only, **never** written. Applying twice is identical to applying once
 (idempotent merge; foreign keys refused; `.ccsnoop/` never touched).
+
+The skills lever writes **`name-only`, never `off`** (ADR-0005): the skill stays listed
+and fully invocable — `/name` still works, "use the X skill" still works — and only its
+description stops shipping. Present it that way: the recovery is a description, the loss
+is unprompted discoverability. A skill the report marks `reachable: false` is a plugin (or
+directory-scoped) skill no `skillOverrides` entry reaches; report its cost, never propose a
+key for it. `skillOverrides` is a MAP: `apply` adds entries and never touches one the user
+already set, so a hand-set `off` survives.
 
 ## Redaction discipline (spec §1.3 — non-negotiable)
 
@@ -156,7 +165,7 @@ but full conversation content. It is inviolable:
 
 - **Too few sessions** for the MCP guard (`sessionCount < 3`): the MCP lever is
   `flag-only`, never `deny`. Tell the user to capture more sessions; do not invent a
-  deny verdict.
+  deny verdict. The skills lever shares that guard, verbatim, and goes `flag-only` with it.
 - **Single-session scope** (`--session` / `--latest`): MCP deny is intentionally
   off. Use the corpus default for tuning decisions.
 - **No captured usage** on a side: `verify`'s token delta is `null` and the verdict

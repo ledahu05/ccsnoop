@@ -26,10 +26,9 @@
 // advice-to-copy, never auto-applied. The called half reuses FT2's
 // `calledToolSet` (issue #72) — one response decoder, not a second copy.
 
-import fs from 'node:fs';
 import path from 'node:path';
 
-import { parseRequestBlob } from './report.js';
+import { eachRequestBody } from './report.js';
 import { calledToolSet } from './finetune-response.js';
 
 /** The minimum corpus size before "never called" is trusted enough to deny. */
@@ -206,47 +205,22 @@ function shippedServersInBody(body) {
  * it ships (deferred listing, unioned across requests) and the servers it called
  * (the FT2 called-tool set, mapped back through {@link mcpServerOf}).
  *
- * Ships are read straight from the request blobs — `loadSession` (report.js)
- * keeps only derived segments, not the system text. Calls reuse FT2's
- * `calledToolSet` (one response decoder). Both degrade, never throw, on a
- * corrupt/truncated capture: a half-written turn contributes nothing rather than
- * taking the verdict down. The only hard error is a session dir with no readable
- * `manifest.jsonl` (a caller mistake, surfaced by `calledToolSet`).
+ * Ships are read straight from the request blobs — `loadSession` (report.js) keeps only
+ * derived segments, not the system text — through the shared `eachRequestBody` walk the
+ * skills lever also uses. Calls reuse FT2's `calledToolSet` (one response decoder). Both
+ * degrade, never throw, on a corrupt/truncated capture: a half-written turn contributes
+ * nothing rather than taking the verdict down. The only hard error is a session dir with no
+ * readable `manifest.jsonl` (a caller mistake).
  *
  * @param {string} dir  The `sessions/<session_id>/` directory.
  * @param {string} [id] Session id (defaults to the dir's basename).
  * @returns {McpSessionProfile}
  */
 export function sessionMcpProfile(dir, id = path.basename(dir)) {
-  const manifestPath = path.join(dir, 'manifest.jsonl');
-  /** @type {string} */
-  let manifest;
-  try {
-    manifest = fs.readFileSync(manifestPath, 'utf8');
-  } catch (err) {
-    throw new Error(`could not read manifest.jsonl in ${dir}: ${/** @type {Error} */ (err)?.message ?? err}`);
-  }
-
   /** @type {Set<string>} */
   const shipped = new Set();
-  for (const rawLine of manifest.split('\n')) {
-    if (rawLine.trim().length === 0) continue;
-    /** @type {any} */
-    let line;
-    try {
-      line = JSON.parse(rawLine);
-    } catch {
-      continue; // a half-written manifest line — skip, don't crash (see FT2).
-    }
-    if (!line || typeof line !== 'object' || typeof line.request_blob !== 'string') continue;
-    /** @type {Buffer} */
-    let buf;
-    try {
-      buf = fs.readFileSync(path.join(dir, line.request_blob));
-    } catch {
-      continue; // aborted exchange (request blob never landed) — contributes nothing.
-    }
-    for (const name of shippedServersInBody(parseRequestBlob(buf).json)) shipped.add(name);
+  for (const body of eachRequestBody(dir)) {
+    for (const name of shippedServersInBody(body)) shipped.add(name);
   }
 
   // Called half: FT2 already decoded every response into a called-tool set + counts.

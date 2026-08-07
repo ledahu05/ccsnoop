@@ -29,6 +29,7 @@ request; `waste` is the recoverable part (bytes re-paid after a cache break). Th
 | **MCP** | MCP servers shipped in the deferred "still connecting" listing | `deny ✓` / `flag-only` (under the guard below) |
 | **hooks** | `SessionStart` hook output | `remove ⚠` (above the floor) or `below floor` |
 | **CLAUDE.md** | project memory files shipped into the system prompt | `advice (excludable)` / `advice (managed)` |
+| **catalog** | the `<system-reminder>` listings — deferred tools, agent types, the skills catalog | `cost only (no lever yet)`, or `name-only ✓ (n)` on the skills catalog |
 | **harness** | the incompressible `system[]` floor | `incompressible floor (not actionable)` |
 
 All figures are bytes (never re-tokenized). The headline line sums it up:
@@ -52,6 +53,16 @@ key appears **only when its lever actually acts** — no empty keys:
   across **≥ 3 sessions** and **never called** (`mcp__<server>__*` never appeared in a
   response). One session is too thin to accuse a server, so this key **never** appears
   in single-session mode.
+- **`skillOverrides`** — a map `{ "<skill>": "name-only" }`, **only under the same
+  guard as MCP**: the corpus holds **≥ 3 sessions**, the skill was listed in the turn-1
+  skills catalog, and the **model** never invoked it in any of them (no `Skill` tool_use
+  named it). Like the MCP guard, the threshold is on the *corpus* — `shippedSessions` per
+  skill is reported so you can see how much of it actually listed the skill. A `/name`
+  *you* typed is not an invocation and does not spare a skill — which is sound, because
+  `name-only` leaves `/name` working: the skill stays listed and fully invocable, only its
+  description stops shipping. **`off` is never emitted.** A scope-qualified skill
+  (`plugin:name`) is reported with its cost and never written: no `skillOverrides` entry
+  reaches a plugin skill.
 - **`hooks.SessionStart`** (set to `[]`) — **only** when a `SessionStart` hook shipped
   ≥ 4096 bytes. It carries the caveat `intent unknown — injected every session; review
   before applying`, because a hook may be load-bearing and `fine-tune` cannot tell.
@@ -74,7 +85,7 @@ roots — so the MCP "never used" guard has the 3-session evidence it needs to f
 
 Pass **`--session <id>`** or **`--latest`** to look at one session only. That is
 **weak-evidence mode**: the MCP lever then **never** denies (one session cannot prove a
-server is unused). The built-in `tools` deny is always taken from the primary session
+server is unused), and neither does the skills lever. The built-in `tools` deny is always taken from the primary session
 (the latest, or the one you named).
 
 ---
