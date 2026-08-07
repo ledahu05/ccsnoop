@@ -48,8 +48,9 @@ over the wire, and later renders them as one self-contained HTML report.
 The report shows you the waste; two more commands help you **act on it**:
 
 - **`ccsnoop fine-tune`** — points at the recoverable bytes (unused tools, idle MCP
-  servers, heavy hooks, excludable CLAUDE.md files) and hands you a paste-ready
-  `settings.json`. See [`docs/fine-tune.md`](docs/fine-tune.md).
+  servers, heavy hooks, excludable CLAUDE.md files, skills whose description you ship
+  every turn and never use) and hands you a paste-ready `settings.json`. See
+  [`docs/fine-tune.md`](docs/fine-tune.md).
 - **`ccsnoop cache`** — for each turn where the prompt cache went cold, explains
   *why* it expired, *what it cost*, and *what to do differently*. See
   [`docs/cache.md`](docs/cache.md).
@@ -174,8 +175,8 @@ Commands:
   fine-tune  Print a byte diagnostic + paste-ready settings.json (all sessions by default)
              --root <path>        capture root (default ./.ccsnoop)
              --sessions-dir <p>   dir holding session subdirs (overrides --root)
-             --session <id>       one session (weak-evidence: no MCP deny)
-             --latest             most-recent session (weak-evidence: no MCP deny)
+             --session <id>       one session (weak-evidence: no MCP/skills verdict)
+             --latest             most-recent session (weak-evidence: no MCP/skills verdict)
              --all                widen discovery across ~/.ccsnoop/routes.json
              --deny-extra <a,b>   add denylist names for this run only
              --deny-allow <a>     drop a denylist name for this run only
@@ -352,18 +353,31 @@ and `isolate` each diagnose a different angle of what a session shipped; `apply`
 
 ### `ccsnoop fine-tune` — trim what Claude Code sends
 
-A byte-level waste diagnostic across five levers (unused built-in tools, idle MCP
-servers, heavy `SessionStart` hooks, excludable CLAUDE.md files, the incompressible
-system floor), plus a **paste-ready `settings.json`** to act on it. It writes nothing —
-you copy the block yourself.
+A byte-level waste diagnostic across six levers (unused built-in tools, idle MCP
+servers, heavy `SessionStart` hooks, excludable CLAUDE.md files, the
+`<system-reminder>` catalogs — deferred tools, agent types, the **skills catalog** —
+and the incompressible system floor), plus a **paste-ready `settings.json`** to act
+on it. It writes nothing — you copy the block yourself, or hand it to `apply`.
 
 ```console
 $ ccsnoop fine-tune
 …
 Recoverable (waste, conservative): ~<n> bytes
 settings.json (paste-ready):
-{ "permissions": { "deny": ["Workflow", "ScheduleWakeup", "ReportFindings"] }, … }
+{ "permissions": { "deny": ["Workflow", "EnterWorktree", "ScheduleWakeup"] },
+  "skillOverrides": { "dataviz": "name-only" }, … }
 ```
+
+**The skills lever** ([ADR-0005](docs/adr/0005-skills-catalog-lever-name-only.md)):
+every skill in the catalog ships its full description on every turn-1. For a skill
+that the corpus shows was **never invoked by the model**, `fine-tune` emits
+`"<name>": "name-only"` — the name (~15 B) stays in the catalog, the description
+stops being shipped, and `/name` plus "use skill X" keep working. That bounded
+failure mode is what makes it a `safe` lever `apply` may write. Plugin skills carry
+the same evidence but are **out of `skillOverrides`' reach** (Claude Code's resolver
+returns `on` unconditionally for them), so the only action left — uninstalling the
+whole plugin — is unbounded: they are measured, named, and reported as **advice
+only**, never written.
 
 Full guide — the levers, the T4 MCP guard, corpus vs single-session, denylist
 overrides: [`docs/fine-tune.md`](docs/fine-tune.md).
@@ -461,6 +475,13 @@ Per-entry breakdown (--detail) — percentages are of the block, not the floor
       …
       · (headers, separators, envelope)            225       4%
 ```
+
+**Which turn is turn 1.** The opening is *not* always the first request on the wire: an
+interactive session begins with a preflight round-trip, and a `claude -p` capture can open
+with a tool-less auxiliary call to a small model. Both carry a `system[]` and neither is
+the conversation's opening. `floor` skips past them and anchors on the first **substantial**
+request — the one that actually ships `tools[]` and the catalogs — so the headline is the
+baseline you really pay, not a few hundred tokens of preflight.
 
 `floor` is the measurement behind `verify`, and the "incompressible system floor" lever
 `fine-tune` reports is the same number, computed the same way.
@@ -565,10 +586,10 @@ Run `ccsnoop <command> [options]`. `--help` prints this same list.
 | `stop`   | Stop the daemon (drain, then terminate). Warns about live sessions still routed through it. | `--clean` also un-route every registered repo (`init --undo` for all) |
 | `status` | Report daemon status (running → exit `0`, stopped → exit `1`). | — |
 | `report` | Render a captured session to a self-contained static HTML file. | `--root <path>` capture root (default `./.ccsnoop`)<br>`--sessions-dir <p>` dir holding session subdirs (overrides `--root`)<br>`--session <id>` session to render (default: latest)<br>`--all` widen discovery across `~/.ccsnoop/routes.json`<br>`--out <path>` output file (default `<session-dir>/report.html`)<br>`--bloat-floor <n>` bloat: absolute byte floor (default `4096`)<br>`--bloat-multiplier <n>` bloat: sibling-outlier multiplier (default `3`) |
-| `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP deny)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run<br>`--json` emit the versioned `tuning-report/v1` contract ([schema](docs/tuning-report-schema.md))<br>`--include-tokens` with `--json`, backfill primary-session token totals |
-| `apply` | Apply a fine-tune report's SAFE subset to `.claude/settings.json` (#98, ADR-0004). Presents a diff; writes only on `--yes`; advice levers are paste-only. | `--from <path\|->` consume a captured report (file, or `-` for stdin)<br>`--root <path>` without `--from`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` without `--from` (default: latest)<br>`--yes` approve the safe-subset write (else diff-only)<br>`--dry-run` print the diff without writing<br>`--settings <path>` override the target (default `./.claude/settings.json`) |
+| `fine-tune` | Print a byte waste diagnostic + a paste-ready `settings.json` (all sessions by default). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` one session (weak-evidence: no MCP/skills verdict)<br>`--latest` most-recent session (weak-evidence)<br>`--all` widen discovery<br>`--deny-extra <a,b>` add denylist names for this run<br>`--deny-allow <a>` drop a denylist name for this run<br>`--json` emit the versioned `tuning-report/v1` contract ([schema](docs/tuning-report-schema.md))<br>`--include-tokens` with `--json`, backfill primary-session token totals |
+| `apply` | Apply a fine-tune report's SAFE subset to `.claude/settings.json` (#98, ADR-0004): `permissions.deny`, `disabledMcpjsonServers`, and `skillOverrides` (#118 — merged per entry; an override you already set is never rewritten). Presents a diff; writes only on `--yes`; advice levers are paste-only. | `--from <path\|->` consume a captured report (file, or `-` for stdin)<br>`--root <path>` without `--from`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` without `--from` (default: latest)<br>`--yes` approve the safe-subset write (else diff-only)<br>`--dry-run` print the diff without writing<br>`--settings <path>` override the target (default `./.claude/settings.json`) |
 | `cache`  | Cache-economy diagnostic for one captured session (per-transition cards + rollup). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--ttl <seconds>` TEMPORAL threshold (default `3600`)<br>`--html` render as a self-contained HTML document |
-| `floor` | Turn-1 baseline metric + ranked per-block attribution (the default context window). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to score (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--window <tokens>` context window for the headline % (default `200000`) |
+| `floor` | Turn-1 baseline metric + ranked per-block attribution (the default context window). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to score (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--window <tokens>` context window for the headline % (default `200000`)<br>`--detail` break the catalog blocks (deferred tools, agent types, skills) down to their per-entry byte cost |
 | `lifetime` | Effective context-lifetime metric for one captured session (compaction count, turns/wall-time to the first compaction, per-event bytes-dropped). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to diagnose (default: latest)<br>`--latest` same as the default (no corpus mode)<br>`--html` render as a self-contained HTML document |
 | `isolate` | Subagent context-isolation for one captured session (isolated vs main + an if-inlined counterfactual). | `--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--session <id>` session to analyze (default: latest)<br>`--threshold <f>` isolation ratio that fires the reco, in `[0,1]` (default `0.25`)<br>`--html` render as a self-contained HTML document |
 | `verify` | Before/after turn-1 floor delta for two captured sessions (a tuning session): did the tuning lower the floor, and by how much? Pure offline. | `--before <id>` baseline session (required)<br>`--after <id>` tuned session (required)<br>`--root <path>`<br>`--sessions-dir <p>` (overrides `--root`)<br>`--window <tokens>` context window for the headline % (default `200000`)<br>`--json` emit the versioned `tuning-session` contract |
@@ -709,8 +730,11 @@ capture?) and tells you the single command that advances it — through to the l
 1. **Capture** — do real work in Claude Code; ccsnoop captures in the background.
 2. **Diagnose** — `ccsnoop fine-tune --json`.
 3. **Apply** — `ccsnoop apply --from <report> --dry-run` to review the safe-subset
-   diff, then `--yes` to write it on approval. Hooks and CLAUDE.md are surfaced
-   paste-only (ADR-0004: only levers with *dynamic proof* of waste are auto-applied).
+   diff, then `--yes` to write it on approval. The safe subset is the denied built-in
+   tools, the idle MCP servers, and the `name-only` skill overrides (#118). Hooks,
+   CLAUDE.md and plugin skills are surfaced paste-only — ADR-0004 auto-applies a lever
+   only when the evidence is *dynamic proof* of waste **and** a false positive stays
+   bounded; uninstalling a whole plugin is not.
 4. **Verify** — re-capture, then `ccsnoop verify --before <id> --after <id>` to see
    whether the turn-1 floor actually moved.
 
