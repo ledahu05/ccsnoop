@@ -568,12 +568,12 @@ const SKILLS_TXT =
  * `shape: 'combined'` rides all three in ONE block (the only shape that can produce the
  * single ~30 KB row issue #109 reports from a real session — 19 tool names are not 30 KB).
  */
-function catalogModel(shape, { surface = 'message', skillsText = SKILLS_TXT } = {}) {
+function catalogModel(shape, { surface = 'message', skillsText = SKILLS_TXT, deferredText = DEFERRED_TXT } = {}) {
   const wrap = (t) => `<system-reminder>\n${t}</system-reminder>`;
   const blocks =
     shape === 'combined'
-      ? [{ type: 'text', text: wrap(`${DEFERRED_TXT}\n${AGENTS_TXT}\n${skillsText}`) }]
-      : [DEFERRED_TXT, AGENTS_TXT, skillsText].map((t) => ({ type: 'text', text: wrap(t) }));
+      ? [{ type: 'text', text: wrap(`${deferredText}\n${AGENTS_TXT}\n${skillsText}`) }]
+      : [deferredText, AGENTS_TXT, skillsText].map((t) => ({ type: 'text', text: wrap(t) }));
   const body = {
     model: 'claude-test',
     system: [{ type: 'text', text: 'harness preamble' + 'H'.repeat(400) }, ...(surface === 'system' ? blocks : [])],
@@ -631,19 +631,53 @@ test('computeFloor carves a COMBINED catalog block into three that tile it exact
   assert.equal(cat.reduce((s, a) => s + a.bytes, 0), whole, 'spans tile the block exactly');
 });
 
-test('computeFloor does not double-count a catalog already inside the harness figure', () => {
-  // On the `system` surface the agent-types and skills blocks ARE charged to harness by
-  // the gain model. Naming them must move those bytes, not add them a second time.
+test('computeFloor does not double-count a catalog, on either surface', () => {
+  // A catalog block used to classify `harness`, so on the `system` surface the gain model
+  // folded it into the preamble figure and `floor` had to DEDUCT it again. Since #116 it
+  // classifies to its own lever on both surfaces, so there is nothing to deduct — but the
+  // property that mattered is unchanged and still pinned here: the same catalogs cost the
+  // same bytes whichever surface carries them, and the harness row is the preamble ALONE.
   const onSystem = computeFloor(catalogModel('separate', { surface: 'system' }));
   const onMessage = computeFloor(catalogModel('separate', { surface: 'message' }));
   const catBytes = (f) =>
     f.attribution.filter((a) => ['agent-types', 'skills-catalog'].includes(a.kind)).reduce((s, a) => s + a.bytes, 0);
   assert.equal(catBytes(onSystem), catBytes(onMessage), 'same catalogs, same bytes on either surface');
+
   const harness = onSystem.attribution.find((a) => a.kind === 'harness');
   assert.ok(harness, 'the system[] preamble still has its own row');
-  assert.ok(!harness.label.includes('Available agent types'), 'sanity: harness is the preamble');
-  // The preamble block is ~400 B of padding; harness must not still carry the catalogs.
-  assert.ok(harness.bytes < catBytes(onSystem), 'catalog bytes were deducted from harness');
+  // The preamble is a known ~400 B of padding. Pinning its EXACT bytes is what makes this
+  // a real guard: a harness figure that still carried the catalogs would be far larger,
+  // and the old `<` comparison would not have caught every way of getting that wrong.
+  assert.equal(harness.bytes, txtBytes('harness preamble' + 'H'.repeat(400)), 'harness is the preamble alone');
+  assert.equal(onSystem.totalBytes, onMessage.totalBytes, 'and the floor totals agree across surfaces');
+});
+
+// ── #116: the classifier inverted under floor, and the bytes did not move ─────
+//
+// The catalog detection moved DOWN into the shared classifier, and `mcp-deferred` shrank
+// to the connecting-servers sub-list. That is a refactor of provenance, not of
+// measurement: `floor` must render the same bytes per block as it did after #113. The
+// listing keeps its connecting servers as `group: 'servers'` entries under one row, and
+// carries `chargedTo: 'mcp'` so the opaque MCP row is still dropped, not shown alongside.
+
+test('computeFloor still renders the deferred listing as ONE row, sub-list included (#116)', () => {
+  const f = computeFloor(catalogModel('separate'));
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+  assert.equal(byKind.get('deferred-tools').bytes, txtBytes(`<system-reminder>\n${DEFERRED_TXT}</system-reminder>`));
+  assert.ok(!byKind.has('mcp-deferred'), 'the MCP sub-list does not become a second row');
+  // The servers are visible where they always were — inside the listing's entries.
+  assert.deepEqual(byKind.get('deferred-tools').entries.filter((e) => e.group === 'servers').map((e) => e.name), ['stub']);
+});
+
+test('computeFloor: a deferred listing with no connecting servers shows no MCP row at all', () => {
+  // The whole point of the narrowing: a repo with no MCP server used to be charged the
+  // entire listing under a label naming a server it had never configured.
+  const noMcp = DEFERRED_TXT.slice(0, DEFERRED_TXT.indexOf('\nThe following MCP servers'));
+  const model = catalogModel('separate', { deferredText: `${noMcp}\n` });
+  const f = computeFloor(model);
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+  assert.ok(byKind.has('deferred-tools'), 'the listing is still named and costed');
+  assert.ok(!byKind.has('mcp-deferred'), 'and nothing is attributed to MCP');
 });
 
 test('computeFloor keeps the opaque MCP row when the listing headers are unrecognized', () => {

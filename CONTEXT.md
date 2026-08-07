@@ -68,6 +68,18 @@ _Avoid_: unconfirmed tier, manual tier
 The population of skills Claude Code lists to the model on turn 1, each entry shipping a name *and* a full description. One of the three sibling populations of the deferred listing, alongside the deferred built-in tools and the agent types. Routinely the largest single line item of the turn-1 floor.
 _Avoid_: skill list, MCP deferred, the deferred block
 
+**Catalog population**:
+One of the three `<system-reminder>` listings Claude Code injects on turn 1 — the deferred built-in tools, the agent types, the skills catalog. Each is a lever of the shared model (#116) and a named row in `floor`; none is MCP, and none has an action behind it yet. Serialized as `catalog.populations[]` in the `--json` contract.
+_Avoid_: catalog block, reminder, the listing
+
+**Lever span**:
+One lever's share of a single request block. A block can carry several populations — the connecting-servers sub-list rides *inside* the deferred-tools listing — so `classifySystemSpans` carves it into spans, one per lever. Spans **tile** their block: their bytes sum to its canonical byte length, which is what stops a split from inventing bytes the wire never carried. The single authority for "which lever owns which bytes".
+_Avoid_: slice, chunk, sub-block
+
+**MCP deferred listing**:
+The *"MCP servers still connecting"* sub-list, and nothing else — the only part of the deferred listing an MCP setting can act on. Before #116 the name covered the whole listing, so a repo with no MCP server was told it shipped tens of kilobytes of "MCP"; it now reports zero.
+_Avoid_: the deferred listing (that is the built-in tools population), the MCP block
+
 **Name-only**:
 The `skillOverrides` value that keeps a skill fully invocable while dropping its description from the catalog. The action lever 5a emits (ADR-0005) — it recovers the dominant byte term without removing capability, which is what makes its false positive *bounded*.
 _Avoid_: truncate, collapse, disable

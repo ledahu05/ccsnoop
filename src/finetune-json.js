@@ -33,6 +33,7 @@
 import { DEFAULT_WASTE_CONFIG } from './waste.js';
 import { NULL_SOURCE, HOOK_INTENT_CAVEAT } from './finetune-levers.js';
 import { mcpServerOf, MCP_GUARD_MIN_SESSIONS } from './finetune-mcp.js';
+import { CATALOG_LEVERS } from './finetune-system.js';
 
 /**
  * The pinned URI of this contract version. Resolves to the in-tree schema doc
@@ -55,6 +56,18 @@ const NOTE =
   'totals.recoverable = Σ waste over the actionable levers only.';
 
 const FLOOR_NOTE = 'Incompressible harness system[] preamble — shown for context, never recoverable.';
+
+/**
+ * The catalog note. These populations are byte cost with NO lever behind them yet: naming
+ * them is what #116 delivered, acting on them (`skillOverrides`, ADR-0005 lever 5a) is a
+ * later slice. Saying so explicitly keeps a consumer from reading `shipped` as a claim.
+ */
+const CATALOG_NOTE =
+  'The <system-reminder> catalogs Claude Code injects: the ToolSearch deferred-tools ' +
+  'listing, the Agent-tool agent types, and the Skill-tool catalog. Byte cost only at ' +
+  'this version — no lever acts on them, so none of these bytes is in totals.recoverable. ' +
+  'Before #116 these bytes were charged to safeLevers[mcp].shipped (or dropped entirely ' +
+  'when they rode the message surface); reading gain.mcp as "the catalog" no longer works.';
 
 /**
  * The levers that actually act, and the byte sums behind the headline. Shared by the
@@ -184,7 +197,10 @@ function buildToolsEntry({ shipped, deny, denyAllowed, gain }) {
  * (`sessionCount>=3 AND calledCount==0`, never in single-session mode); otherwise
  * flag-only. Per-server bytes are summed from `mcp__<server>__*` tool-def segments
  * (primary-session scope — see {@link sumMcpServerBytes}); the lever-level
- * `shipped`/`waste` is the deferred-listing block.
+ * `shipped`/`waste` is the connecting-servers sub-list of the deferred listing — which,
+ * since #116, is ALL `gain.mcp` holds. It used to be the whole deferred listing, catalogs
+ * included; a session with no MCP server now reports 0 here rather than ~30 KB of built-in
+ * tool, agent and skill names that no MCP setting could ever recover.
  * @param {{ mcp: import('./finetune-mcp.js').McpCorpus, gain: import('./finetune-gain.js').GainModel,
  *   perServer: Map<string, { shipped: number, waste: number }>, mcpDeny: string[] }} ctx
  */
@@ -217,7 +233,9 @@ function buildMcpEntry({ mcp, gain, perServer, mcpDeny }) {
     scope:
       'Deny verdicts are corpus-scoped; per-server shipped/waste are summed from ' +
       'mcp__<server>__* tool-def segments in the PRIMARY session (a byte proxy). ' +
-      'Deferred servers ship name-only, so per-server bytes may be 0 — unmeasured, not free.',
+      'Deferred servers ship name-only, so per-server bytes may be 0 — unmeasured, not free. ' +
+      'Lever-level shipped is the connecting-servers sub-list only; the rest of the ' +
+      'deferred listing is reported under `catalog` (schemaVersion 1, since #116).',
     shipped: gain.mcp.shipped,
     waste: mcpDeny.length > 0 ? gain.mcp.waste : 0,
     names: [...mcpDeny],
@@ -290,6 +308,27 @@ function tok(v) {
 }
 
 /**
+ * The catalog populations, as one byte-cost section (issue #116). Not a lever entry: it
+ * carries no verdict, no tier and no settings key, because nothing acts on it yet. Every
+ * population is listed even at zero bytes, so a consumer can tell "this build ships no
+ * skills catalog" from "this schema version does not report one".
+ * @param {{ gain: import('./finetune-gain.js').GainModel }} ctx
+ */
+function buildCatalogEntry({ gain }) {
+  const populations = CATALOG_LEVERS.map((lever) => {
+    const g = gain.catalog?.get(lever) ?? { shipped: 0, waste: 0 };
+    return { population: lever, shipped: g.shipped, waste: g.waste };
+  });
+  return {
+    shipped: populations.reduce((s, p) => s + p.shipped, 0),
+    waste: populations.reduce((s, p) => s + p.waste, 0),
+    action: 'none',
+    note: CATALOG_NOTE,
+    populations,
+  };
+}
+
+/**
  * Primary-session token totals from the captured `usage` (GAP C). Tokens are NOT a
  * fine-tune figure — the diagnostic is byte-only by spec — so this is OPT-IN
  * (`--include-tokens`) and never re-tokenizes: it sums the `usage` blocks already
@@ -342,9 +381,15 @@ export function buildJsonReport(ctx, opts = {}) {
   const mcpEntry = buildMcpEntry({ mcp, gain, perServer: sumMcpServerBytes(gain.tool), mcpDeny });
   const hooksEntry = buildHooksEntry({ hook, gain });
   const claudeMdEntry = buildClaudeMdEntry({ levers, gain });
+  const catalogEntry = buildCatalogEntry({ gain });
 
   const totalShipped =
-    toolsEntry.shipped + mcpEntry.shipped + hooksEntry.shipped + claudeMdEntry.shipped + gain.harness.shipped;
+    toolsEntry.shipped +
+    mcpEntry.shipped +
+    hooksEntry.shipped +
+    claudeMdEntry.shipped +
+    catalogEntry.shipped +
+    gain.harness.shipped;
 
   // settings.auto = the safe subset the skill may write on approval (built-in deny
   // always present, spec §3.1; MCP deny only under the guard). settings.advice = the
@@ -367,6 +412,7 @@ export function buildJsonReport(ctx, opts = {}) {
     note: NOTE,
     totals: { shipped: totalShipped, recoverable },
     floor: { shipped: gain.harness.shipped, waste: null, action: 'none', note: FLOOR_NOTE },
+    catalog: catalogEntry,
     safeLevers: [toolsEntry, mcpEntry],
     adviceLevers: [hooksEntry, claudeMdEntry],
     settings: { auto, advice },

@@ -418,6 +418,15 @@ export function renderFineTune({ sessionId, requests, shipped, deny, mcp, levers
     pushRow('CLAUDE.md', c.source ?? '(managed)', g?.shipped ?? c.bytes, g?.waste ?? 0, action);
   }
 
+  // Catalog populations (issue #116) — the `<system-reminder>` listings CC injects.
+  // Shown as byte cost with NO action: naming them is what #116 delivered, acting on
+  // them (`skillOverrides`, ADR-0005 lever 5a) is a later slice, and claiming a gain
+  // before the action exists is exactly the unproven advice ADR-0004 bars. Before #116
+  // most of these bytes were reported as MCP.
+  for (const [population, g] of gain.catalog ?? []) {
+    if (g.shipped > 0) pushRow('catalog', population, g.shipped, null, 'cost only (no lever yet)');
+  }
+
   // Harness — the incompressible floor (system[] preamble). Shown for context; its
   // waste is a dash (never recoverable, not modelled).
   if (gain.harness.shipped > 0) {

@@ -99,6 +99,7 @@ function gainWith(tools) {
     claudeMd: new Map(EMPTY_GAIN.claudeMd),
     hook: { ...EMPTY_GAIN.hook },
     mcp: { ...EMPTY_GAIN.mcp },
+    catalog: new Map(EMPTY_GAIN.catalog),
     harness: { ...EMPTY_GAIN.harness },
   };
   for (const [name, shipped, waste] of tools) gain.tool.set(name, { shipped, waste });
@@ -500,6 +501,84 @@ test('floor is the incompressible harness baseline (waste null, not recoverable)
   assert.equal(r.floor.action, 'none');
   // The recoverable headline never counts the floor.
   assert.equal(r.totals.recoverable, 0);
+});
+
+// ── catalog populations (issue #116) — a widening of the v1 contract ─────────
+//
+// Three new `lever` values exist in the shared model (`deferred-tools`, `agent-types`,
+// `skills-catalog`), and `gain.mcp` narrowed to the connecting-servers sub-list. That is
+// a contract change, not an internal detail: a consumer that read `safeLevers[mcp].shipped`
+// to talk about "the catalog" sees that figure DROP, and must read `catalog` instead.
+
+/**
+ * A gain model carrying the three catalog populations.
+ * @returns {import('../src/finetune-gain.js').GainModel}
+ */
+function catalogGain(mcpShipped = 0) {
+  return {
+    ...EMPTY_GAIN,
+    mcp: { shipped: mcpShipped, waste: 0 },
+    catalog: new Map([
+      ['deferred-tools', { shipped: 530, waste: 0 }],
+      ['agent-types', { shipped: 2656, waste: 0 }],
+      ['skills-catalog', { shipped: 5119, waste: 0 }],
+    ]),
+  };
+}
+
+/** The report of a session shipping the three catalogs and `mcpShipped` bytes of MCP. */
+function catalogReport(mcpShipped = 0) {
+  return buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: catalogGain(mcpShipped),
+  });
+}
+
+test('a repo with no MCP server reports mcp shipped: 0, with the catalog bytes under `catalog`', () => {
+  // Issue #116's exit criterion, on the emitted contract.
+  const r = catalogReport(0);
+  assert.equal(r.safeLevers.find((l) => l.lever === 'mcp').shipped, 0);
+  const skills = r.catalog.populations.find((p) => p.population === 'skills-catalog');
+  assert.equal(skills.shipped, 5119, 'the skills catalog is named and byte-costed');
+});
+
+test('catalog lists every population even at zero, so absent ≠ unreported', () => {
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: EMPTY_GAIN,
+  });
+  assert.deepEqual(
+    r.catalog.populations.map((p) => p.population),
+    ['deferred-tools', 'agent-types', 'skills-catalog'],
+  );
+  assert.equal(r.catalog.shipped, 0);
+});
+
+test('catalog is byte cost only — it acts on nothing and adds nothing to recoverable', () => {
+  const r = catalogReport(0);
+  assert.equal(r.catalog.action, 'none');
+  assert.equal(r.totals.recoverable, 0, 'naming a population is not claiming a gain');
+  assert.equal(r.catalog.shipped, 530 + 2656 + 5119);
+  assert.match(r.catalog.note, /#116/, 'the note tells a consumer where these bytes used to be');
+  assert.ok(!('tier' in r.catalog), 'not a lever entry: no tier, no verdict, no settings key');
+  assert.ok(!('verdict' in r.catalog));
+});
+
+test('totals.shipped absorbs the catalog — the bytes are counted once, under their own name', () => {
+  const r = catalogReport(471);
+  assert.equal(r.totals.shipped, r.catalog.shipped + 471, 'catalog + the narrowed MCP lever');
 });
 
 // ── optional token opt-in (GAP C — from captured usage, never re-tokenized) ───

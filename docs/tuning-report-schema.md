@@ -35,6 +35,16 @@ The contract is **additive**: a future `v2` may add fields, never silently remov
 rename a `v1` field. Breaking changes bump `schemaVersion` and the `$schema` URI. Pin
 on `schemaVersion`, not on field absence.
 
+### Changelog within `v1`
+
+Additive changes keep `schemaVersion: 1`. A change that leaves a field *present but
+meaning something narrower* is listed here, because pinning the version will not protect
+a consumer from it.
+
+| change | effect on a consumer |
+| ------ | -------------------- |
+| **[#116](https://github.com/ledahu05/ccsnoop/issues/116)** — `catalog` added; `safeLevers[mcp].shipped` **narrowed** to the connecting-servers sub-list. | ⚠ **Behavioural, not just additive.** `safeLevers[mcp].shipped` used to carry the *whole* deferred listing — the built-in tool names, and on some captures the agent-types and skills catalogs riding the same block. It now carries only the "MCP servers still connecting" sub-list, so **a session with no MCP server reports `0`** where it previously reported tens of kilobytes. That is the intended correction: no MCP setting could ever have recovered those bytes. A consumer that read `gain.mcp` / `safeLevers[mcp].shipped` to describe the catalog must read [`catalog`](#catalog) instead. **`totals.shipped` also GROWS**: the agent-types and skills catalogs ride `messages[0].content`, where the old model dropped them as conversation — they contributed zero. Naming them is what makes them countable (+7.8 KB on the reference capture). `totals.recoverable` is unaffected. |
+
 ### Reuse by `floor --json`
 
 The **envelope** is generic so [`ccsnoop floor`](../src/floor.js) (`#93`) can emit the
@@ -127,6 +137,7 @@ makes — it does not invent a second block. (Asserted by the test suite.)
   "note":           "<byte-proxy + scope explanation>",
   "totals":         { shipped, recoverable },
   "floor":          { shipped, waste, action, note },
+  "catalog":        { shipped, waste, action, note, populations[] },
   "safeLevers":     [ <tools>, <mcp> ],
   "adviceLevers":   [ <hooks>, <claudeMd> ],
   "settings":       { auto, advice },
@@ -146,7 +157,7 @@ makes — it does not invent a second block. (Asserted by the test suite.)
 
 | field | meaning |
 | ----- | ------- |
-| `shipped` | Σ the lever-level `shipped` figures + the floor — gross per-request byte size, size context only. Note the scope: the MCP lever contributes its **deferred-listing block** only, so per-server `mcp__*` tool-def bytes (`safeLevers[mcp].items[].shipped`) are *not* included here. Sum those separately if you want them. |
+| `shipped` | Σ the lever-level `shipped` figures + `catalog` + the floor — gross per-request byte size, size context only. Note the scope: the MCP lever contributes its **connecting-servers sub-list** only, so per-server `mcp__*` tool-def bytes (`safeLevers[mcp].items[].shipped`) are *not* included here. Sum those separately if you want them. |
 | `recoverable` | Σ `waste` over the **actionable** levers only (denied tools, MCP under guard, above-floor hooks, excludable-above-floor CLAUDE.md). The conservative, cache-aware headline. The floor and non-actionable waste are **never** counted. |
 
 ### `floor`
@@ -154,6 +165,22 @@ makes — it does not invent a second block. (Asserted by the test suite.)
 The incompressible harness `system[]` preamble — shown for context, never recoverable.
 `waste` is `null` (a dash in the text table): the bytes are real but there is no "what
 you'd stop re-paying" figure because the floor is never cut.
+
+### `catalog`
+
+The `<system-reminder>` catalogs Claude Code injects into the first user message: the
+ToolSearch **deferred-tools** listing, the Agent-tool **agent types**, and the Skill-tool
+**skills catalog**. Byte cost only — this section carries no `tier`, no `verdict` and no
+settings key, because no lever acts on these populations yet
+([ADR-0005](adr/0005-skills-catalog-lever-name-only.md) lever 5a is a later slice). None of
+these bytes is in `totals.recoverable`.
+
+| field | meaning |
+| ----- | ------- |
+| `shipped` / `waste` | Σ over the populations. |
+| `action` | always `"none"` at this version. |
+| `note` | says in words that this is cost, not a claim — and where these bytes used to be reported. |
+| `populations` | one entry per population, `{ population, shipped, waste }`, **always all three**, in the order a block presents them: `deferred-tools`, `agent-types`, `skills-catalog`. A population absent from the capture is `0`, so "absent" is distinguishable from "unreported". |
 
 ---
 
@@ -205,8 +232,12 @@ single-session scope.
   are summed from `mcp__<server>__*` tool-def segments in the **primary session** (GAP B).
   Deferred servers ship **name-only**, so their per-server schema bytes are `0` —
   **unmeasured, not free** (GAP D). A naïve consumer must not read `0` as "costs nothing".
-- lever-level `shipped`/`waste` — the deferred-listing **block** bytes (one figure for
-  the whole listing, distinct from the per-server tool-def sums).
+- lever-level `shipped`/`waste` — the **connecting-servers sub-list** of the deferred
+  listing (one figure, distinct from the per-server tool-def sums). ⚠ **This narrowed in
+  [#116](https://github.com/ledahu05/ccsnoop/issues/116)**: it used to be the *whole*
+  deferred listing, built-in tool / agent / skill names included. A session with no MCP
+  server now reports `0` here instead of tens of kilobytes. If you were reading this figure
+  to talk about the catalog, read [`catalog`](#catalog) instead.
 
 ### `hooks` (advice)
 

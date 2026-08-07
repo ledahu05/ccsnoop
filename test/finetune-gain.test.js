@@ -166,6 +166,96 @@ test('a managed CLAUDE.md block (no path) keys under the NULL_SOURCE placeholder
   assert.ok(acc.claudeMd.has(NULL_SOURCE) || acc.claudeMd.size === 0, 'managed source keys under NULL_SOURCE (or is absent)');
 });
 
+// ── catalog populations, and mcp-deferred narrowed (issue #116) ───────────────
+//
+// The gain model used to charge the WHOLE deferred listing — built-in tool names, agent
+// types, skills — to `mcp`, and to drop the catalogs that ride `messages[0].content`
+// entirely (they classified `harness`, which is charged on the `system` surface only). So
+// a repo with no MCP server was told it shipped ~30 KB of "MCP", and the skills catalog
+// was invisible. The shared classifier now carves each block into lever spans and
+// `chargeExchange` charges span by span.
+
+/** The real Claude Code header lines a `<system-reminder>` catalog opens with. */
+const DEFERRED_HDR = 'The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded.';
+const AGENTS_HDR = 'Available agent types for the Agent tool:';
+const SKILLS_HDR = 'The following skills are available for use with the Skill tool:';
+const CONNECTING_HDR = 'The following MCP servers are still connecting:';
+
+/**
+ * A turn-1 body whose first user message carries the three catalogs, as the wire shows
+ * them. `mcp: true` adds the connecting-servers sub-list inside the deferred listing —
+ * the ONLY thing that should ever charge the MCP lever.
+ */
+function catalogBody({ mcp = false, combined = false } = {}) {
+  const deferred = `${DEFERRED_HDR}\nWebFetch\nWebSearch\n${mcp ? `\n${CONNECTING_HDR}\nstub\n` : ''}`;
+  const agents = `${AGENTS_HDR}\n- Explore: Read-only search agent.\n`;
+  const skills = `${SKILLS_HDR}\n\n- dataviz: Charts and plots.\n- tdd: Red-green-refactor.\n`;
+  const wrap = (t) => ({ type: 'text', text: `<system-reminder>\n${t}</system-reminder>` });
+  const blocks = combined ? [wrap(`${deferred}\n${agents}\n${skills}`)] : [deferred, agents, skills].map(wrap);
+  return {
+    system: [{ type: 'text', text: 'You are a Claude agent, built on Anthropic.' }],
+    tools: [],
+    messages: [{ role: 'user', content: [...blocks, { type: 'text', text: 'do the thing' }] }],
+  };
+}
+
+test('a repo with NO MCP server charges ZERO mcp-deferred bytes — the catch-all is dead', () => {
+  // Issue #116's exit criterion, at the model. Every byte of the listing belongs to a
+  // catalog population; none of it is recoverable by any MCP setting, so none is MCP.
+  const body = catalogBody();
+  const acc = structuredGain();
+  chargeExchange({ segments: [{ slot: 'message#0', bytes: 1, kind: 'new' }], body }, acc);
+  assert.equal(acc.mcp.shipped, 0, 'no connecting-servers sub-list ⇒ no MCP bytes');
+  assert.ok(acc.catalog.get('skills-catalog').shipped > 0, 'the skills catalog is where those bytes are');
+  assert.ok(acc.catalog.get('agent-types').shipped > 0);
+  assert.ok(acc.catalog.get('deferred-tools').shipped > 0);
+});
+
+test('the connecting-servers sub-list is the ONLY thing charged to the MCP lever', () => {
+  const withMcp = structuredGain();
+  const without = structuredGain();
+  const seg = [{ slot: 'message#0', bytes: 1, kind: 'new' }];
+  chargeExchange({ segments: seg, body: catalogBody({ mcp: true }) }, withMcp);
+  chargeExchange({ segments: seg, body: catalogBody() }, without);
+
+  assert.ok(withMcp.mcp.shipped > 0, 'a connecting server does charge the MCP lever');
+  // …and it takes nothing from the catalogs: the two runs agree on every population that
+  // is not the sub-list, because the sub-list is carved OUT rather than folded in.
+  for (const kind of ['agent-types', 'skills-catalog']) {
+    assert.equal(withMcp.catalog.get(kind).shipped, without.catalog.get(kind).shipped, kind);
+  }
+});
+
+test('the catalogs are charged on the MESSAGE surface — where Claude Code actually injects them', () => {
+  // Before #116 these blocks classified `harness`, and `chargeExchange` charges harness on
+  // the `system` surface only — so the skills catalog contributed exactly zero bytes.
+  const body = catalogBody();
+  const acc = structuredGain();
+  chargeExchange({ segments: [{ slot: 'message#0', bytes: 1, kind: 'new' }], body }, acc);
+  assert.equal(acc.harness.shipped, cbytes(body.system[0]), 'the floor is still the system[] preamble alone');
+  assert.ok(!acc.catalog.has('harness'), 'and the catalogs are not part of it');
+});
+
+test('a COMBINED catalog block is charged span by span, and the spans tile it exactly', () => {
+  // All three populations plus the MCP sub-list on ONE block. Splitting must not invent
+  // or lose a byte: Σ what was charged === the block's own canonical byte length.
+  const body = catalogBody({ mcp: true, combined: true });
+  const acc = structuredGain();
+  chargeExchange({ segments: [{ slot: 'message#0', bytes: 1, kind: 'new' }], body }, acc);
+  const charged =
+    acc.mcp.shipped + [...acc.catalog.values()].reduce((s, g) => s + g.shipped, 0);
+  assert.equal(charged, cbytes(body.messages[0].content[0]), 'spans tile the source block');
+  assert.equal(acc.catalog.size, 3, 'one entry per population, from a single block');
+});
+
+test('a catalog span is re-paid per its carrier segment, like every other lever', () => {
+  const body = catalogBody();
+  const acc = structuredGain();
+  chargeExchange({ segments: [{ slot: 'message#0', bytes: 1, kind: 'reused-uncached' }], body }, acc);
+  const skills = acc.catalog.get('skills-catalog');
+  assert.equal(skills.waste, skills.shipped, 'a cold cache re-pays the catalog in full');
+});
+
 // ── computeGain: re-parses the captured request blobs ─────────────────────────
 
 test('computeGain re-parses requestBlob per exchange and never throws on an unparseable body', () => {
@@ -200,6 +290,7 @@ test('the headline sums waste only over actionable levers; non-actionable rows a
     claudeMd: new Map([['./CLAUDE.md', { shipped: 5120, waste: 3072 }]]),
     hook: { shipped: 6144, waste: 6144 },
     mcp: { shipped: 2400, waste: 2400 }, // flag-only here → not counted
+    catalog: new Map(),
     harness: { shipped: 2765, waste: 2765 }, // floor → never counted
   };
   const levers = buildLeverVerdicts({
@@ -376,6 +467,7 @@ function structuredGain() {
     claudeMd: new Map(),
     hook: { shipped: 0, waste: 0 },
     mcp: { shipped: 0, waste: 0 },
+    catalog: new Map(),
     harness: { shipped: 0, waste: 0 },
   };
 }
@@ -522,6 +614,7 @@ test('byte-cost ranking lists every shipped tool (not only denied), per-server M
     claudeMd: new Map([['./CLAUDE.md', { shipped: 1500, waste: 0 }]]),
     hook: { shipped: 0, waste: 0 },
     mcp: { shipped: 0, waste: 0 },
+    catalog: new Map(),
     harness: { shipped: 0, waste: 0 },
   };
   const levers = {
@@ -595,6 +688,7 @@ function rankCtx({ tool, source = './CLAUDE.md', shipped, deny = [], servers = [
       claudeMd: new Map([[source, { shipped: 1500, waste: 0 }]]),
       hook: { shipped: 0, waste: 0 },
       mcp: { shipped: 0, waste: 0 },
+      catalog: new Map(),
       harness: { shipped: 0, waste: 0 },
     },
   };
