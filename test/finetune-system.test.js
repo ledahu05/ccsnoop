@@ -172,6 +172,30 @@ test('an on-wire mcp__<server>__<tool> deferred name still reads as mcp-deferred
   assert.equal(classifySystemBlock(text('deferred tools: mcp__stub__t00 listing')).lever, 'mcp-deferred');
 });
 
+// ── #117: the header-less fallback needs the envelope on the MESSAGE surface ────
+//
+// The `mcp__<server>__<tool>` marker is a bare tool NAME with no header behind it, so on
+// the message surface — where the user's own prose rides — it is trusted only inside the
+// `<system-reminder>` envelope Claude Code wraps its injections in. `system[]` needs no
+// envelope: nothing there is conversation.
+
+test('the mcp__ fallback on the message surface needs the <system-reminder> envelope', () => {
+  const prose = text('why does mcp__github__create_issue keep failing on this repo?');
+  assert.equal(classifySystemBlock(prose, { surface: 'message' }).lever, 'harness', 'prose is not a listing');
+  assert.equal(classifySystemBlock(prose, { surface: 'system' }).lever, 'mcp-deferred', 'system[] is never conversation');
+  assert.equal(classifySystemBlock(prose).lever, 'mcp-deferred', 'and `system` is the default surface');
+});
+
+test('the envelope is matched on the tag NAME — an attribute or odd casing still reads as injected', () => {
+  // Requiring the exact `<system-reminder>` would make a real listing invisible the day a
+  // build adds an attribute — the failure this slice exists to remove, reintroduced by a
+  // regex. This is the same probe `finetune-levers.js` uses for its denominator.
+  for (const open of ['<system-reminder>', '<system-reminder priority="high">', '<SYSTEM-REMINDER>']) {
+    const block = text(`${open}\nmcp__stub__t01\nmcp__stub__t02\n</system-reminder>`);
+    assert.equal(classifySystemBlock(block, { surface: 'message' }).lever, 'mcp-deferred', open);
+  }
+});
+
 test('a block naming no lever at all is the harness floor, even if it says "deferred tools"', () => {
   // The old catch-all `/deferred\s+(?:tool|mcp)/` swept prose into the MCP lever. Prose
   // that merely uses the words — with no catalog header, no connecting sub-list and no

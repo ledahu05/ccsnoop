@@ -76,6 +76,18 @@ _Avoid_: catalog block, reminder, the listing
 One lever's share of a single request block. A block can carry several populations — the connecting-servers sub-list rides *inside* the deferred-tools listing — so `classifySystemSpans` carves it into spans, one per lever. Spans **tile** their block: their bytes sum to its canonical byte length, which is what stops a split from inventing bytes the wire never carried. The single authority for "which lever owns which bytes".
 _Avoid_: slice, chunk, sub-block
 
+**Message surface**:
+`messages[*].content` — the second place a floor block can ride, alongside the `system[]` surface. Claude Code injects the catalogs (and, under `-p`, CLAUDE.md, the hook and the MCP listing) into the *first user message*, wrapped in a `<system-reminder>` envelope. A block is charged for **classifying onto a lever**, never for its position: the injected reminders are floor, the user's own prompt sharing that message is not, and the `harness` fallback stays `system[]`-only so an unmatched message block costs nothing (#117).
+_Avoid_: the user message, messages[0], the conversation surface
+
+**Injection envelope**:
+The `<system-reminder>` wrapper Claude Code puts around every block it injects into a user message. On the message surface it is the corroboration a *header-less* classification needs — the coarse `mcp__<server>__*` fallback is trusted inside it and read as prose outside it, so a question mentioning an MCP tool neither inflates the floor nor dilutes the "% of system" denominator (#117). Matched on the tag **name**, case-insensitively, so an added attribute cannot make a real listing invisible again; one probe (`hasReminderEnvelope`), both consumers.
+_Avoid_: reminder tag, wrapper
+
+**Reconciliation gate**:
+The test that `floor`'s total and the gain model's total are the same number reached two ways. They differ by route only: `floor` shows the deferred listing whole (the connecting-servers sub-list **folded back in**, its own MCP row dropped), while the gain model splits the same bytes into `catalog` + `mcp`. A span already charged to a lever is *replaced or deducted, never added* — which is what "no byte is counted twice" means operationally (#117, `test/floor.test.js`).
+_Avoid_: the totals check, double-count test
+
 **MCP deferred listing**:
 The *"MCP servers still connecting"* sub-list, and nothing else — the only part of the deferred listing an MCP setting can act on. Before #116 the name covered the whole listing, so a repo with no MCP server was told it shipped tens of kilobytes of "MCP"; it now reports zero.
 _Avoid_: the deferred listing (that is the built-in tools population), the MCP block

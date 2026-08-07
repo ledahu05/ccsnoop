@@ -23,6 +23,7 @@ import { floor, computeFloor, renderFloor, DEFAULT_WINDOW_TOKENS } from '../src/
 import { buildRequestBlob } from '../src/capture.js';
 import { canonicalize } from '../src/waste.js';
 import { loadSession } from '../src/report.js';
+import { chargedBytes, computeGain } from '../src/finetune-gain.js';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const BIN = path.join(REPO_ROOT, 'bin', 'ccsnoop.js');
@@ -690,6 +691,43 @@ test('computeFloor keeps the opaque MCP row when the listing headers are unrecog
   assert.ok(!byKind.has('deferred-tools'), 'no catalog is invented from an unmatched block');
 });
 
+// ── #117: the reconciliation gate — floor's total IS the gain model's total ─────
+//
+// `floor` and `fine-tune` measure the same turn-1 prompt through two different paths:
+// `floor` reads the catalog rows off `findCatalogBlocks` (which FOLDS the
+// connecting-servers sub-list back into the listing it interrupts), while the gain model
+// charges each span to its own lever. The two must add up to the same number — that is
+// the whole content of "no byte is counted twice, and none is dropped". Nothing enforces
+// it structurally (the fold lives in `floor-catalog.js`, the charge in
+// `finetune-gain.js`), so it is enforced here, on every capture shape that fold has to
+// handle.
+
+/** The capture shapes the fold has to handle — every one must reconcile. */
+const RECONCILE_SHAPES = [
+  { shape: 'three separate catalog blocks', build: () => catalogModel('separate') },
+  { shape: 'one combined catalog block', build: () => catalogModel('combined') },
+  { shape: 'catalogs on the system surface', build: () => catalogModel('separate', { surface: 'system' }) },
+  {
+    shape: 'a listing with no connecting servers',
+    build: () =>
+      catalogModel('separate', {
+        deferredText: `${DEFERRED_TXT.slice(0, DEFERRED_TXT.indexOf('\nThe following MCP servers'))}\n`,
+      }),
+  },
+  { shape: 'an unrecognized listing (the coarse MCP fallback)', build: () => synthModel().model },
+];
+
+for (const { shape, build } of RECONCILE_SHAPES) {
+  test(`floor's total equals the gain model's total charge — ${shape}`, () => {
+    const m = build();
+    const f = computeFloor(m);
+    // Cast: a hand-built model keeps `requestBlob` as a Buffer (what `buildRequestBlob`
+    // returns), where a loaded session keeps the decoded string. Both parse.
+    const gain = computeGain({ exchanges: [/** @type {any} */ (m.exchanges[f.turn1Index])] });
+    assert.equal(f.totalBytes, chargedBytes(gain));
+  });
+}
+
 test('computeFloor: catalog entries are parsed, ranked, and sum to under the block', () => {
   const f = computeFloor(catalogModel('separate'));
   const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
@@ -849,4 +887,34 @@ test('floor() on the real fixture: real turn-1 tokens + ranked floor (issue #99 
   assert.deepEqual(bytes, [...bytes].sort((a, b) => b - a));
   assert.equal(res.totalBytes, bytes.reduce((s, b) => s + b, 0));
   assert.ok(res.totalBytes > 0);
+});
+
+test('floor and the gain model agree on the real fixture, line by line (#117)', fixtureOpts, () => {
+  const dir = path.join(FIXTURES_DIR, 'session-963204f5-937b-4a13-b658-f1cbffd21421');
+  const loaded = loadSession(dir, 'fixture');
+  const f = computeFloor(loaded);
+  const gain = computeGain({ exchanges: [loaded.exchanges[f.turn1Index]] });
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+
+  // The frozen total. It is the sum of the six gain buckets AND the sum of floor's rows —
+  // one number reached two ways, which is the point.
+  assert.equal(f.totalBytes, 112103, 'the floor total is frozen');
+  assert.equal(chargedBytes(gain), 112103, 'and the gain model charges exactly the same bytes');
+
+  // The one row where the two paths differ, and why the difference is not a byte: this
+  // capture's deferred listing carries the connecting-servers sub-list, so 471 B of it are
+  // ALREADY charged to `mcp-deferred`. `floor` shows the listing whole (1 001 B) and drops
+  // its own MCP row; the gain model splits it 530 + 471. Either way the wire carried 1 001 B
+  // once. This is the "catalog block already attributed to mcp-deferred" case #117 froze.
+  assert.equal(byKind.get('deferred-tools').bytes, 1001, 'floor shows the listing whole');
+  assert.equal(gain.catalog.get('deferred-tools').shipped, 530, 'the gain model keeps the catalog half');
+  assert.equal(gain.mcp.shipped, 471, 'and charges the sub-list to the MCP lever');
+  assert.equal(gain.catalog.get('deferred-tools').shipped + gain.mcp.shipped, byKind.get('deferred-tools').bytes);
+  assert.ok(!byKind.has('mcp-deferred'), 'so floor must NOT also show an MCP row');
+
+  // Every other row is the same figure on both sides — no fold, no split.
+  assert.equal(byKind.get('agent-types').bytes, gain.catalog.get('agent-types').shipped);
+  assert.equal(byKind.get('skills-catalog').bytes, gain.catalog.get('skills-catalog').shipped);
+  assert.equal(byKind.get('harness').bytes, gain.harness.shipped);
+  assert.equal(byKind.get('hook').bytes, gain.hook.shipped);
 });
