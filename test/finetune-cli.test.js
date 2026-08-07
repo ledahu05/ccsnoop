@@ -30,13 +30,14 @@ const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const BIN = path.join(REPO_ROOT, 'bin', 'ccsnoop.js');
 const FIXTURES_DIR = fileURLToPath(new URL('./fixtures/finetune', import.meta.url));
 
-// The 9 v1 denylist names in spec order (data/builtin-denylist.json).
+// The 10 v1 denylist names in spec order (data/builtin-denylist.json).
 const V1_NAMES = [
   'Workflow',
   'Artifact',
   'AskUserQuestion',
   'ScheduleWakeup',
   'ReportFindings',
+  'EnterWorktree',
   'CronCreate',
   'CronDelete',
   'CronList',

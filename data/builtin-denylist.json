@@ -4,6 +4,7 @@
   { "name": "AskUserQuestion", "category": "structured UI", "note": "structured prompts" },
   { "name": "ScheduleWakeup", "category": "scheduling", "note": "/loop self-pacing" },
   { "name": "ReportFindings", "category": "review output", "note": "code-review" },
+  { "name": "EnterWorktree", "category": "isolation", "note": "opt-in by contract — explicit user instruction required" },
   { "name": "CronCreate", "category": "scheduling", "note": "cron jobs" },
   { "name": "CronDelete", "category": "scheduling", "note": "cron jobs" },
   { "name": "CronList", "category": "scheduling", "note": "cron jobs" },
