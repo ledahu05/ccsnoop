@@ -5,3 +5,6 @@ sessions/
 bench/runs/
 .claude/worktrees/
 .sandcastle/worktrees/
+# Sandcastle provider secrets — never commit (ADR-0001). .env.secrets.example stays tracked.
+.sandcastle/.env
+.sandcastle/.env.secrets
