@@ -423,8 +423,17 @@ function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ccsnoop-floor-'));
 }
 
-/** A one-turn session dir with a known tools[] + a usage-bearing response. */
-function writeSession(dir, id, tools, usage) {
+/**
+ * A one-turn session dir with a known tools[] + a usage-bearing response.
+ * `messageContent` is the turn-1 user message — a bare string by default, or an array of
+ * content blocks when a test needs the catalog `<system-reminder>`s that ride it (#109).
+ * @param {string} dir
+ * @param {string} id
+ * @param {{ name: string }[]} tools
+ * @param {Record<string, number>} usage
+ * @param {string | { type: string, text: string }[]} [messageContent]
+ */
+function writeSession(dir, id, tools, usage, messageContent = 'hi') {
   fs.mkdirSync(dir, { recursive: true });
   const req = buildRequestBlob({
     method: 'POST',
@@ -435,7 +444,7 @@ function writeSession(dir, id, tools, usage) {
         model: 'claude-x',
         system: [{ type: 'text', text: 'system prompt' }],
         tools,
-        messages: [{ role: 'user', content: 'hi' }],
+        messages: [{ role: 'user', content: messageContent }],
       })
     ),
   });
@@ -535,6 +544,185 @@ test('ccsnoop floor --window overrides the context window for the % figure', () 
   assert.match(r.stdout, /50%.*window/);
 });
 
+// ── catalog blocks: deferred tools / agent types / skills (issue #109) ─────────
+//
+// The turn-1 prompt carries three catalogs. Before #109 `floor` showed at most ONE
+// opaque `MCP — deferred tool listing` row: only the deferred-tools listing matched the
+// shared classifier, while the agent-types and skills catalogs — which ride
+// `messages[0].content` and classify to `harness` — were dropped entirely, because
+// `chargeExchange` charges harness only on the `system` surface. So these tests pin two
+// distinct properties: the catalogs are NAMED (ventilation), and the two that were
+// invisible now COUNT (the correctness half of the issue).
+
+/** The real Claude Code header lines that introduce each catalog. */
+const DEFERRED_TXT =
+  'The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded.\n\nWebFetch\nWebSearch\nMonitor\n\nThe following MCP servers are still connecting:\n\nstub\n';
+const AGENTS_TXT =
+  'Available agent types for the Agent tool:\n- Explore: Read-only search agent for broad fan-out searches.\n- Plan: Software architect agent for designing implementation plans.\n';
+const SKILLS_TXT =
+  'The following skills are available for use with the Skill tool:\n\n- dataviz: Use this skill whenever you are about to create ANY chart.\n- claude-api: Reference for the Claude API.\nTRIGGER — read BEFORE opening the target file.\nSKIP only when another provider is being worked on.\n';
+
+/**
+ * A one-exchange model whose turn-1 `messages[0].content` carries the three catalogs.
+ * `shape: 'separate'` gives each its own block (the committed fixture's shape);
+ * `shape: 'combined'` rides all three in ONE block (the only shape that can produce the
+ * single ~30 KB row issue #109 reports from a real session — 19 tool names are not 30 KB).
+ */
+function catalogModel(shape, { surface = 'message' } = {}) {
+  const wrap = (t) => `<system-reminder>\n${t}</system-reminder>`;
+  const blocks =
+    shape === 'combined'
+      ? [{ type: 'text', text: wrap(`${DEFERRED_TXT}\n${AGENTS_TXT}\n${SKILLS_TXT}`) }]
+      : [DEFERRED_TXT, AGENTS_TXT, SKILLS_TXT].map((t) => ({ type: 'text', text: wrap(t) }));
+  const body = {
+    model: 'claude-test',
+    system: [{ type: 'text', text: 'harness preamble' + 'H'.repeat(400) }, ...(surface === 'system' ? blocks : [])],
+    tools: [{ name: 'Read' }],
+    messages: [{ role: 'user', content: surface === 'system' ? 'hello' : [{ type: 'text', text: 'hello' }, ...blocks] }],
+  };
+  const requestBlob = buildRequestBlob({
+    method: 'POST',
+    url: '/v1/messages',
+    rawHeaders: ['Content-Type', 'application/json'],
+    body: Buffer.from(JSON.stringify(body)),
+  });
+  return {
+    sessionId: 'catalog',
+    exchanges: [
+      {
+        turn: 1,
+        usage: { inputTokens: 100, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0 },
+        requestBlob,
+        segments: [{ slot: 'tool:Read', bytes: 500, kind: 'reused-cached' }],
+      },
+    ],
+  };
+}
+
+test('computeFloor names the three catalogs instead of one opaque MCP row', () => {
+  const f = computeFloor(catalogModel('separate'));
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+  assert.ok(byKind.has('deferred-tools'), 'deferred-tools listing named');
+  assert.ok(byKind.has('agent-types'), 'agent-types catalog named');
+  assert.ok(byKind.has('skills-catalog'), 'skills catalog named');
+  assert.ok(!byKind.has('mcp-deferred'), 'the opaque MCP row is replaced, not duplicated');
+  // Each block's bytes are the canonical byte length of its own <system-reminder> block —
+  // the same basis every other floor row uses, so the table stays comparable.
+  assert.equal(byKind.get('agent-types').bytes, txtBytes(`<system-reminder>\n${AGENTS_TXT}</system-reminder>`));
+});
+
+test('computeFloor: the previously-invisible catalogs now count toward the floor total', () => {
+  const f = computeFloor(catalogModel('separate'));
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+  // Before #109 these two rode the message surface, classified `harness`, and were
+  // dropped as conversation — they contributed exactly zero to the floor.
+  const gained = byKind.get('agent-types').bytes + byKind.get('skills-catalog').bytes;
+  assert.ok(gained > 0, 'agent-types + skills carry real bytes');
+  assert.equal(f.totalBytes, f.attribution.reduce((s, a) => s + a.bytes, 0), 'total absorbs them');
+});
+
+test('computeFloor carves a COMBINED catalog block into three that tile it exactly', () => {
+  const f = computeFloor(catalogModel('combined'));
+  const cat = f.attribution.filter((a) => ['deferred-tools', 'agent-types', 'skills-catalog'].includes(a.kind));
+  assert.equal(cat.length, 3, 'one row per population, from a single source block');
+  // The spans must tile the source block: splitting a row may not invent bytes the gain
+  // model never charged, so Σ spans === the whole block's canonical byte length.
+  const whole = txtBytes(`<system-reminder>\n${DEFERRED_TXT}\n${AGENTS_TXT}\n${SKILLS_TXT}</system-reminder>`);
+  assert.equal(cat.reduce((s, a) => s + a.bytes, 0), whole, 'spans tile the block exactly');
+});
+
+test('computeFloor does not double-count a catalog already inside the harness figure', () => {
+  // On the `system` surface the agent-types and skills blocks ARE charged to harness by
+  // the gain model. Naming them must move those bytes, not add them a second time.
+  const onSystem = computeFloor(catalogModel('separate', { surface: 'system' }));
+  const onMessage = computeFloor(catalogModel('separate', { surface: 'message' }));
+  const catBytes = (f) =>
+    f.attribution.filter((a) => ['agent-types', 'skills-catalog'].includes(a.kind)).reduce((s, a) => s + a.bytes, 0);
+  assert.equal(catBytes(onSystem), catBytes(onMessage), 'same catalogs, same bytes on either surface');
+  const harness = onSystem.attribution.find((a) => a.kind === 'harness');
+  assert.ok(harness, 'the system[] preamble still has its own row');
+  assert.ok(!harness.label.includes('Available agent types'), 'sanity: harness is the preamble');
+  // The preamble block is ~400 B of padding; harness must not still carry the catalogs.
+  assert.ok(harness.bytes < catBytes(onSystem), 'catalog bytes were deducted from harness');
+});
+
+test('computeFloor keeps the opaque MCP row when the listing headers are unrecognized', () => {
+  // A build of Claude Code that words the headers differently still trips the shared
+  // classifier. One coarse row beats silently dropping ~30 KB from the floor.
+  const { model, expected } = synthModel();
+  const f = computeFloor(model);
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+  assert.equal(byKind.get('mcp-deferred').bytes, expected.mcp, 'the fallback row survives');
+  assert.ok(!byKind.has('deferred-tools'), 'no catalog is invented from an unmatched block');
+});
+
+test('computeFloor: catalog entries are parsed, ranked, and sum to under the block', () => {
+  const f = computeFloor(catalogModel('separate'));
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+
+  // Deferred tools: the bare-token names, plus the connecting MCP servers as their own group.
+  const deferred = byKind.get('deferred-tools');
+  assert.deepEqual(
+    deferred.entries.filter((e) => e.group === 'tools').map((e) => e.name).sort(),
+    ['Monitor', 'WebFetch', 'WebSearch']
+  );
+  assert.deepEqual(deferred.entries.filter((e) => e.group === 'servers').map((e) => e.name), ['stub']);
+
+  // Skills: a description spanning several physical lines is ONE entry, not three.
+  const skills = byKind.get('skills-catalog');
+  assert.deepEqual(skills.entries.map((e) => e.name).sort(), ['claude-api', 'dataviz']);
+  const api = skills.entries.find((e) => e.name === 'claude-api');
+  assert.ok(api.bytes > Buffer.byteLength('- claude-api: Reference for the Claude API.\n'), 'continuation lines folded in');
+
+  for (const kind of /** @type {import('../src/floor.js').FloorBlock['kind'][]} */ ([
+    'deferred-tools',
+    'agent-types',
+    'skills-catalog',
+  ])) {
+    const b = byKind.get(kind);
+    assert.deepEqual(b.entries.map((e) => e.bytes), [...b.entries.map((e) => e.bytes)].sort((x, y) => y - x), `${kind} ranked`);
+    const sum = b.entries.reduce((s, e) => s + e.bytes, 0);
+    assert.ok(sum > 0 && sum < b.bytes, `${kind} entries sum under the block (headers are the remainder)`);
+  }
+});
+
+test('renderFloor: --detail adds a per-entry section below the total, leaving the table intact', () => {
+  const ctx = computeFloor(catalogModel('separate'));
+  const plain = renderFloor(ctx).lines.join('\n');
+  const detailed = renderFloor(ctx, { detail: true }).lines.join('\n');
+
+  assert.ok(detailed.startsWith(plain), 'detail is strictly appended — the ranked table is unchanged');
+  assert.doesNotMatch(plain, /per-entry/i, 'no entry noise without the flag');
+  assert.match(detailed, /Per-entry breakdown/i);
+  assert.match(detailed, /WebSearch/, 'a deferred tool name is listed');
+  assert.match(detailed, /stub \(mcp server\)/, 'a connecting server is marked as such');
+  assert.match(detailed, /dataviz/, 'a skill name is listed');
+  assert.match(detailed, /headers, separators, envelope/, 'the unattributed remainder is named, not hidden');
+});
+
+test('renderFloor: --detail on a floor with no catalog says so rather than printing an empty section', () => {
+  const out = renderFloor(computeFloor(synthModel().model), { detail: true }).lines.join('\n');
+  assert.match(out, /no catalog blocks/i);
+});
+
+test('ccsnoop floor --detail prints the per-entry breakdown (exit 0)', () => {
+  const sessionsDir = mkTmpDir();
+  const wrap = (t) => ({ type: 'text', text: `<system-reminder>\n${t}</system-reminder>` });
+  writeSession(path.join(sessionsDir, 'cat'), 'cat', [{ name: 'Read' }], { input_tokens: 100, output_tokens: 1 }, [
+    { type: 'text', text: 'hi' },
+    wrap(DEFERRED_TXT),
+    wrap(SKILLS_TXT),
+  ]);
+  const base = [BIN, 'floor', '--sessions-dir', sessionsDir];
+  const plain = spawnSync(process.execPath, base, { encoding: 'utf8' });
+  const detailed = spawnSync(process.execPath, [...base, '--detail'], { encoding: 'utf8' });
+  assert.equal(detailed.status, 0, `stderr: ${detailed.stderr}`);
+  assert.match(plain.stdout, /deferred tools — ToolSearch listing/, 'the catalog row is named without the flag');
+  assert.doesNotMatch(plain.stdout, /WebSearch/, 'entries stay behind the flag');
+  assert.match(detailed.stdout, /Per-entry breakdown/i);
+  assert.match(detailed.stdout, /WebSearch/);
+});
+
 // Self-activating gate: only runs when the frozen real fixture is committed.
 const fixtureOpts = fs.existsSync(FIXTURES_DIR) &&
   fs.readdirSync(FIXTURES_DIR, { withFileTypes: true }).some((e) => e.isDirectory() && /^session-/.test(e.name))
@@ -561,6 +749,15 @@ test('floor() on the real fixture: real turn-1 tokens + ranked floor (issue #99 
   assert.ok(kinds.has('tool'), 'tool defs attributed');
   assert.ok(kinds.has('claude-md'), 'CLAUDE.md sources attributed');
   assert.ok(kinds.has('hook'), 'SessionStart hook output attributed');
+  // #109 — the deferred listing is ventilated into three named catalogs, and the two that
+  // the gain model dropped as conversation are now costed on the real capture too.
+  assert.ok(kinds.has('deferred-tools'), 'deferred tool listing attributed');
+  assert.ok(kinds.has('agent-types'), 'agent-types catalog attributed');
+  assert.ok(kinds.has('skills-catalog'), 'skills catalog attributed');
+  assert.ok(!kinds.has('mcp-deferred'), 'no opaque MCP row left on a recognized capture');
+  for (const a of res.attribution.filter((x) => x.entries)) {
+    assert.ok(a.entries.length > 0, `${a.label} broke down into entries`);
+  }
 
   // Ranked by byte cost; total is the sum.
   const bytes = res.attribution.map((a) => a.bytes);
