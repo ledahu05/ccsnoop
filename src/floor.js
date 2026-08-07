@@ -95,7 +95,7 @@ export function fmtTokens(n) {
  * @typedef {object} FloorContext
  * @property {string | null} sessionId
  * @property {number} turns            Total exchanges in the session.
- * @property {number | null} turn1Index Always 0 when there is a turn 1; null when empty.
+ * @property {number | null} turn1Index Index of the exchange the floor was taken from — the first exchange shipping the static floor (NOT always 0: an interactive session's exchanges[0] is a preflight probe). Null when empty.
  * @property {string | null} model     Captured request model name (display only).
  * @property {number} windowTokens     The window the headline % was scored against.
  * @property {FloorHeadline} headline
@@ -104,10 +104,70 @@ export function fmtTokens(n) {
  */
 
 /**
+ * The byte floor below which a request is assumed to carry no static floor. Claude
+ * Code's interactive preflight is a ~1 KB probe; the real conversation opening is
+ * tens of KB. Used only as the fallback when no exchange ships a recognizable
+ * tools[]/system[] (a degraded capture), to pick a substantial request over a tiny one.
+ */
+const TURN1_BYTE_FLOOR = 4096;
+
+/**
+ * Whether an exchange ships the static floor — a non-empty `tools[]` and/or `system[]`
+ * in its parsed request body. The interactive preflight Claude Code emits before turn 1
+ * carries neither (a small probe, sometimes a non-JSON HEAD whose body does not parse),
+ * so it reads as no tools and no system; every real conversation turn carries both.
+ * Reads the same {@link parseRequestBlob} path `computeGain` does. Internal to turn-1
+ * selection; not the gain model's notion of an attributed block.
+ * @param {any} ex
+ * @returns {boolean}
+ */
+function carriesFloor(ex) {
+  const body = parseRequestBlob(ex?.requestBlob ?? '').json;
+  if (!body || typeof body !== 'object') return false;
+  if (Array.isArray(body.tools) && body.tools.length > 0) return true;
+  // `system` may be an array of blocks or a bare prompt string (both valid per the
+  // Anthropic API); either is a floor only when non-empty — `system: ""` is not.
+  const sys = body.system;
+  if (Array.isArray(sys)) return sys.length > 0;
+  if (typeof sys === 'string') return sys.length > 0;
+  return false;
+}
+
+/**
+ * Locate turn 1 — the first exchange that ships the static floor — and its index.
+ * Index 0 is NOT reliably turn 1: an interactive session's first captured request is
+ * Claude Code's preflight probe (no tools[], no system[]), not the opening, so
+ * anchoring on `exchanges[0]` zeroed the whole metric (issue #107). Falls back, in
+ * order, to the first exchange at least {@link TURN1_BYTE_FLOOR} bytes (a degraded
+ * capture with no recognizable floor), then to index 0, so a session still renders
+ * rather than reading as an empty floor.
+ * @param {Array<Record<string, any>>} exchanges
+ * @returns {{ turn1: Record<string, any> | null, turn1Index: number | null }}
+ */
+function findTurn1(exchanges) {
+  for (let i = 0; i < exchanges.length; i++) {
+    if (carriesFloor(exchanges[i])) return { turn1: exchanges[i], turn1Index: i };
+  }
+  for (let i = 0; i < exchanges.length; i++) {
+    const blob = exchanges[i]?.requestBlob;
+    // `requestBlob` is a string on a loaded session and a Buffer on a hand-built test
+    // model (buildRequestBlob); size both the same way.
+    const len = typeof blob === 'string' ? Buffer.byteLength(blob, 'utf8') : Buffer.isBuffer(blob) ? blob.length : 0;
+    if (len >= TURN1_BYTE_FLOOR) {
+      return { turn1: exchanges[i], turn1Index: i };
+    }
+  }
+  return { turn1: exchanges[0] ?? null, turn1Index: exchanges.length > 0 ? 0 : null };
+}
+
+/**
  * The pure attribution core: isolate turn 1 and build the floor context from a
- * loaded session model. Turn-1 isolation profiles ONLY the first exchange — every
- * static block is re-shipped each turn, so turn 1 is the canonical floor, and
- * ignoring later turns drops any mid-session mutation from the baseline.
+ * loaded session model. Turn-1 isolation profiles ONLY the exchange that ships the
+ * static floor — every static block is re-shipped each turn, so that opening is the
+ * canonical floor, and ignoring later turns drops any mid-session mutation from the
+ * baseline. The opening is NOT always `exchanges[0]`: an interactive session begins
+ * with a preflight probe that carries no floor, so {@link findTurn1} skips it
+ * (issue #107).
  *
  * The byte figures are the turn-1 slice of {@link module:finetune-gain.computeGain};
  * the headline tokens are the real captured `usage`. Never re-tokenizes. Null-safe:
@@ -127,10 +187,13 @@ export function computeFloor(model, opts = {}) {
       ? opts.windowTokens
       : DEFAULT_WINDOW_TOKENS;
   const exchanges = model?.exchanges ?? [];
-  const turn1 = exchanges[0] ?? null;
   const turns = exchanges.length;
 
-  // Turn-1 isolation: attribute the floor from the FIRST exchange only.
+  // Turn-1 isolation: attribute the floor from the first exchange that SHIPS it. The
+  // opening is not always exchanges[0] — Claude Code emits a preflight probe before the
+  // first real turn on interactive sessions (#107), so index 0 can be a floor-less
+  // request that would zero the whole metric. `findTurn1` skips past it.
+  const { turn1, turn1Index } = findTurn1(exchanges);
   const gain = computeGain({ exchanges: turn1 ? [turn1] : [] });
 
   // ── headline: real turn-1 input tokens from captured usage ──────────────────
@@ -179,7 +242,7 @@ export function computeFloor(model, opts = {}) {
   return {
     sessionId: model?.sessionId ?? null,
     turns,
-    turn1Index: turns > 0 ? 0 : null,
+    turn1Index,
     model: modelName,
     windowTokens,
     headline: {

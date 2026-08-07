@@ -43,7 +43,7 @@ const NOTE =
   'decide which two sessions pair.';
 
 /**
- * @typedef {'lowered' | 'raised' | 'flat'} Verdict
+ * @typedef {'lowered' | 'raised' | 'flat' | 'unknown'} Verdict
  */
 
 /**
@@ -187,7 +187,9 @@ function relPhrase(rel) {
  * Turn-1 isolation is inherited from `computeFloor` (each side profiles only its first
  * exchange); the headline delta is the real captured `usage`; the per-block delta is a
  * byte proxy. Never re-tokenizes. Null-safe: a side with no usage yields a null token
- * headline, and the verdict then falls back to the byte proxy.
+ * headline, and the verdict then falls back to the byte proxy — unless that side (or
+ * either) also has 0 attributed bytes, in which case the verdict is `'unknown'`: a
+ * capture gap is not a tuning result, never a confident −100% lowered (issue #107).
  *
  * @param {{ sessionId?: string, exchanges?: Array<Record<string, any>> }} beforeModel
  * @param {{ sessionId?: string, exchanges?: Array<Record<string, any>> }} afterModel
@@ -220,12 +222,23 @@ export function computeVerify(beforeModel, afterModel, opts = {}) {
   const beforeBytes = before.totalBytes;
   const afterBytes = after.totalBytes;
   const bytesAbsolute = afterBytes - beforeBytes;
-  const bytesRelative = relativeOf(bytesAbsolute, beforeBytes);
-  const blocks = computeBlockDeltas(before.attribution, after.attribution);
 
   // ── verdict: tokens when both sides captured usage, else the byte proxy ──────
   const basis = tokenBasis ? 'tokens' : 'bytes';
-  const verdict = basis === 'tokens' ? verdictOf(beforeTokens, afterTokens) : verdictOf(beforeBytes, afterBytes);
+  // Guard (issue #107): never a confident verdict when a side captured no floor at
+  // all. The byte basis is only reached when at least one side has null tokens; if
+  // that side (or either) also has 0 attributed bytes, the "delta" is a capture gap,
+  // not a tuning result — emit 'unknown' rather than a bogus −100% lowered. Suppress
+  // the byte relative AND the per-block deltas so no misleading −100% / shrank-to-0
+  // signal leaks into the JSON contract or the renderer.
+  const noFloor = basis === 'bytes' && (beforeBytes === 0 || afterBytes === 0);
+  const blocks = noFloor ? [] : computeBlockDeltas(before.attribution, after.attribution);
+  const verdict = noFloor
+    ? 'unknown'
+    : basis === 'tokens'
+      ? verdictOf(beforeTokens, afterTokens)
+      : verdictOf(beforeBytes, afterBytes);
+  const bytesRelative = noFloor ? null : relativeOf(bytesAbsolute, beforeBytes);
 
   return {
     before,
@@ -289,6 +302,9 @@ function vRow(block, beforeCell, afterCell, deltaCell) {
  * @returns {string}
  */
 function verdictLine(delta) {
+  if (delta.verdict === 'unknown') {
+    return 'verdict: UNKNOWN — a side captured no floor (no usage and no attributed bytes); the delta is a capture gap, not a tuning result';
+  }
   const basisNote = delta.basis === 'tokens' ? '' : ' — real tokens unavailable; byte-proxy basis';
   if (delta.verdict === 'flat') return `verdict: FLAT — the before and after floors match${basisNote}`;
   const word = delta.verdict === 'lowered' ? 'LOWERED' : 'RAISED';
@@ -319,11 +335,15 @@ export function renderVerify(ctx) {
 
   // Headline — real turn-1 tokens from captured usage.
   const t = ctx.delta.tokens;
+  const unknown = ctx.delta.verdict === 'unknown';
   lines.push('Headline — real turn-1 tokens from captured usage');
   if (t.before !== null && t.after !== null) {
     lines.push(`  before: ${fmtTokens(t.before)} tokens  (${ctx.before.headline.pctOfWindow}% of window)`);
     lines.push(`  after:  ${fmtTokens(t.after)} tokens  (${ctx.after.headline.pctOfWindow}% of window)`);
     lines.push(`  delta:  ${signedTokens(/** @type {number} */ (t.absolute))} tokens  (${relPhrase(t.relative)})`);
+  } else if (unknown) {
+    lines.push('  real turn-1 tokens unavailable on at least one side (no captured usage)');
+    lines.push('  delta:  not scored — a side captured no floor (see verdict)');
   } else {
     lines.push('  real turn-1 tokens unavailable on at least one side (no captured usage)');
     lines.push('  delta:  verdict falls back to the byte proxy below');
@@ -335,22 +355,33 @@ export function renderVerify(ctx) {
   lines.push('Byte proxy — per-block byte-length totals (never re-tokenized)');
   lines.push(`  before: ${fmtBytes(b.before)} bytes`);
   lines.push(`  after:  ${fmtBytes(b.after)} bytes`);
-  lines.push(`  delta:  ${signedBytes(b.absolute)} bytes  (${relPhrase(b.relative)})`);
+  if (unknown) {
+    // A side is 0 bytes — its "delta" is a capture gap, not a change; show no bogus %.
+    lines.push('  delta:  not scored — a side captured no floor (see verdict)');
+  } else {
+    lines.push(`  delta:  ${signedBytes(b.absolute)} bytes  (${relPhrase(b.relative)})`);
+  }
   lines.push('');
 
-  // Per-block delta, ranked by absolute byte change.
-  lines.push('Per-block delta — ranked by absolute byte change (proxy; − shrank, + grew)');
-  lines.push(vRow('block', 'before', 'after', 'Δbytes'));
-  lines.push(`  ${VRULE}`);
-  if (b.blocks.length === 0) {
-    lines.push('  (nothing attributed on either side — no turn-1 request body captured)');
-  }
-  for (const row of b.blocks) {
-    lines.push(vRow(blockLabel(row), fmtBytes(row.beforeBytes), fmtBytes(row.afterBytes), signedBytes(row.delta)));
-  }
-  if (b.blocks.length > 0) {
+  // Per-block delta, ranked by absolute byte change. Suppressed under 'unknown': with
+  // one side at 0 bytes every block reads "shrank to 0", which is the capture gap, not
+  // a real per-block change — printing it would repeat the false signal #107 flags.
+  if (unknown) {
+    lines.push('Per-block delta — suppressed (a capture gap has no meaningful per-block change)');
+  } else {
+    lines.push('Per-block delta — ranked by absolute byte change (proxy; − shrank, + grew)');
+    lines.push(vRow('block', 'before', 'after', 'Δbytes'));
     lines.push(`  ${VRULE}`);
-    lines.push(vRow('total', fmtBytes(b.before), fmtBytes(b.after), signedBytes(b.absolute)));
+    if (b.blocks.length === 0) {
+      lines.push('  (nothing attributed on either side — no turn-1 request body captured)');
+    }
+    for (const row of b.blocks) {
+      lines.push(vRow(blockLabel(row), fmtBytes(row.beforeBytes), fmtBytes(row.afterBytes), signedBytes(row.delta)));
+    }
+    if (b.blocks.length > 0) {
+      lines.push(`  ${VRULE}`);
+      lines.push(vRow('total', fmtBytes(b.before), fmtBytes(b.after), signedBytes(b.absolute)));
+    }
   }
   lines.push('');
 
