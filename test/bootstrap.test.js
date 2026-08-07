@@ -145,6 +145,29 @@ test('isRepoInitialized: path-normalizes (trailing slash / relative segments)', 
   assert.equal(isRepoInitialized(routes, '/repos/acme/./.ccsnoop'), true);
 });
 
+test('isRepoInitialized: true when the route is the object manifest form `ccsnoop init` writes (issue #106)', () => {
+  // `src/init.js` writes `{ dir, repo, created_local_settings, ... }`, not a bare dir
+  // string. The string-only walk `tokenFor` shipped would pass the object to
+  // path.resolve() and throw ERR_INVALID_ARG_TYPE — the skill's bootstrap crash.
+  const routes = { abcd1234: { dir: '/repos/acme/.ccsnoop', repo: 'acme', created_local_settings: true } };
+  assert.equal(isRepoInitialized(routes, '/repos/acme/.ccsnoop'), true);
+});
+
+test('isRepoInitialized: false when only OTHER repos are registered (object form) (issue #106)', () => {
+  const routes = { ef901234: { dir: '/repos/other/.ccsnoop', repo: 'other' } };
+  assert.equal(isRepoInitialized(routes, '/repos/acme/.ccsnoop'), false);
+});
+
+test('isRepoInitialized: tolerates a mixed routes map — string and {dir} entries (issue #106)', () => {
+  // An older init and a newer init in the same routes.json: both shapes must resolve.
+  const routes = {
+    abcd1234: { dir: '/repos/acme/.ccsnoop', repo: 'acme' },
+    ef901234: '/repos/other/.ccsnoop',
+  };
+  assert.equal(isRepoInitialized(routes, '/repos/acme/.ccsnoop'), true);
+  assert.equal(isRepoInitialized(routes, '/repos/other/.ccsnoop'), true);
+});
+
 // ─── detectState: probes wired to decideState via injectable deps ────────────
 // A fake spawnSync answering the three probes ccsnoop cares about, plus a canned
 // routes reader. Lets us exercise the full matrix without a real daemon/routes.
@@ -213,5 +236,18 @@ test('detectState: surfaces the resolved capture dir + matched token on ready (f
     readRoutes: () => ({ abcd1234: '/repos/acme/.ccsnoop' }),
   });
   assert.equal(r.captureDir, '/repos/acme/.ccsnoop');
+  assert.equal(r.routeToken, 'abcd1234');
+});
+
+test('detectState: ready (no crash) when this repo is registered in object form (issue #106)', () => {
+  // The real-world hit: right after `ccsnoop init`, routes.json holds the manifest
+  // object, and detectState threw in tokenFor before it could return `ready`. This
+  // runs the full probe→decide path against the object form and must reach `ready`.
+  const r = detectState({
+    cwd: '/repos/acme',
+    spawnSync: fakeSpawn({ versionOk: true, statusOk: true }),
+    readRoutes: () => ({ abcd1234: { dir: '/repos/acme/.ccsnoop', repo: 'acme' } }),
+  });
+  assert.equal(r.state, 'ready');
   assert.equal(r.routeToken, 'abcd1234');
 });
