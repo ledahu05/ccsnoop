@@ -19,7 +19,8 @@
 // It consumes ccsnoop strictly through its scriptable surfaces:
 //   • `ccsnoop --help`  → exit 0 ⇒ on PATH (no `--version` flag exists)
 //   • `ccsnoop status`  → exit 0 ⇒ daemon running
-//   • `~/.ccsnoop/routes.json` → the token→dir map `ccsnoop init` writes
+//   • `~/.ccsnoop/routes.json` → the per-token manifest `ccsnoop init` writes
+//     (`token → { dir, ... }`, or a plain dir string on older inits)
 // and reads no capture data (redaction contract, spec §1.3: `.ccsnoop/` bodies are
 // inviolable; this script never opens a session file).
 
@@ -138,17 +139,25 @@ export function repoCaptureDir(cwd, spawnSyncFn = runSync) {
 
 /**
  * Find the route token registered for this repo's capture dir, if any. Reuses the
- * exact mapping `ccsnoop init` writes (token → abs capture dir) without importing
- * ccsnoop — a path-resolve equality, so trailing slashes / `.` segments don't cause
- * a false negative.
- * @param {Record<string, string>} routes
+ * exact mapping `ccsnoop init` writes — a per-token manifest (`token → { dir, ... }`),
+ * or a plain dir string on older inits — without importing ccsnoop. A path-resolve
+ * equality, so trailing slashes / `.` segments don't cause a false negative.
+ *
+ * Must stay in lockstep with `src/routes.js`'s `routeDir` (the canonical reader):
+ * both tolerate the string and `{ dir }` shapes. Diverging here is what shipped
+ * issue #106 — the string-only walk passed the manifest object to `path.resolve`
+ * and threw, so the skill's bootstrap detector crashed on every freshly-init'd repo.
+ * The script is standalone by design (no `src/` import), so the tolerance is copied,
+ * not shared — change one, change both.
+ * @param {Record<string, unknown>} routes
  * @param {string} captureDir
  * @returns {string | null}
  */
 function tokenFor(routes, captureDir) {
   const want = path.resolve(captureDir);
-  for (const [token, dir] of Object.entries(routes || {})) {
-    if (path.resolve(dir) === want) return token;
+  for (const [token, entry] of Object.entries(routes || {})) {
+    const dir = typeof entry === 'string' ? entry : /** @type {any} */ (entry)?.dir;
+    if (typeof dir === 'string' && path.resolve(dir) === want) return token;
   }
   return null;
 }
@@ -157,7 +166,7 @@ function tokenFor(routes, captureDir) {
  * Is this repo initialized? True iff some route in `routes.json` resolves to this
  * repo's capture dir — i.e. {@link tokenFor} found a match. A thin boolean view of
  * the same resolve-and-compare walk (kept because the decision reads as a boolean).
- * @param {Record<string, string>} routes token → absolute capture dir
+ * @param {Record<string, unknown>} routes token → manifest `{ dir, ... }` or dir string
  * @param {string} captureDir
  * @returns {boolean}
  */
@@ -166,10 +175,11 @@ export function isRepoInitialized(routes, captureDir) {
 }
 
 /**
- * Read `~/.ccsnoop/routes.json` (token → dir). Missing/malformed → `{}`. Mirrors
- * `src/daemon.js` `readState`'s "never throw on a missing home file" leniency.
+ * Read `~/.ccsnoop/routes.json` (the per-token manifest, `token → { dir, ... }` or a
+ * dir string on older inits). Missing/malformed → `{}`. Mirrors `src/daemon.js`
+ * `readState`'s "never throw on a missing home file" leniency.
  * @param {string} home
- * @returns {Record<string, string>}
+ * @returns {Record<string, unknown>}
  */
 export function readRoutesFile(home) {
   try {
@@ -190,7 +200,7 @@ export function readRoutesFile(home) {
  * @param {string} [opts.home]
  * @param {NodeJS.ProcessEnv} [opts.env]
  * @param {SpawnFn} [opts.spawnSync]
- * @param {() => Record<string, string>} [opts.readRoutes]
+ * @param {() => Record<string, unknown>} [opts.readRoutes]
  * @returns {{ state: (typeof STATES)[number], detail: string, guidance: string[], captureDir: string, routeToken: string|null, installed: boolean, daemonRunning: boolean }}
  */
 export function detectState(opts = {}) {
