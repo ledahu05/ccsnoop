@@ -25,16 +25,18 @@
 // the slot, no body re-parse). The `system` levers ride `system[]` blocks AND, under
 // `-p`, the first user message's content blocks (bench/SPEC.md §4 — the FT0 fixture
 // confirms hook + CLAUDE.md + MCP land in `messages[0]`, not `system[]`). Each such
-// block is classified by FT3's `classifySystemBlock` (the single source of "which
-// lever is this block") and charged to its lever; a block's re-payment is its CARRIER
+// block is carved by FT3's `classifySystemSpans` (the single source of "which lever
+// owns which bytes of this block", issue #116) and each span charged to its lever — a
+// block may hold several, since the deferred listing, its connecting-servers sub-list
+// and the skills/agent catalogs can share one `<system-reminder>`. The spans tile the
+// block, so every byte is charged exactly once. A block's re-payment is its CARRIER
 // segment's `.kind` — a `system#<i>` block carries itself, content blocks inside
 // `messages[<m>]` share the `message#<m>` carrier. Plain conversation content (an
 // unmatched message block) is NOT the harness floor — only `system[]` blocks are —
 // so a user prompt is never mistaken for incompressible harness bytes.
 
 import { parseRequestBlob } from './report.js';
-import { canonicalize } from './waste.js';
-import { classifySystemBlock } from './finetune-system.js';
+import { classifySystemSpans, isCatalogLever } from './finetune-system.js';
 import { NULL_SOURCE } from './finetune-levers.js';
 
 /**
@@ -56,7 +58,12 @@ export { NULL_SOURCE } from './finetune-levers.js';
  * @property {Map<string, LeverGain>} tool       Per built-in tool name → shipped/waste.
  * @property {Map<string, LeverGain>} claudeMd   Per CLAUDE.md source (path, or `NULL_SOURCE`) → shipped/waste.
  * @property {LeverGain} hook                    SessionStart hook output.
- * @property {LeverGain} mcp                     The MCP deferred listing (one figure for the lever).
+ * @property {LeverGain} mcp                     The MCP connecting-servers sub-list of the deferred listing.
+ * @property {Map<import('./finetune-system.js').CatalogLever, LeverGain>} catalog
+ *                                               Per catalog population (deferred tools / agent types /
+ *                                               skills) → shipped/waste. Split out of `mcp` by #116:
+ *                                               these bytes used to be charged wholesale to the MCP
+ *                                               lever (the deferred listing) or dropped as conversation.
  * @property {LeverGain} harness                 The incompressible harness floor (`system[]` preamble).
  */
 
@@ -66,24 +73,13 @@ export const EMPTY_GAIN = /** @type {GainModel} */ ({
   claudeMd: new Map(),
   hook: { shipped: 0, waste: 0 },
   mcp: { shipped: 0, waste: 0 },
+  catalog: new Map(),
   harness: { shipped: 0, waste: 0 },
 });
 
 /** @returns {LeverGain} */
 function zero() {
   return { shipped: 0, waste: 0 };
-}
-
-/**
- * Canonical byte length of a block — delegated to waste.js' `canonicalize` so a
- * gain figure is byte-for-byte the same proxy as `Segment.bytes` (one byte
- * accounting, never re-tokenized). Null/undefined → 0.
- * @param {any} block
- * @returns {number}
- */
-function blockBytes(block) {
-  if (block === undefined || block === null) return 0;
-  return Buffer.byteLength(canonicalize(block), 'utf8');
 }
 
 /**
@@ -120,9 +116,9 @@ function rollMax(req, roll) {
  * The pure core of the gain model: attribute ONE parsed request body's levers and
  * fold them into the running aggregates (`acc`). Built-in tools come from the
  * classified `segments` (`tool:<name>`); the `system` levers come from walking the
- * body's text surfaces (`system[]` + `messages[*].content`), each block classified by
- * `classifySystemBlock` and re-paid per its carrier segment's `.kind`. Call once per
- * exchange; `acc` keeps the cross-request MAXes. Exposed for direct unit tests.
+ * body's text surfaces (`system[]` + `messages[*].content`), each block carved into
+ * lever spans by `classifySystemSpans` and re-paid per its carrier segment's `.kind`.
+ * Call once per exchange; `acc` keeps the cross-request MAXes. Exposed for direct unit tests.
  *
  * @param {{ segments: Array<{ slot: string, bytes: number, kind?: string }>, body: any }} exchange
  * @param {GainModel} acc  Mutated in place with this exchange's contribution.
@@ -144,6 +140,8 @@ export function chargeExchange(exchange, acc) {
   const hookReq = { shipped: 0, waste: 0 };
   /** @type {{ shipped: number, waste: number }} */
   const mcpReq = { shipped: 0, waste: 0 };
+  /** @type {Map<string, { shipped: number, waste: number }>} */
+  const catalogReq = new Map();
   /** @type {{ shipped: number, waste: number }} */
   const harnessReq = { shipped: 0, waste: 0 };
 
@@ -168,37 +166,59 @@ export function chargeExchange(exchange, acc) {
   // message#<m>). Plain conversation (an unmatched message block) is NOT the harness
   // floor — only system[] blocks are — so a user prompt never becomes harness bytes.
   walkBodyBlocks(body, (block, surface, index) => {
-    const verdict = classifySystemBlock(block);
-    const bytes = blockBytes(block);
     const carrier = segBySlot.get(carrierSlot(surface, index));
-    const waste = carrier && carrier.kind === 'reused-uncached' ? bytes : 0;
+    const uncached = Boolean(carrier && carrier.kind === 'reused-uncached');
 
-    if (verdict.lever === 'claude-md') {
-      const key = verdict.source ?? NULL_SOURCE;
-      let r = claudeMdReq.get(key);
-      if (!r) {
-        r = { shipped: 0, waste: 0 };
-        claudeMdReq.set(key, r);
+    // A block may carry SEVERAL levers — the deferred listing and its connecting-servers
+    // sub-list ride one block, and a combined `<system-reminder>` can hold all three
+    // catalogs. The shared classifier carves it into spans that TILE the block, so
+    // charging span by span attributes every byte exactly once (issue #116).
+    for (const span of classifySystemSpans(block)) {
+      const bytes = span.bytes;
+      const waste = uncached ? bytes : 0;
+
+      if (span.lever === 'claude-md') {
+        const key = span.source ?? NULL_SOURCE;
+        let r = claudeMdReq.get(key);
+        if (!r) {
+          r = { shipped: 0, waste: 0 };
+          claudeMdReq.set(key, r);
+        }
+        r.shipped += bytes;
+        r.waste += waste;
+      } else if (span.lever === 'hook') {
+        hookReq.shipped += bytes;
+        hookReq.waste += waste;
+      } else if (span.lever === 'mcp-deferred') {
+        mcpReq.shipped += bytes;
+        mcpReq.waste += waste;
+      } else if (isCatalogLever(span.lever)) {
+        // A catalog population — charged on EITHER surface. These blocks ride
+        // `messages[0].content`, so a surface guard would zero them out; unlike the
+        // harness fallback they are positively identified by their own header, so
+        // charging them is never mistaking conversation for config. Asking the shared
+        // predicate (not `!== 'harness'`) is what keeps an eighth lever added later from
+        // silently landing in the catalog bucket.
+        let r = catalogReq.get(span.lever);
+        if (!r) {
+          r = { shipped: 0, waste: 0 };
+          catalogReq.set(span.lever, r);
+        }
+        r.shipped += bytes;
+        r.waste += waste;
+      } else if (span.lever === 'harness' && surface === 'system') {
+        // Only system[] preamble blocks are the harness floor; a message block that
+        // merely fails to match a lever marker is conversation, not harness.
+        harnessReq.shipped += bytes;
+        harnessReq.waste += waste;
       }
-      r.shipped += bytes;
-      r.waste += waste;
-    } else if (verdict.lever === 'hook') {
-      hookReq.shipped += bytes;
-      hookReq.waste += waste;
-    } else if (verdict.lever === 'mcp-deferred') {
-      mcpReq.shipped += bytes;
-      mcpReq.waste += waste;
-    } else if (verdict.lever === 'harness' && surface === 'system') {
-      // Only system[] preamble blocks are the harness floor; a message block that
-      // merely fails to match a lever marker is conversation, not harness.
-      harnessReq.shipped += bytes;
-      harnessReq.waste += waste;
     }
   });
 
   // Roll this request's sums into the running cross-request maxes.
   rollMax(toolReq, acc.tool);
   rollMax(claudeMdReq, acc.claudeMd);
+  rollMax(catalogReq, acc.catalog);
   for (const [req, roll] of /** @type {[{shipped:number,waste:number}, LeverGain][]} */ ([
     [hookReq, acc.hook],
     [mcpReq, acc.mcp],
@@ -253,6 +273,7 @@ export function computeGain(model) {
     claudeMd: new Map(),
     hook: zero(),
     mcp: zero(),
+    catalog: new Map(),
     harness: zero(),
   };
   for (const ex of model?.exchanges ?? []) {

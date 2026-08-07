@@ -81,12 +81,17 @@ Two classes of shipped tool (T2):
 
 ### 2.3 Lever attribution — split the `system` bucket by source (T5→T6)
 
-The one segmentation extension `fine-tune` adds: the `system` bucket currently mixes CLAUDE.md, SessionStart-hook output, the MCP deferred listing, and the CC harness. **Split it by source** using content + order (the omniris capture confirms these arrive as distinct system blocks/messages). Map each system segment to a lever:
+The one segmentation extension `fine-tune` adds: the `system` bucket mixes CLAUDE.md, SessionStart-hook output, the catalogs Claude Code injects, and the CC harness. **Split it by source** using content + order (the omniris capture confirms these arrive as distinct system blocks/messages). Map each system segment to a lever:
 
 - **CLAUDE.md** — per source file (global `~/.claude/CLAUDE.md`, project `./CLAUDE.md`, memory files) when attribution supports it, else the CLAUDE.md-derived block as a whole.
 - **SessionStart hook output** — the injected message (e.g. CAVEMAN+PONYTAIL).
-- **MCP deferred listing** — feeds the MCP lever (§3.4).
+- **MCP deferred listing** — the *"MCP servers still connecting"* sub-list. Feeds the MCP lever (§3.4).
+- **The three catalogs** — the ToolSearch **deferred-tools** listing, the Agent-tool **agent types**, the Skill-tool **skills catalog**. Byte cost only for now (no lever acts on them; [ADR-0005](adr/0005-skills-catalog-lever-name-only.md) lever 5a is the future action).
 - **CC harness** (`system[2]`-style) — **incompressible floor, not actionable** (~2.7K on omniris). Shown in the diagnostic, never emitted.
+
+**One authority, span-based.** A single block can carry several of these — the connecting-servers sub-list rides *inside* the deferred-tools listing, and a combined `<system-reminder>` can hold all three catalogs. `classifySystemSpans` (`src/finetune-system.js`) is the only place that decides which lever owns which bytes; `src/floor-catalog.js` consumes it rather than doubling the detection. The spans **tile** their block — their bytes sum to its canonical byte length — so a split never invents or loses a byte. Seven levers: `claude-md`, `hook`, `mcp-deferred`, `deferred-tools`, `skills-catalog`, `agent-types`, `harness`.
+
+> ⚠ **`mcp-deferred` narrowed in [#116](https://github.com/ledahu05/ccsnoop/issues/116).** It used to swallow the entire deferred listing, so a repo with **no MCP server at all** was told it shipped ~30 KB of "MCP". It now means the connecting-servers sub-list and nothing else, and such a repo reports **zero** `mcp-deferred` bytes. See the [`tuning-report` v1 changelog](tuning-report-schema.md#changelog-within-v1).
 
 > Detail (decision): [#35 (T6)](https://github.com/ledahu05/ccsnoop/issues/35) (D2+D5, escalated by [#34 T5](https://github.com/ledahu05/ccsnoop/issues/34)).
 

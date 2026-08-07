@@ -70,10 +70,12 @@ nothing** — both branches exercised. The corpus roll-up and the
 
 ## Downstream contract — system-bucket attribution (issue #73 / FT3)
 
-`src/finetune-system.js` splits the `system` bucket by source, attributing each
-`system` block to one of four levers — `claude-md` / `hook` / `mcp-deferred` /
-`harness` — with the harness (and anything unattributable) flagged as the
-**incompressible floor** (shown, never emitted downstream; fine-tune-spec §2.3).
+`src/finetune-system.js` splits the `system` bucket by source, attributing each block to
+one of **seven** levers — `claude-md` / `hook` / `mcp-deferred` / `deferred-tools` /
+`skills-catalog` / `agent-types` / `harness` — with the harness (and anything
+unattributable) flagged as the **incompressible floor** (shown, never emitted downstream;
+fine-tune-spec §2.3). A block carrying several populations is carved into spans that tile
+it, so every byte is charged exactly once ([#116](https://github.com/ledahu05/ccsnoop/issues/116)).
 
 A second self-activating gate in `test/finetune-system.test.js` enforces AC #1–#2
 on a committed fixture: every `system` block maps to exactly one lever, floor
@@ -85,9 +87,15 @@ bench fixture carries a unique sentinel (`CLAUDEMD-…`, `PERSONA-…`, the L4 M
 stub tool `t00`) that is the on-wire proof of its lever. The assumed CC build is
 **v2.1.220 linux-x64 sdk-cli, `claude-haiku-4-5-20251001`, `ENABLE_TOOL_SEARCH=true`**
 (bench/SPEC.md §0). The conservative textual markers (`<file path=…>`,
-`<session-start-hook`, "deferred tool(s)") are best-effort aids for real-CC blocks
-with no sentinel; they are confirmed/refined against this real capture the instant
-it lands.
+`<session-start-hook`, the catalog header lines, `mcp__<server>__*`) are best-effort aids
+for real-CC blocks with no sentinel; they are confirmed/refined against this real capture
+the instant it lands.
+
+On this capture the deferred listing block is **1 001 B**, which #116 splits into
+**530 B** of `deferred-tools` (the built-in names) and **471 B** of `mcp-deferred` (the
+`stub` server still connecting) — the whole of what the MCP lever may claim. The
+agent-types (2 656 B) and skills (5 119 B) catalogs ride `messages[0].content` as their
+own `<system-reminder>` blocks.
 
 > **Fidelity caveat.** Under `-p` the bench observed L2–L6 lever content landing in
 > `message#0` (currentTurn at turn 1), not in `system[]` (bench/SPEC.md §4). Whether

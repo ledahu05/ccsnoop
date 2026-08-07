@@ -244,29 +244,27 @@ export function computeFloor(model, opts = {}) {
   }
 
   // Catalog populations (issue #109) — the deferred-tools listing, the agent-types
-  // catalog and the skills catalog, each as its own named, byte-costed row. `floor`
-  // detects these itself ({@link module:floor-catalog.findCatalogBlocks}) instead of
-  // reading `gain.mcp`, because two of the three are INVISIBLE to the gain model: they
-  // ride `messages[*].content`, classify to `harness`, and `chargeExchange` charges
-  // harness only on the `system` surface — so they contributed zero bytes. Making them
-  // visible RAISES the floor total; that is the correctness half of #109.
+  // catalog and the skills catalog, each as its own named, byte-costed row, from the
+  // shared classifier's spans ({@link module:floor-catalog.findCatalogBlocks}). Before
+  // #109 two of the three were INVISIBLE: they ride `messages[*].content`, classified to
+  // `harness`, and `chargeExchange` charges harness only on the `system` surface — so
+  // they contributed zero. Making them visible RAISES the floor total; that is the
+  // correctness half of #109. Since #116 they are levers of the shared model too, so the
+  // gain model no longer folds any of them into the harness figure.
   const catalogs = findCatalogBlocks(turn1Body);
-  // Each catalog block reports which existing row already carries its bytes, so a
-  // population is counted exactly once: `mcp` means it IS the `gain.mcp` block (drop
-  // that row — the catalogs replace it), `harness` means it is inside the system[]
-  // preamble figure (deduct it), null means it was previously uncounted (pure gain).
+  // A population that absorbed the connecting-servers sub-list reports `chargedTo: 'mcp'`
+  // — `gain.mcp` holds that share, so its row must be dropped, not shown alongside.
   const replacesMcp = catalogs.some((c) => c.chargedTo === 'mcp');
-  const takenFromHarness = catalogs.reduce((s, c) => (c.chargedTo === 'harness' ? s + c.bytes : s), 0);
 
-  // The opaque `mcp-deferred` row survives ONLY as the fallback for a capture whose
-  // deferred listing the shared classifier recognizes but whose headers this build of
-  // Claude Code words differently — better one coarse row than a silently dropped one.
+  // The `mcp-deferred` row is the connecting-servers listing on its own — and the
+  // fallback for a capture whose deferred listing the shared classifier recognizes by its
+  // `mcp__<server>__*` names but whose headers this build of Claude Code words
+  // differently. Better one coarse row than a silently dropped one.
   if (gain.mcp.shipped > 0 && !replacesMcp) {
     blocks.push({ kind: 'mcp-deferred', label: 'MCP deferred listing', detail: null, bytes: gain.mcp.shipped });
   }
-  const harnessBytes = Math.max(0, gain.harness.shipped - takenFromHarness);
-  if (harnessBytes > 0) {
-    blocks.push({ kind: 'harness', label: 'system[] preamble', detail: null, bytes: harnessBytes });
+  if (gain.harness.shipped > 0) {
+    blocks.push({ kind: 'harness', label: 'system[] preamble', detail: null, bytes: gain.harness.shipped });
   }
   for (const c of catalogs) {
     blocks.push({
@@ -323,7 +321,11 @@ export function blockLabel(a) {
     case 'hook':
       return 'hook — SessionStart output';
     case 'mcp-deferred':
-      return 'MCP — deferred tool listing';
+      // Since #116 this row is the connecting-servers sub-list — the only part of the
+      // deferred listing an MCP setting can act on. It also stays the coarse fallback for
+      // a capture whose catalog headers this build words differently, so the label names
+      // the lever rather than promising a shape.
+      return 'MCP — deferred server listing';
     // The three catalog populations #109 split that opaque row into. None says "MCP":
     // the listing costs bytes whether or not a single MCP server is configured, and the
     // old name sent users hunting one that was not there.

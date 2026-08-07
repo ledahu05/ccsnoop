@@ -2,16 +2,33 @@
 //
 // `src/waste.js` already segments every request into `system` / `tools` /
 // `history` / `currentTurn`, one `system#<i>` segment per `system` block. But the
-// `system` bucket itself MIXES four sources the fine-tune levers care about:
+// `system` bucket itself MIXES seven sources the fine-tune levers care about:
 //
 //   • claude-md      — CLAUDE.md-derived memory (project `./CLAUDE.md`, global, …)
 //   • hook           — SessionStart-hook output injected into the system prompt
-//   • mcp-deferred   — the MCP deferred tool listing (names only under tool-search)
+//   • mcp-deferred   — the MCP servers still connecting; the deferred listing's MCP sub-list
+//   • deferred-tools — the ToolSearch listing of deferred BUILT-IN tools
+//   • skills-catalog — the Skill-tool catalog
+//   • agent-types    — the Agent-tool catalog
 //   • harness        — the CC identity/capabilities preamble; the incompressible floor
 //
 // This module attributes each `system` block to exactly one of them so the
 // downstream fine-tune levers (T5/T6) can charge `Segment.bytes` to the right
 // place and flag the harness floor as "shown but never actionable".
+//
+// ── One authority for "which lever is this block" (issue #116 / ADR-0005) ────────
+// The three catalog populations used to be detected TWICE: here, where any block
+// saying "deferred tool" was swept into `mcp-deferred`, and in `src/floor-catalog.js`
+// (#109/#113), which already told them apart but stayed a deliberate pure consumer so
+// as not to preempt this decision. The layering now inverts — the header detection
+// lives HERE and `floor-catalog.js` consumes it — with two consequences:
+//
+//   • a block may carry SEVERAL populations, so classification is span-based
+//     ({@link classifySystemSpans}); the spans TILE the block, which is what stops a
+//     split from charging bytes the gain model never saw;
+//   • `mcp-deferred` shrinks to what it actually names — the connecting-servers
+//     sub-list — at the MODEL level, not just in `floor`'s display. A repo with no MCP
+//     server now reports zero `mcp-deferred` bytes, as it always should have.
 //
 // It is a PURE CONSUMER on top of the existing segmentation — it does NOT touch
 // `segmentRequest` (the bench forbids sub-segmenting `src/waste.js`: "modifie le
@@ -42,11 +59,30 @@
 
 import { canonicalize } from './waste.js';
 
-/** The four system-bucket sources, in canonical order. */
-export const SYSTEM_LEVERS = /** @type {const} */ (['claude-md', 'hook', 'mcp-deferred', 'harness']);
+/** The seven system-bucket sources, in canonical order. */
+export const SYSTEM_LEVERS = /** @type {const} */ ([
+  'claude-md',
+  'hook',
+  'mcp-deferred',
+  'deferred-tools',
+  'skills-catalog',
+  'agent-types',
+  'harness',
+]);
+
+/**
+ * The subset of levers that are CATALOG POPULATIONS — the `<system-reminder>` listings
+ * Claude Code injects, several of which may ride one block and therefore be carved out of
+ * it. In the order a block presents them, which is also `floor`'s stable row order.
+ */
+export const CATALOG_LEVERS = /** @type {const} */ (['deferred-tools', 'agent-types', 'skills-catalog']);
 
 /**
  * @typedef {(typeof SYSTEM_LEVERS)[number]} SystemLever
+ */
+
+/**
+ * @typedef {(typeof CATALOG_LEVERS)[number]} CatalogLever
  */
 
 /**
@@ -65,12 +101,81 @@ export const SYSTEM_LEVERS = /** @type {const} */ (['claude-md', 'hook', 'mcp-de
  * @property {string | null} source
  */
 
+/**
+ * One lever's share of a single block. A block carrying several catalog populations
+ * yields several spans; the spans of a block TILE it — their texts concatenate back to
+ * the block's text and their `.bytes` sum to its canonical byte length.
+ * @typedef {object} SystemSpan
+ * @property {SystemLever} lever
+ * @property {boolean} floor
+ * @property {string | null} source
+ * @property {string} text    This span's slice of the block's text.
+ * @property {number} bytes   This span's share of the block's canonical byte length.
+ */
+
 // Bench lever sentinels — the on-wire fingerprint of each lever (issue #70 fixture plan).
 const CLAUDEMD_SENTINEL = /CCSNOOP-BENCH-SENTINEL-CLAUDEMD-[0-9a-f]+/;
 const PERSONA_SENTINEL = /CCSNOOP-BENCH-SENTINEL-PERSONA-[0-9a-f]+/;
 // The L4 MCP stub registers 64 short-named tools; `t00` is the probe name the bench
 // (and FT0) assert on. A bare-word match is unambiguous for these stub names.
 const MCP_STUB_TOOL = /\bt00\b/;
+// The REAL on-wire spelling of an MCP tool is `mcp__<server>__<tool>` — `_` is a word
+// character, so the bare-`t00` sentinel above can never match a capture (fixtures
+// README, §"the on-wire spelling"). This is the marker that catches an MCP deferred
+// listing whose headers a future build words differently: better one coarse
+// `mcp-deferred` row than ~30 KB silently dropped to the floor.
+const MCP_TOOL_NAME = /\bmcp__[A-Za-z0-9_.-]+__/;
+
+// ── catalog headers — the ONE detection (moved down from floor-catalog.js, #116) ──
+//
+// Case-sensitive, multiline-anchored: each matches exactly its population (no
+// cross-matches), and none appears in a real `body.system` preamble. The `m` flag lets
+// `^` match after a newline inside a multi-line block (the header sits one line below the
+// `<system-reminder>` wrapper); on a single trimmed line `.test` matches regardless.
+const DEFERRED_TOOLS_HDR = /^The following deferred tools are now available via ToolSearch\./m;
+const AGENT_TYPES_HDR = /^Available agent types for the Agent tool:/m;
+const SKILLS_HDR = /^The following skills are available for use with the Skill tool:/m;
+// The MCP sub-list of the deferred listing. This — and ONLY this — is what
+// `mcp-deferred` names now: a repo with no MCP server never emits this header, so it
+// never reports `mcp-deferred` bytes (issue #116's exit criterion).
+const MCP_CONNECTING_HDR = /^The following MCP servers are still connecting/m;
+
+/**
+ * The carve points inside one block, in the order they are searched. `mcp-deferred`
+ * rides here alongside the three catalogs because on the wire the connecting-servers
+ * sub-list sits INSIDE the deferred-tools listing — carving is the only way to charge
+ * each half to the lever that owns it.
+ * @type {{ lever: SystemLever, re: RegExp }[]}
+ */
+const POPULATION_HEADERS = [
+  { lever: 'deferred-tools', re: DEFERRED_TOOLS_HDR },
+  { lever: 'agent-types', re: AGENT_TYPES_HDR },
+  { lever: 'skills-catalog', re: SKILLS_HDR },
+  { lever: 'mcp-deferred', re: MCP_CONNECTING_HDR },
+];
+
+/**
+ * The two headers an ENTRY parser must recognize to split the deferred listing into its
+ * named items (`floor --detail`): they open the built-in-tool sub-list and the
+ * connecting-server sub-list respectively. Exported so the parser reads the same spelling
+ * the classifier carves on — DETECTION itself never happens outside this module.
+ */
+export const SUBLIST_HEADERS = /** @type {const} */ ({
+  'deferred-tools': DEFERRED_TOOLS_HDR,
+  'mcp-deferred': MCP_CONNECTING_HDR,
+});
+
+/**
+ * Is this lever one of the catalog populations — the levers a block can be carved into
+ * and that `floor` gives a named row to? The single predicate; `finetune-gain.js` and
+ * `floor-catalog.js` both ask it rather than each re-deriving the rule, so an eighth lever
+ * added later cannot silently be treated as a catalog by one of them and not the other.
+ * @param {SystemLever} lever
+ * @returns {boolean}
+ */
+export function isCatalogLever(lever) {
+  return /** @type {readonly string[]} */ (CATALOG_LEVERS).includes(lever);
+}
 
 // Real-capture markers (CC v2.1.220, the FT0 fixture's format). The sentinels
 // above prove each lever in the bench; these match a REAL session's blocks, which
@@ -118,19 +223,15 @@ function extractSourcePath(t) {
 }
 
 /**
- * Classify a single `system` block to its source lever (AC #1). Content-driven:
- * a bench sentinel (or a conservative real-CC marker) maps a block to its lever;
- * anything unmatched is the harness floor. `opts.index` is reserved for an
- * order-based refinement once the real FT0 capture lands (v1 is content-sufficient).
- *
- * @param {any} block   One `body.system[i]` (string or `{type:'text',text}` block).
- * @param {{ index?: number, total?: number }} [opts]  Order context (reserved; v1 unused).
- * @returns {SystemLeverVerdict}
+ * Classify a WHOLE block's text, ignoring any catalog population it may carry. The two
+ * levers that own a real action (CLAUDE.md's `claudeMdExcludes`, the hook's
+ * `hooks.SessionStart`) are tested FIRST, so a memory file that merely quotes a catalog
+ * header stays CLAUDE.md rather than becoming one. Returns null when nothing but a
+ * catalog header could still decide the block.
+ * @param {string} t
+ * @returns {SystemLeverVerdict | null}
  */
-export function classifySystemBlock(block, opts = {}) {
-  void opts; // order seam — see module header; sentinels + floor-fallback decide v1.
-  const t = blockText(block);
-
+function classifyWhole(t) {
   // CLAUDE.md — bench sentinel, an injectable `<file path=…>` marker, or the real
   // CC `Contents of <path> (<scope> instructions)` injection (the FT0 capture's
   // format — a real CLAUDE.md block carries no bench sentinel, so the Contents-of
@@ -143,12 +244,91 @@ export function classifySystemBlock(block, opts = {}) {
   if (PERSONA_SENTINEL.test(t) || /<session-start-hook/i.test(t) || SESSIONSTART_HOOK.test(t)) {
     return { lever: 'hook', floor: false, source: null };
   }
-  // MCP deferred listing — the L4 stub tool name, or a deferred-tools listing phrase.
-  if (MCP_STUB_TOOL.test(t) || /deferred\s+(?:tool|mcp)/i.test(t)) {
-    return { lever: 'mcp-deferred', floor: false, source: null };
+  return null;
+}
+
+/**
+ * Locate every catalog population present in a block's text, by char offset, in text
+ * order. Empty when the block carries none.
+ * @param {string} t
+ * @returns {{ lever: SystemLever, at: number }[]}
+ */
+function populationHits(t) {
+  /** @type {{ lever: SystemLever, at: number }[]} */
+  const hits = [];
+  for (const h of POPULATION_HEADERS) {
+    const m = h.re.exec(t);
+    if (m) hits.push({ lever: h.lever, at: m.index });
   }
-  // The CC harness / anything unattributable — the incompressible floor (AC #3).
-  return { lever: 'harness', floor: true, source: null };
+  return hits.sort((a, b) => a.at - b.at);
+}
+
+/**
+ * Carve one `system`/message block into its lever SPANS — the single authority for
+ * "which lever owns which bytes of this block" (issue #116). Always returns at least one
+ * span, and the spans TILE the block: their texts concatenate back to the block's text
+ * and their `.bytes` sum to the block's own canonical byte length. That invariant is what
+ * makes a split safe — the gain model can charge each span without a carve ever inventing
+ * or losing bytes.
+ *
+ * Three shapes, in precedence order:
+ *   • an actionable lever (CLAUDE.md / hook) claims the whole block;
+ *   • one or more catalog headers → one span per population, each running from its header
+ *     to the next (the first span starts at char 0, so the `<system-reminder>` envelope is
+ *     not lost);
+ *   • otherwise one span: an MCP deferred listing by its `mcp__<server>__*` names, else
+ *     the harness floor.
+ *
+ * @param {any} block  One `body.system[i]` or `messages[*].content[j]`.
+ * @returns {SystemSpan[]}  Non-empty.
+ */
+export function classifySystemSpans(block) {
+  const t = blockText(block);
+  const total = segBytes(block);
+
+  const whole = classifyWhole(t);
+  if (whole) return [{ ...whole, text: t, bytes: total }];
+
+  const hits = populationHits(t);
+  if (hits.length === 0) {
+    const lever = MCP_TOOL_NAME.test(t) || MCP_STUB_TOOL.test(t) ? 'mcp-deferred' : 'harness';
+    return [{ lever, floor: lever === 'harness', source: null, text: t, bytes: total }];
+  }
+
+  /** @type {SystemSpan[]} */
+  const spans = hits.map((h, k) => ({
+    lever: h.lever,
+    floor: false,
+    source: null,
+    text: t.slice(k === 0 ? 0 : h.at, k + 1 < hits.length ? hits[k + 1].at : t.length),
+    bytes: 0,
+  }));
+  // Tail spans are measured on their own escaped length; the HEAD span absorbs the
+  // remainder — the block's JSON envelope, plus any `cache_control` key `canonicalize`
+  // counts. Σ spans is therefore `total` by construction, on any block shape.
+  let tail = 0;
+  for (let k = 1; k < spans.length; k++) {
+    spans[k].bytes = spanBytes(spans[k].text);
+    tail += spans[k].bytes;
+  }
+  spans[0].bytes = total - tail;
+  return spans;
+}
+
+/**
+ * Classify a single `system` block to its source lever (AC #1). The single-verdict view
+ * of {@link classifySystemSpans}: a block's lever is its FIRST span's — its dominant
+ * population. `opts.index` is reserved for an order-based refinement (v1 is
+ * content-sufficient).
+ *
+ * @param {any} block   One `body.system[i]` (string or `{type:'text',text}` block).
+ * @param {{ index?: number, total?: number }} [opts]  Order context (reserved; v1 unused).
+ * @returns {SystemLeverVerdict}
+ */
+export function classifySystemBlock(block, opts = {}) {
+  void opts; // order seam — see module header; sentinels + floor-fallback decide v1.
+  const { lever, floor, source } = classifySystemSpans(block)[0];
+  return { lever, floor, source };
 }
 
 /**
@@ -198,4 +378,22 @@ export function filterFloor(attribs) {
  */
 function segBytes(value) {
   return value === undefined || value === null ? 0 : Buffer.byteLength(canonicalize(value), 'utf8');
+}
+
+/**
+ * The canonical envelope of an EMPTY text block — `{"text":"","type":"text"}`. JSON string
+ * escaping is per-character, so `canonicalBytes(t) === ENVELOPE + escaped(t)` and therefore
+ * `escaped(a + b) === escaped(a) + escaped(b)`: a span's own byte weight is its escaped
+ * text, envelope-free, which is exactly what makes carved spans tile their block.
+ */
+const ENVELOPE = segBytes({ type: 'text', text: '' });
+
+/**
+ * The byte weight of a text SPAN — its escaped length with no block envelope, so the
+ * spans of one block sum to that block's canonical byte length.
+ * @param {string} textSpan
+ * @returns {number}
+ */
+function spanBytes(textSpan) {
+  return segBytes({ type: 'text', text: textSpan }) - ENVELOPE;
 }

@@ -10,45 +10,57 @@
 // populations so each shows as a named, byte-costed block — and `--detail` drills into the
 // per-entry lines.
 //
-// It is a PURE CONSUMER of the parsed request body: it does NOT touch the shared
-// `classifySystemBlock` / `computeGain` (those feed the fine-tune lever model and the
-// `tuning-report` contract; widening them is issue #105's job). Bytes are measured with
-// the same `canonicalize` every other floor block uses, so a catalog block's figure is
-// byte-consistent with the rest of the table.
+// It USED to carry its own header detection, deliberately, so as not to preempt issue
+// #105's decision about the shared lever model. That decision has landed (ADR-0005) and
+// issue #116 inverted the layering: `src/finetune-system.js` is now the single authority
+// for "which lever owns which bytes of this block", and this module CONSUMES its spans
+// ({@link module:finetune-system.classifySystemSpans}) instead of doubling the detection.
+// What remains here is presentation: naming the populations `floor` shows, parsing each
+// into its entries for `--detail`, and reporting which existing floor row already carries
+// a population's bytes.
 //
-// Two capture shapes are handled:
+// Two capture shapes are handled, both by the shared classifier:
 //   • separate blocks — each population is its own `<system-reminder>` (the committed
-//     fixture). The block's whole text is the population, and its bytes match `gain.mcp`
-//     for the deferred-tools block exactly.
+//     fixture). The block's whole text is the population.
 //   • one combined block — all three populations ride a single `<system-reminder>` (the
 //     only way a real session can show one ~30 KB "MCP deferred listing" row — 19 tool
 //     names are not 30 KB). The block is carved into one span per population.
+//
+// One fold happens on the way out. The classifier carves the connecting-servers sub-list
+// (`mcp-deferred`) out of the deferred-tools listing it rides inside, because the gain
+// model must charge each half to the lever that owns it. `floor` keeps showing the
+// listing as ONE row — the servers are already visible as its `group: 'servers'` entries
+// — so an `mcp-deferred` span folds back into the population it interrupted, and that
+// population reports `chargedTo: 'mcp'` so the opaque MCP row is dropped rather than
+// double-counted. Per-block bytes are therefore unchanged from #113: the inversion is a
+// refactor of provenance, not of measurement.
 
-import { canonicalize } from './waste.js';
-import { classifySystemBlock } from './finetune-system.js';
+import { classifySystemSpans, CATALOG_LEVERS, SUBLIST_HEADERS, isCatalogLever } from './finetune-system.js';
 
 /**
- * The three catalog populations, as `floor`-block kinds.
- * @typedef {'deferred-tools' | 'agent-types' | 'skills-catalog'} CatalogKind
+ * The three catalog populations, as `floor`-block kinds — the shared classifier's
+ * `CATALOG_LEVERS`, under the name `floor`'s attribution rows use.
+ * @typedef {import('./finetune-system.js').CatalogLever} CatalogKind
  */
 
 /**
  * A detected catalog population.
  * @typedef {object} CatalogBlock
  * @property {CatalogKind} kind
- * @property {number} bytes   Canonical byte length — `canonicalize` of a `{type:'text'}`
- *                            block carrying the population's text span, the same basis every
- *                            other floor block uses (so it is comparable in one table).
+ * @property {number} bytes   This population's share of its source block's canonical byte
+ *                            length, straight from the shared classifier's span — the same
+ *                            basis every other floor block uses (so it is comparable in one
+ *                            table), and the spans of one block tile it exactly.
  * @property {string} text    The population's text span (for `--detail` entry parsing).
- * @property {'mcp' | 'harness' | null} chargedTo  Which existing floor row already carries
- *                            these bytes, so the caller can drop/deduct instead of
+ * @property {'mcp' | null} chargedTo  Which existing floor row already carries part of
+ *                            these bytes, so the caller can drop it instead of
  *                            double-counting. Read off the SHARED classifier — the same
  *                            authority `chargeExchange` uses — so the two can never drift:
- *                            `mcp` when the source block classifies `mcp-deferred`,
- *                            `harness` when it classifies `harness` on the `system` surface
- *                            (the only surface `chargeExchange` charges harness for), and
- *                            null when the gain model drops it as conversation — i.e. this
- *                            population is currently INVISIBLE in the floor.
+ *                            `mcp` when this population absorbed the connecting-servers
+ *                            sub-list (whose bytes `chargeExchange` charged to `gain.mcp`),
+ *                            null otherwise. Since #116 a catalog block classifies to its
+ *                            own lever rather than to `harness`, so the gain model no
+ *                            longer folds any of it into the harness figure.
  */
 
 /**
@@ -60,15 +72,11 @@ import { classifySystemBlock } from './finetune-system.js';
  *                                                   to split built-in tools from connecting servers.
  */
 
-// Header phrases that introduce each population. Case-sensitive, multiline-anchored: each
-// matches exactly its block (no cross-matches), and none appears in `body.system` on the
-// committed fixture. The `m` flag lets `^` match after a newline inside a multi-line block
-// (the header sits one line below the `<system-reminder>` wrapper); on a single trimmed
-// line `.test` matches the prefix regardless of the flag.
-const DEFERRED_TOOLS_HDR = /^The following deferred tools are now available via ToolSearch\./m;
-const AGENT_TYPES_HDR = /^Available agent types for the Agent tool:/m;
-const SKILLS_HDR = /^The following skills are available for use with the Skill tool:/m;
-const MCP_CONNECTING_HDR = /^The following MCP servers are still connecting/m;
+// The header phrases, read off the shared classifier — the module that DETECTS them. Only
+// the entry parsers below use them here, to recognize the line that opens each sub-list
+// when splitting a population into its named items.
+const DEFERRED_TOOLS_HDR = SUBLIST_HEADERS['deferred-tools'];
+const MCP_CONNECTING_HDR = SUBLIST_HEADERS['mcp-deferred'];
 
 /** A deferred-tool or connecting-server name is a bare token (the charset finetune-mcp.js uses). */
 const BARE_TOKEN = /^[A-Za-z0-9_.-]+$/;
@@ -96,13 +104,6 @@ const NAME_ONLY_ENTRY = /^-\s+([A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)\s*$/;
 /** The `<system-reminder>` wrapper lines that carry these blocks. */
 const REMINDER_TAG = /^<\/?system-reminder>/;
 
-/** The headers in canonical (kind) order; used both for detection and for stable output. */
-const HEADERS = /** @type {{ kind: CatalogKind, re: RegExp }[]} */ ([
-  { kind: 'deferred-tools', re: DEFERRED_TOOLS_HDR },
-  { kind: 'agent-types', re: AGENT_TYPES_HDR },
-  { kind: 'skills-catalog', re: SKILLS_HDR },
-]);
-
 /**
  * The text payload of a content block — a bare string, or the `text` field of a
  * `{ type: 'text', text }` block. Null-safe (mirrors `finetune-system.js`'s `blockText`).
@@ -116,66 +117,48 @@ function blockText(block) {
 }
 
 /**
- * Canonical byte length of a text span, on the same basis every floor block is measured:
- * `canonicalize` of a `{ type: 'text', text }` block. For a span that is a block's whole
- * text this reproduces the gain model's figure byte-for-byte (the catalog blocks carry no
- * `cache_control`, so `{ type:'text', text }` is their exact canonical shape).
- * @param {string} textSpan
- * @returns {number}
- */
-function catalogBytes(textSpan) {
-  return Buffer.byteLength(canonicalize({ type: 'text', text: textSpan }), 'utf8');
-}
-
-/**
- * The canonical envelope of an EMPTY text block — `{"text":"","type":"text"}`. JSON string
- * escaping is per-character, so `catalogBytes(t) === ENVELOPE + escaped(t)` and therefore
- * `escaped(a + b) === escaped(a) + escaped(b)`. Charging the envelope to the first span only
- * makes the spans of a carved block tile it EXACTLY: Σ span bytes === the whole block's
- * bytes, so splitting a combined block never invents bytes the gain model did not charge.
- */
-const ENVELOPE = catalogBytes('');
-
-/**
  * Visit every content block of a parsed request body — `body.system` and every
- * `messages[*].content` block — yielding `{ block, surface }`. Mirrors the surface walk
- * `finetune-gain.js` / `finetune-mcp.js` use; floor needs its own because those modules'
- * walks are private. Null-safe.
+ * `messages[*].content` block. Mirrors the surface walk `finetune-gain.js` /
+ * `finetune-mcp.js` use; floor needs its own because those modules' walks are private.
+ * Null-safe.
  *
  * Both surfaces are walked because the fidelity question of WHERE CC injects these blocks
  * (`system[]` vs `message#0`) is exactly the open question FT3 left (test/fixtures/finetune/
- * README.md); detecting on both surfaces is robust across CC builds.
+ * README.md); detecting on both surfaces is robust across CC builds. The surface itself no
+ * longer matters here: since #116 a catalog block classifies to its own lever on either
+ * surface, so it is never folded into the harness figure it would have to be deducted from.
  * @param {any} body  Parsed request JSON.
- * @returns {Generator<{ block: any, surface: 'system' | 'message' }>}
+ * @returns {Generator<{ block: any }>}
  */
 function* walkBodyBlocks(body) {
   if (!body || typeof body !== 'object') return;
   const sys = body.system;
   const sysBlocks = Array.isArray(sys) ? sys : sys == null ? [] : [sys];
-  for (const block of sysBlocks) yield { block, surface: 'system' };
+  for (const block of sysBlocks) yield { block };
   const msgs = Array.isArray(body.messages) ? body.messages : [];
   for (const m of msgs) {
     if (!m || typeof m !== 'object') continue;
     const c = m.content;
     if (Array.isArray(c)) {
-      for (const block of c) yield { block, surface: 'message' };
+      for (const block of c) yield { block };
     } else {
-      yield { block: c, surface: 'message' }; // a bare-string message content
+      yield { block: c }; // a bare-string message content
     }
   }
 }
 
 /**
  * Find the catalog populations in a parsed turn-1 body. Walks every text block on both
- * surfaces; within each block, locates the catalog headers present and emits one
- * `CatalogBlock` per population:
- *   • one header in a block (the separate-block shape) → the whole block text is the
- *     population;
- *   • several headers in one block (the combined-block shape) → the text is carved into one
- *     span per population (the first span starts at the block's first character so the
- *     `<system-reminder>` envelope is not lost; spans tile the block text).
- * A population re-sent elsewhere in the same request is counted once (first wins). Never
- * throws; a non-object body yields `[]`.
+ * surfaces, hands each to the shared classifier, and keeps the spans that are catalog
+ * populations — one `CatalogBlock` each. The classifier covers both capture shapes: a
+ * block carrying one header yields one span (its whole text), a combined block yields one
+ * span per population, and the spans tile the block.
+ *
+ * A `mcp-deferred` span is FOLDED into the population it interrupts (see the module
+ * header): `floor` shows the deferred listing as one row whose connecting servers are
+ * already `group: 'servers'` entries, and the fold is what keeps that row's bytes
+ * identical to #113's. A population re-sent elsewhere in the same request is counted once
+ * (first wins). Never throws; a non-object body yields `[]`.
  * @param {any} body  Parsed request JSON (null-safe).
  * @returns {CatalogBlock[]}  0–3 blocks, in canonical kind order.
  */
@@ -184,49 +167,39 @@ export function findCatalogBlocks(body) {
   const out = [];
   /** @type {Set<CatalogKind>} */
   const seen = new Set();
-  for (const { block, surface } of walkBodyBlocks(body)) {
-    const text = blockText(block);
-    if (!text) continue;
-    // Locate every catalog header present in THIS block, by char offset.
-    /** @type {{ kind: CatalogKind, at: number }[]} */
-    const hits = [];
-    for (const h of HEADERS) {
-      const m = h.re.exec(text);
-      if (m) hits.push({ kind: h.kind, at: m.index });
-    }
-    if (hits.length === 0) continue;
-    hits.sort((a, b) => a.at - b.at);
+  for (const { block } of walkBodyBlocks(body)) {
+    if (!blockText(block)) continue;
+    const spans = classifySystemSpans(block);
+    if (!spans.some((s) => isCatalogLever(s.lever))) continue;
 
-    // What the gain model already charged for THIS source block. Asking the shared
-    // classifier (rather than re-deriving the rule) is what keeps floor's deduction and
-    // `chargeExchange`'s charge in lockstep — see `chargedTo` on the typedef.
-    const lever = classifySystemBlock(block).lever;
-    /** @type {CatalogBlock['chargedTo']} */
-    const chargedTo = lever === 'mcp-deferred' ? 'mcp' : lever === 'harness' && surface === 'system' ? 'harness' : null;
-
-    if (hits.length === 1) {
-      const kind = hits[0].kind;
-      if (seen.has(kind)) continue;
-      seen.add(kind);
-      out.push({ kind, bytes: catalogBytes(text), text, chargedTo });
-    } else {
-      // Combined block: carve one span per population. Span i runs from its header to the
-      // next population's header; the last runs to end-of-text. The text before the first
-      // header (the opening <system-reminder> envelope) folds into the first span, which
-      // is also the span charged the canonical ENVELOPE so the spans tile the block exactly.
-      for (let k = 0; k < hits.length; k++) {
-        const kind = hits[k].kind;
-        if (seen.has(kind)) continue;
-        seen.add(kind);
-        const start = k === 0 ? 0 : hits[k].at;
-        const end = k + 1 < hits.length ? hits[k + 1].at : text.length;
-        const span = text.slice(start, end);
-        out.push({ kind, bytes: catalogBytes(span) - (k === 0 ? 0 : ENVELOPE), text: span, chargedTo });
+    /** The catalog spans of THIS block, each with any following MCP sub-list folded in. */
+    /** @type {{ kind: CatalogKind, bytes: number, text: string, mcp: boolean }[]} */
+    const folded = [];
+    for (const span of spans) {
+      if (isCatalogLever(span.lever)) {
+        folded.push({ kind: /** @type {CatalogKind} */ (span.lever), bytes: span.bytes, text: span.text, mcp: false });
+      } else if (span.lever === 'mcp-deferred' && folded.length > 0) {
+        const host = folded[folded.length - 1];
+        host.bytes += span.bytes;
+        host.text += span.text;
+        host.mcp = true;
       }
+      // An `mcp-deferred` span with no catalog before it is NOT a catalog population: it
+      // is the connecting-servers listing on its own, which `floor` shows as its own row
+      // from `gain.mcp`. Dropping it here is what keeps that row from being duplicated.
+    }
+
+    for (const f of folded) {
+      if (seen.has(f.kind)) continue;
+      seen.add(f.kind);
+      // `mcp` when this population absorbed the connecting-servers sub-list: `gain.mcp`
+      // holds that share, so `floor` must drop its opaque MCP row rather than show those
+      // bytes twice. See `chargedTo` on the typedef.
+      out.push({ kind: f.kind, bytes: f.bytes, text: f.text, chargedTo: f.mcp ? 'mcp' : null });
     }
   }
   // Stable canonical-kind order (the byte-descending sort in floor re-orders for display).
-  return out.sort((a, b) => HEADERS.findIndex((h) => h.kind === a.kind) - HEADERS.findIndex((h) => h.kind === b.kind));
+  return out.sort((a, b) => CATALOG_LEVERS.indexOf(a.kind) - CATALOG_LEVERS.indexOf(b.kind));
 }
 
 /**

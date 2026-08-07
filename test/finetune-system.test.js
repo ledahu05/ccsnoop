@@ -1,10 +1,12 @@
 // FT3 (issue #73) — split the `system` bucket by source.
 //
-// The fine-tune `system` bucket mixes four sources (fine-tune-spec §2.3): the
-// CC harness, CLAUDE.md, a SessionStart-hook persona, and the MCP deferred
-// listing. `src/finetune-system.js` attributes each `system` block to one of
-// them so the downstream levers (T5/T6) can charge bytes to the right place and
-// flag the harness as the incompressible floor (shown but never actionable).
+// The fine-tune `system` bucket mixes seven sources (fine-tune-spec §2.3): the
+// CC harness, CLAUDE.md, a SessionStart-hook persona, the MCP connecting-servers
+// sub-list, and the three catalogs Claude Code injects (deferred tools, agent
+// types, skills). `src/finetune-system.js` attributes each block to one of them —
+// carving a block that carries several into spans that tile it — so the downstream
+// levers (T5/T6) can charge bytes to the right place and flag the harness as the
+// incompressible floor (shown but never actionable).
 //
 // RGR posture. The classifier heuristics are derived from the bench's frozen
 // sentinels — the on-wire proof each lever carries (bench/fixture/CLAUDE.md,
@@ -25,7 +27,9 @@ import { segmentRequest } from '../src/waste.js';
 import { parseRequestBlob } from '../src/report.js';
 import {
   SYSTEM_LEVERS,
+  CATALOG_LEVERS,
   classifySystemBlock,
+  classifySystemSpans,
   attributeSystemBlocks,
   filterFloor,
 } from '../src/finetune-system.js';
@@ -45,8 +49,23 @@ const text = (text) => ({ type: 'text', text });
 
 // ── lever vocabulary (AC #1) ──────────────────────────────────────────────────
 
-test('SYSTEM_LEVERS is exactly the four system-bucket sources', () => {
-  assert.deepEqual(SYSTEM_LEVERS, ['claude-md', 'hook', 'mcp-deferred', 'harness']);
+test('SYSTEM_LEVERS is exactly the seven system-bucket sources', () => {
+  // #116 / ADR-0005: the three catalog populations `floor` already named (#109/#113) are
+  // levers of the shared model too, so `fine-tune` sees what `floor` sees.
+  assert.deepEqual(SYSTEM_LEVERS, [
+    'claude-md',
+    'hook',
+    'mcp-deferred',
+    'deferred-tools',
+    'skills-catalog',
+    'agent-types',
+    'harness',
+  ]);
+});
+
+test('CATALOG_LEVERS is the carvable subset, in the order a block presents them', () => {
+  assert.deepEqual(CATALOG_LEVERS, ['deferred-tools', 'agent-types', 'skills-catalog']);
+  for (const l of CATALOG_LEVERS) assert.ok(SYSTEM_LEVERS.includes(l), `${l} is a system lever`);
 });
 
 // ── per-block classification — sentinel fidelity (AC #1) ──────────────────────
@@ -82,6 +101,151 @@ test('only the harness lever is flagged as the floor (the three actionable lever
     assert.equal(classifySystemBlock(block).floor, false);
   }
 });
+
+// ── the catalog levers, and `mcp-deferred` narrowed (issue #116, ADR-0005) ────
+//
+// Before #116 there were TWO detections of the same blocks: this module's, which swept
+// every block saying "deferred tool" into `mcp-deferred`, and `floor-catalog.js`'s, which
+// already told the three catalog populations apart but deliberately stayed a pure
+// consumer. The layering inverts here: header detection lives in ONE authority, and
+// `mcp-deferred` shrinks to what it actually names — the connecting-servers sub-list.
+// The practical consequence: a repo with no MCP server reports zero `mcp-deferred` bytes.
+
+/**
+ * The real Claude Code header lines — the opening of each catalog as the committed FT0
+ * capture spells it, truncated to what the classifier anchors on. The full-sentence
+ * spelling is asserted against the capture itself by the fixture gate at the bottom, so
+ * these constants stay readable without the fixture's exact tail becoming load-bearing.
+ */
+const DEFERRED_HDR =
+  'The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError.';
+const AGENTS_HDR = 'Available agent types for the Agent tool:';
+const SKILLS_HDR = 'The following skills are available for use with the Skill tool:';
+const CONNECTING_HDR =
+  'The following MCP servers are still connecting — their tools (typically named mcp__<server>__*) are not yet available but will appear shortly:';
+
+/** A `<system-reminder>`-wrapped block, the envelope CC ships these catalogs in. */
+const reminder = (body) => text(`<system-reminder>\n${body}</system-reminder>`);
+
+/** The deferred-tools listing of a repo with NO MCP server: no connecting sub-list at all. */
+const NO_MCP_DEFERRED = `${DEFERRED_HDR}\nWebFetch\nWebSearch\nMonitor\n`;
+
+test('each catalog header maps the block to its own lever, not to the mcp-deferred catch-all', () => {
+  assert.equal(classifySystemBlock(reminder(NO_MCP_DEFERRED)).lever, 'deferred-tools');
+  assert.equal(classifySystemBlock(reminder(`${AGENTS_HDR}\n- Explore: Read-only search agent.\n`)).lever, 'agent-types');
+  assert.equal(classifySystemBlock(reminder(`${SKILLS_HDR}\n\n- tdd: Red-green-refactor.\n`)).lever, 'skills-catalog');
+});
+
+test('none of the catalog levers is the incompressible floor', () => {
+  for (const body of [NO_MCP_DEFERRED, `${AGENTS_HDR}\n- Explore: x\n`, `${SKILLS_HDR}\n- tdd: y\n`]) {
+    assert.equal(classifySystemBlock(reminder(body)).floor, false);
+    assert.equal(classifySystemBlock(reminder(body)).source, null, 'only CLAUDE.md carries a source');
+  }
+});
+
+test('a repo with no MCP server produces NO mcp-deferred span — the catch-all label is dead', () => {
+  // The exit criterion of issue #116, at the classifier: the deferred-tools listing of a
+  // repo without a single MCP server used to be charged 100 % to `mcp-deferred`, sending
+  // the reader hunting a server that was never configured.
+  const spans = classifySystemSpans(reminder(NO_MCP_DEFERRED));
+  assert.deepEqual(spans.map((s) => s.lever), ['deferred-tools']);
+});
+
+test('mcp-deferred is the connecting-servers sub-list, and it is carved OUT of the listing', () => {
+  // The sub-list rides INSIDE the deferred-tools block on the wire (the committed FT0
+  // capture). One authority, two spans: the tool names are the catalog, the servers are MCP.
+  const spans = classifySystemSpans(reminder(`${NO_MCP_DEFERRED}\n${CONNECTING_HDR}\nstub\n`));
+  assert.deepEqual(spans.map((s) => s.lever), ['deferred-tools', 'mcp-deferred']);
+  assert.match(spans[1].text, /^The following MCP servers are still connecting/);
+  assert.ok(!/WebFetch/.test(spans[1].text), 'the tool names stay with the catalog');
+});
+
+test('a block that is ONLY the connecting-servers listing is one mcp-deferred span', () => {
+  const spans = classifySystemSpans(reminder(`${CONNECTING_HDR}\nstub\n`));
+  assert.deepEqual(spans.map((s) => s.lever), ['mcp-deferred']);
+  assert.equal(spans[0].floor, false);
+});
+
+test('an on-wire mcp__<server>__<tool> deferred name still reads as mcp-deferred', () => {
+  // A build wording its headers differently must not silently drop ~30 KB: the real
+  // on-wire MCP tool spelling (`mcp__stub__t00`, fixtures README) is the fallback marker.
+  assert.equal(classifySystemBlock(text('deferred tools: mcp__stub__t00 listing')).lever, 'mcp-deferred');
+});
+
+test('a block naming no lever at all is the harness floor, even if it says "deferred tools"', () => {
+  // The old catch-all `/deferred\s+(?:tool|mcp)/` swept prose into the MCP lever. Prose
+  // that merely uses the words — with no catalog header, no connecting sub-list and no
+  // `mcp__` name — is unattributable, hence floor.
+  const v = classifySystemBlock(text('Some deferred tools may be unavailable in this environment.'));
+  assert.equal(v.lever, 'harness');
+  assert.equal(v.floor, true);
+});
+
+// ── span carving: the two capture shapes floor-catalog.js already handles ──────
+
+test('classifySystemSpans carves a COMBINED block into one span per population', () => {
+  const spans = classifySystemSpans(
+    reminder(`${NO_MCP_DEFERRED}\n${AGENTS_HDR}\n- Explore: x\n\n${SKILLS_HDR}\n- tdd: y\n`),
+  );
+  assert.deepEqual(spans.map((s) => s.lever), ['deferred-tools', 'agent-types', 'skills-catalog']);
+});
+
+test('the spans of a block TILE it exactly — carving never invents or loses bytes', () => {
+  // The invariant `floor-catalog.js` held and this module inherits: Σ span bytes is the
+  // block's own canonical byte length, so splitting a row can never charge bytes the
+  // gain model did not. Checked on both capture shapes and on a plain (uncarved) block.
+  const blocks = [
+    reminder(`${NO_MCP_DEFERRED}\n${AGENTS_HDR}\n- Explore: x\n\n${SKILLS_HDR}\n- tdd: y\n`),
+    reminder(`${NO_MCP_DEFERRED}\n${CONNECTING_HDR}\nstub\n`),
+    reminder(NO_MCP_DEFERRED),
+    text('You are Claude Code, Anthropic’s CLI.'),
+  ];
+  for (const block of blocks) {
+    const spans = classifySystemSpans(block);
+    const [seg] = segmentRequest({ system: [block] }).filter((s) => s.bucket === 'system');
+    assert.equal(
+      spans.reduce((s, x) => s + x.bytes, 0),
+      seg.bytes,
+      `spans tile the block: ${JSON.stringify(spans.map((s) => s.lever))}`,
+    );
+    assert.equal(spans.map((s) => s.text).join(''), blockTextOf(block), 'and the texts tile it too');
+  }
+});
+
+test('a cache_control marker rides the first span, so tiling still holds', () => {
+  // A real capture puts `cache_control` on its big system blocks. It is not text, so no
+  // span's own escaped length can account for it: the HEAD span absorbs it, which keeps
+  // Σ spans equal to the whole-block figure this module reports for the same block.
+  const block = { type: 'text', text: `<system-reminder>\n${NO_MCP_DEFERRED}\n${SKILLS_HDR}\n- tdd: y\n</system-reminder>`, cache_control: { type: 'ephemeral' } };
+  const spans = classifySystemSpans(block);
+  assert.ok(spans.length > 1, 'the block really is carved');
+  const [whole] = attributeSystemBlocks({ system: [block] });
+  assert.equal(spans.reduce((s, x) => s + x.bytes, 0), whole.bytes);
+});
+
+test('classifySystemBlock reports the FIRST span — the block\'s dominant population', () => {
+  const combined = reminder(`${NO_MCP_DEFERRED}\n${AGENTS_HDR}\n- Explore: x\n`);
+  assert.equal(classifySystemBlock(combined).lever, classifySystemSpans(combined)[0].lever);
+});
+
+test('CLAUDE.md and hook markers still win over a catalog header they merely quote', () => {
+  // A memory file documenting the catalogs must not become one. The two levers that
+  // carry a real source/action are tested BEFORE the catalog headers.
+  const md = classifySystemBlock(
+    text(`Contents of ./CLAUDE.md (project instructions):\n${SKILLS_HDR}\n- tdd: we use it\nSENTINEL: ${CLAUDEMD}`),
+  );
+  assert.equal(md.lever, 'claude-md');
+  assert.equal(md.source, './CLAUDE.md');
+  assert.equal(
+    classifySystemBlock(text(`<system-reminder>\nSessionStart:startup hook success: ${AGENTS_HDR}\n</system-reminder>`)).lever,
+    'hook',
+  );
+});
+
+/** The text payload of a block, mirroring the module's own `blockText`. */
+function blockTextOf(block) {
+  return typeof block === 'string' ? block : (block && block.text) || '';
+}
 
 // ── content wins over order (AC: "content + order") ───────────────────────────
 
@@ -324,7 +488,7 @@ test('FT3 system-bucket lever mapping — AC #1–#2 (issue #73)', fixtureGateOp
       const req = parseRequestBlob(fs.readFileSync(path.join(dir, line.request_blob)));
       const attribs = attributeSystemBlocks(req.json);
       for (const a of attribs) {
-        // Structural completeness — every system block maps to exactly one of the four levers.
+        // Structural completeness — every system block maps to exactly one of the levers.
         assert.ok(
           SYSTEM_LEVERS.includes(a.lever),
           `${id}/${line.request_blob}: system block ${a.slot} mapped to unknown lever '${a.lever}'`,
@@ -350,6 +514,37 @@ test('FT3 system-bucket lever mapping — AC #1–#2 (issue #73)', fixtureGateOp
 
     // The harness floor must be present and flagged (AC #3 precondition: shown but not actionable).
     assert.ok(floorSeen, `${id}: no harness/floor system block found (AC #3 expects the floor to be shown)`);
+  }
+});
+
+test('FT3 — the catalog levers on the REAL capture (issue #116)', fixtureGateOpts, () => {
+  // The catalogs ride `messages[0].content`, not `system[]`, so the gate above never sees
+  // them. This one walks the message surface and pins what #116 changed on real bytes:
+  // the deferred listing carves into the built-in names and the connecting-servers
+  // sub-list, and the two catalogs that used to be invisible name themselves.
+  for (const dir of dirs) {
+    const id = path.basename(dir);
+    const lines = fs
+      .readFileSync(path.join(dir, 'manifest.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+    const req = parseRequestBlob(fs.readFileSync(path.join(dir, lines[0].request_blob)));
+    const blocks = (req.json?.messages ?? []).flatMap((m) => (Array.isArray(m.content) ? m.content : [m.content]));
+    const spans = blocks.flatMap((b) => classifySystemSpans(b));
+    const byLever = new Map();
+    for (const s of spans) byLever.set(s.lever, (byLever.get(s.lever) ?? 0) + s.bytes);
+
+    for (const lever of CATALOG_LEVERS) {
+      assert.ok((byLever.get(lever) ?? 0) > 0, `${id}: no bytes attributed to ${lever} on the real capture`);
+    }
+    // This fixture DOES have a connecting MCP server (`stub`, turns 1–2), so the narrowed
+    // lever is non-empty here — and strictly smaller than the listing it was carved from.
+    assert.ok((byLever.get('mcp-deferred') ?? 0) > 0, `${id}: the stub server's sub-list should charge the MCP lever`);
+    assert.ok(
+      byLever.get('mcp-deferred') < byLever.get('deferred-tools') + byLever.get('mcp-deferred'),
+      `${id}: mcp-deferred is a PART of the listing, not the whole of it`,
+    );
   }
 });
 
