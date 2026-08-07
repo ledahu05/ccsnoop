@@ -21,6 +21,7 @@ absolue sur omniris — non reproductible par construction (B4).
 | Élément | Valeur | Source |
 |---|---|---|
 | Claude Code | `2.1.220`, linux-x64, `sdk-cli` | B1, B2, B6 |
+| ↳ dérive constatée | poste de dev à `2.1.224` au 2026-08-07. Les lectures du levier 5 (`skillOverrides`, exemption plugin, `disableBundledSkills`) ont été re-lues sur les **deux** versions : code identique, chaînes de schéma byte-identiques — [#115](https://github.com/ledahu05/ccsnoop/issues/115), [note](../docs/research/skill-overrides-name-only.md) | #115 |
 | Compte | `authMethod: claude.ai`, abonnement (pas `ANTHROPIC_API_KEY`) | B1 |
 | Modèle | **`claude-haiku-4-5-20251001`** — ID daté, pinné (pas l'alias) | B2, B6 |
 | Régime | `ENABLE_TOOL_SEARCH=true`, identique aux 7 bras | B7 |

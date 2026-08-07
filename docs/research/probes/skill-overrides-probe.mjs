@@ -14,6 +14,12 @@
 //           must drop it from `skills` only; `off` from both.
 //           ⚠ CEILING: `system/init` cannot see the wire. A skill still listed there says
 //           nothing about whether its DESCRIPTION was shipped — that is the capture's job.
+//           And a LISTING is not an invocation, which is what `slash` is for.
+//
+//   slash   ZERO billed tokens. Runs `/name` for real against the dead port: a known
+//           command becomes a turn that then fails to POST, an unknown one never becomes a
+//           turn. Upgrades "`/name` is still listed" to "`/name` still RUNS" — the claim
+//           ADR-0005's bounded-action argument actually rests on.
 //
 //   capture Two real `claude -p` runs through ccsnoop, differing ONLY by
 //           <arm>/.claude/settings.json. Answers the byte half: what does the
@@ -31,6 +37,7 @@
 //
 // Usage:
 //   node skill-overrides-probe.mjs sweep
+//   node skill-overrides-probe.mjs slash
 //   node skill-overrides-probe.mjs capture [port]
 //   node skill-overrides-probe.mjs analyze <controlSessionDir> <nameOnlySessionDir>
 //   node skill-overrides-probe.mjs clean
@@ -200,6 +207,53 @@ function sweep() {
   }
 }
 
+// ── slash: does `/name` still RUN, not merely still appear in a list? ────────
+//
+// The sweep only reads `system/init.slash_commands` — a listing, and that payload's sibling
+// list (`skills`) was shown NOT to reflect what the model sees, so a listing is weak
+// evidence. This cell exercises the command for real, still at zero billed tokens: with
+// ANTHROPIC_BASE_URL on a dead port, Claude Code expands a KNOWN command into a turn and
+// then fails to POST it, while an UNKNOWN one never becomes a turn at all. The result
+// envelope separates the two cleanly:
+//
+//   known    → num_turns >= 1, is_error true  (the turn existed; the dead port killed it)
+//   unknown  → num_turns === 0, is_error false (nothing was ever run)
+//
+// So `num_turns >= 1` is the "the slash command RAN" signal.
+function slashRuns(cfg, cmd) {
+  const r = sh('claude', ['-p', cmd, '--model', MODEL, '--output-format', 'json'], {
+    cwd: PROJECT,
+    env: { ...baseEnv(), CLAUDE_CONFIG_DIR: cfg, ANTHROPIC_BASE_URL: DEAD_URL },
+    timeout: 90_000,
+  });
+  try {
+    const ev = JSON.parse((r.stdout ?? '').trim());
+    return { ran: (ev.num_turns ?? 0) >= 1, turns: ev.num_turns, cost: ev.total_cost_usd };
+  } catch {
+    return { ran: null, turns: null, raw: (r.stdout ?? r.stderr ?? '').slice(0, 200) };
+  }
+}
+
+function slash() {
+  ensureProject();
+  const cells = [
+    ['control', {}],
+    ['name-only', { skillOverrides: Object.fromEntries(TARGETS.map((n) => [n, 'name-only'])) }],
+    ['off', { skillOverrides: Object.fromEntries(TARGETS.map((n) => [n, 'off'])) }],
+  ];
+  // The negative control: a command that does not exist under ANY setting. Without it,
+  // "ran" could just mean "claude -p always reports a turn".
+  const UNKNOWN = '/no-such-command-anywhere';
+  for (const [name, settings] of cells) {
+    const cfg = armDir('slash-' + name, settings, { creds: false });
+    console.log(`\n## ${name}`);
+    for (const cmd of [...TARGETS.map((t) => '/' + t), UNKNOWN]) {
+      const r = slashRuns(cfg, cmd);
+      console.log(`   ${cmd.padEnd(26)} ran=${r.ran === null ? '??' : r.ran ? 'YES' : 'no '}  num_turns=${r.turns}  cost=${r.cost ?? 0}`);
+    }
+  }
+}
+
 // ── capture: two live runs through ccsnoop ──────────────────────────────────
 function ccsnoop(args, env = {}) {
   return sh('node', [path.join(REPO_ROOT, 'bin', 'ccsnoop.js'), ...args], {
@@ -272,8 +326,12 @@ function capture() {
 }
 
 // ── analyze: per-entry byte diff via the repo's own catalog parser ───────────
+//
+// Why this selects on `tools[]` rather than calling `computeFloor`: on a `-p` capture, turn 1
+// is a tool-less auxiliary round-trip and `floor` anchors on it, reporting no catalog at all
+// (issue #120). A non-empty `tools[]` is the discriminator that finds the real opening.
 function firstToolRequest(dir) {
-  const model = loadSession(dir); // exercises the repo's own session loader on the capture
+  loadSession(dir); // smoke-test the repo's own session loader on this capture before reading it
   const lines = fs
     .readFileSync(path.join(dir, 'manifest.jsonl'), 'utf8')
     .split('\n')
@@ -289,7 +347,7 @@ function firstToolRequest(dir) {
     } catch {
       continue;
     }
-    if (Array.isArray(body.tools) && body.tools.length) return { body, model, turn: m.turn };
+    if (Array.isArray(body.tools) && body.tools.length) return { body, turn: m.turn };
   }
   throw new Error('no request with a non-empty tools[] in ' + dir);
 }
@@ -375,10 +433,11 @@ function clean() {
 
 const mode = process.argv[2];
 if (mode === 'sweep') sweep();
+else if (mode === 'slash') slash();
 else if (mode === 'capture') capture();
 else if (mode === 'analyze') analyze(process.argv[3], process.argv[4]);
 else if (mode === 'clean') clean();
 else {
-  console.error('usage: skill-overrides-probe.mjs sweep|capture [port]|analyze <ctlDir> <nameOnlyDir>|clean');
+  console.error('usage: skill-overrides-probe.mjs sweep|slash|capture [port]|analyze <ctlDir> <nameOnlyDir>|clean');
   process.exit(2);
 }

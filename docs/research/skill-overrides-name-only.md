@@ -11,7 +11,8 @@ fil, une entrée passée en `name-only` tombe à **exactement sa ligne de nom** 
 **1 157 → 10 octets (−99,1 %)**, une skill de projet **674 → 14 octets (−97,9 %)** — et le bloc
 `skills-catalog` entier perd **1 843 octets sur 5 744 (−32,1 %)** en ne désignant que deux skills
 sur douze. **Résidu nul** : aucune des deux descriptions retirées ne reparaît ailleurs dans la
-requête. La skill reste listée, et `/nom` reste tapable.
+requête. La skill reste listée — et `/nom` **tourne encore**, vérifié en l'exécutant, pas en le
+lisant dans un inventaire.
 
 Le gain du levier 5a n'est donc plus postulé. Il est mesuré.
 
@@ -32,7 +33,7 @@ repo). Aucune re-tokenisation.
 | Lectures binaires | **`2.1.220`** (la version épinglée par `bench/SPEC.md` §0, tirée de `@anthropic-ai/claude-code-linux-x64@2.1.220`) **et `2.1.224`** (le build local) |
 | Mesure sur le fil | `2.1.224` — le seul binaire installé sur ce poste |
 | Modèle | `claude-haiku-4-5-20251001`, `-p`, `--permission-mode bypassPermissions`, `ENABLE_TOOL_SEARCH=true` |
-| Harnais | [`probes/skill-overrides-probe.mjs`](./probes/skill-overrides-probe.mjs) — importe `findCatalogBlocks` / `parseCatalogEntries` de `src/floor-catalog.js`, `loadSession` / `computeAnatomy` de `src/report.js`. Pas de second parseur. |
+| Harnais | [`probes/skill-overrides-probe.mjs`](./probes/skill-overrides-probe.mjs) — mesure le catalogue avec `findCatalogBlocks` / `parseCatalogEntries` de `src/floor-catalog.js`, le chemin exact de `floor --detail` (pas un second parseur de catalogue), et `computeAnatomy` de `src/report.js` pour les totaux |
 
 **La dérive annoncée dans la réserve a bien commencé** — le bench épingle `2.1.220`, le poste est à
 `2.1.224` — mais sur les quatre lectures qui portent le levier 5, les deux versions sont
@@ -40,10 +41,12 @@ repo). Aucune re-tokenisation.
 faite que sur `2.1.224` ; c'est la seule asymétrie qui subsiste, et elle est bénigne puisque le code
 de rendu est le même dans les deux builds (§4).
 
-**Correction de forme à ADR-0005.** L'ADR attribue ses lectures à « v2.1.220 » mais cite les
-symboles `p4e`, `ho`, `O4_` : ce sont ceux de **2.1.224**. Sur 2.1.220 le même code se minifie en
-`jFe`, `eo`, `sPy`. Le fond est intact — c'est le même code, aux noms de symboles près, ce que la
-double lecture ci-dessous établit.
+**Correction de forme.** Le commentaire de grilling de
+[#105](https://github.com/ledahu05/ccsnoop/issues/105#issuecomment-5217816269) cite le résolveur
+sous les symboles `p4e`, `ho`, `O4_` en l'attribuant à « v2.1.220 » : ce sont ceux de **2.1.224**.
+Sur 2.1.220 le même code se minifie en `jFe`, `eo`, `sPy`. Le fond est intact — c'est le même code,
+aux noms de symboles près, ce que la double lecture ci-dessous établit. (Le corps d'ADR-0005 ne cite
+aucun symbole ; rien n'y est à corriger sur ce point.)
 
 ---
 
@@ -108,7 +111,7 @@ versions) précise le périmètre :
 
 Et surtout, la troisième voie : `Doo` n'est consulté qu'**après** la lecture de `skillOverrides`, si
 bien qu'une entrée par nom atteint une skill bundled tant que `disableBundledSkills` est faux. C'est
-ce que la mesure du §4 vérifie directement — **`dataviz` est une skill bundled**, et son override
+ce que la mesure du §6 vérifie directement — **`dataviz` est une skill bundled**, et son override
 `name-only` mord.
 
 **Nuance mesurée (§5)** : `disableBundledSkills: true` retire les skills bundled **des deux**
@@ -155,17 +158,39 @@ Le point 2 a une conséquence immédiate, traitée au §7.
 | `disableBundledSkills: true` | **2** | **28** | ❌ | ✅ (projet, épargnée) |
 | override sur un nom inexistant | 16 | 42 | ✅ | ✅ |
 
-**Ce que ça établit** — la frontière `off` / le reste. `off` retire la skill des deux inventaires ;
-`name-only` ne retire rien. C'est la moitié « action bornée » de la thèse d'ADR-0005 : sous
-`name-only`, `/nom` marche encore.
+**Ce que ça établit** — la frontière `off` / le reste, au niveau des *inventaires* : `off` retire la
+skill des deux, `name-only` ne retire rien.
 
 ⚠ **Plafond de l'instrument, à ne pas surinterpréter.** La cellule `user-invocable-only` laisse la
 skill dans `skills` alors que le résolveur la cache manifestement au modèle. **`system/init.skills`
 n'est donc pas la liste vue par le modèle** : c'est le registre. Cet instrument sait dire « la skill
 existe-t-elle encore », pas « sa description a-t-elle été expédiée ». Seul le fil répond à ça — d'où
+l'instrument C.
+
+Et puisque la fidélité de `skills` vient d'être démentie, **celle de `slash_commands` ne peut pas
+être postulée** : un décompte qui ne bouge pas ne prouve pas qu'une commande *marche*. D'où
 l'instrument B.
 
-## 6. Instrument B — la mesure sur le fil
+## 5 bis. Instrument B — `/nom` exécuté, pas seulement listé (zéro token)
+
+Toujours sur le port mort, mais en tapant réellement la commande. L'enveloppe de résultat sépare
+proprement les deux cas : une commande **connue** devient un tour qui échoue ensuite à POSTer
+(`num_turns >= 1`, `is_error: true`) ; une commande **inconnue** ne devient jamais un tour
+(`num_turns: 0`). `num_turns >= 1` est donc le signal « la commande a tourné ».
+
+| Cellule | `/dataviz` | `/probe-heavy` | `/no-such-command-anywhere` (contrôle négatif) |
+|---|:--:|:--:|:--:|
+| control | a tourné (1 tour) | a tourné (1 tour) | jamais (0 tour) |
+| **`name-only`** | **a tourné (1 tour)** | **a tourné (1 tour)** | jamais (0 tour) |
+| `off` | jamais (0 tour) | jamais (0 tour) | jamais (0 tour) |
+
+Coût facturé : **0** dans les neuf cellules.
+
+**Sous `name-only`, `/nom` tourne encore ; sous `off`, la skill est aussi morte qu'une commande qui
+n'existe pas.** C'est la moitié « action bornée » d'ADR-0005, démontrée fonctionnellement et non
+déduite d'un inventaire.
+
+## 6. Instrument C — la mesure sur le fil
 
 Deux bras live, ne différant **que** par `<arm>/.claude/settings.json` (canal `CLAUDE_CONFIG_DIR`),
 même cwd, même prompt canonique de B2, lancés séquentiellement, un run par bras.
@@ -228,16 +253,22 @@ donc déjà voir, dans `floor --detail`, une skill en usage grossie des octets d
 Corrigé dans `src/floor-catalog.js` par un motif tenté **avant** le motif bulleté :
 
 ```js
-const NAME_ONLY_ENTRY = /^-\s+([A-Za-z0-9_.:-]+)\s*$/;
+const NAME_ONLY_ENTRY = /^-\s+([A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)\s*$/;
 ```
 
 Le discriminant est volontairement serré — **un seul token nu après le tiret, sans espace** — pour
 qu'une ligne de continuation en prose commençant par `- ` continue de se replier dans l'entrée du
-dessus. Les deux propriétés sont figées par test (`test/floor.test.js`, « a name-only skill is its
-own entry » et « a bulleted description is never mistaken for a name-only entry »). Le motif tolère
-le deux-points **à l'intérieur** du token, si bien qu'un nom qualifié (`plugin:skill` — la forme que
-la troncature budgétaire peut produire sur une skill de plugin) reste entier au lieu d'être coupé à
-son deux-points.
+dessus. Le deux-points peut **joindre** deux tokens, si bien qu'un nom qualifié (`plugin:skill` — la
+forme que la troncature budgétaire peut produire sur une skill de plugin) reste entier au lieu
+d'être coupé par le motif bulleté ; il ne peut pas **traîner**, car `- tdd:` est une skill à
+description vide, qui relève du motif bulleté — celui-ci détache le deux-points du nom. Laisser le
+motif `name-only` l'attraper nommerait cette entrée `tdd:` et casserait la jointure entre deux
+captures de la même skill : exactement la jointure sur laquelle tourne un diff avant/après
+d'override.
+
+Les trois propriétés sont figées par test (`test/floor.test.js`) : « a name-only skill is its own
+entry », « a bulleted description is never mistaken for a name-only entry », « an empty description
+is still a named entry, colon not swallowed ».
 
 ## 8. Ce qui reste ouvert
 
@@ -249,10 +280,15 @@ son deux-points.
    c'est précisément ce contournement qui devrait descendre dans `computeFloor`.
 2. **L'exemption plugin reste statique** (§2). Si #119 veut une preuve sur le fil, il lui faut un
    plugin installé sur le poste de mesure.
-3. **La mesure n'a été faite que sur 2.1.224.** Les lectures statiques couvrent 2.1.220 et 2.1.224 ;
+3. **Un correctif de parseur a été livré dans une tranche « préalable ».** `NAME_ONLY_ENTRY` est du
+   code de production, alors que #115 ne demandait qu'une note. C'est assumé : la mesure était
+   inexploitable sans lui, et le défaut atteint déjà les utilisateurs par le budget de catalogue
+   (§7). Mais c'est bien du périmètre en plus, à relire comme tel plutôt qu'à laisser passer avec la
+   note.
+4. **La mesure n'a été faite que sur 2.1.224.** Les lectures statiques couvrent 2.1.220 et 2.1.224 ;
    le code de rendu du §4 est identique dans les deux, donc rien ne laisse attendre un delta
    différent. À re-mesurer si le bench dégèle sa version épinglée.
-4. **Un run par bras.** Le plancher de bruit mesuré en B2 est de 0 o entre deux runs identiques,
+5. **Un run par bras.** Le plancher de bruit mesuré en B2 est de 0 o entre deux runs identiques,
    ce qui autorise le run unique ; les deltas relevés ici (−1 147 o sur une entrée) sont de toute
    façon hors de portée du bruit.
 
