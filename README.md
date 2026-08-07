@@ -203,6 +203,8 @@ Commands:
              --session <id>       session to score (default: latest)
              --latest             most-recent session (same as the default; no corpus mode)
              --window <tokens>    context window for the headline % (default 200000)
+             --detail             break the catalog blocks (deferred tools, agent types,
+                                  skills) down to their per-entry byte cost
   lifetime  Effective context-lifetime metric for one captured session (compaction count,
            turns/wall-time to the first compaction, per-event bytes-dropped)
              --root <path>        capture root (default ./.ccsnoop)
@@ -438,6 +440,26 @@ Per-block attribution — ranked by byte cost (proxy)
   system            …       …
   tools             …       …
   …
+```
+
+Three of those blocks are **catalogs** Claude Code injects as `<system-reminder>`s: the
+deferred-tools listing, the agent-types catalog and the skills catalog. `floor` names each
+one separately rather than folding them into a single opaque "MCP deferred listing" row —
+the old name sent people hunting an MCP server that was often not configured at all, and
+two of the three used to be missing from the floor entirely. `--detail` drills each catalog
+down to its per-entry byte cost, so you can see which individual skills, agent types and
+deferred tools you are paying for on every single turn:
+
+```console
+$ ccsnoop floor --detail
+…
+Per-entry breakdown (--detail) — percentages are of the block, not the floor
+
+  skills — Skill tool catalog  (12)               5.0K       5%
+      · dataviz                                   1.1K      23%
+      · claude-api                                1.1K      21%
+      …
+      · (headers, separators, envelope)            225       4%
 ```
 
 `floor` is the measurement behind `verify`, and the "incompressible system floor" lever

@@ -35,6 +35,7 @@
 import { loadSession, resolveRoots, listSessions, pickLatestSession, parseRequestBlob } from './report.js';
 import { computeGain } from './finetune-gain.js';
 import { NULL_SOURCE } from './finetune-levers.js';
+import { findCatalogBlocks, parseCatalogEntries } from './floor-catalog.js';
 
 /**
  * The context window the headline % is scored against. The standard Claude window
@@ -74,11 +75,12 @@ export function fmtTokens(n) {
 
 /**
  * @typedef {object} FloorBlock
- * @property {'tool'|'claude-md'|'hook'|'mcp-deferred'|'harness'} kind  The contributor class.
- * @property {string} label   Short human label (tool name, or the lever name).
+ * @property {'tool'|'claude-md'|'hook'|'mcp-deferred'|'deferred-tools'|'agent-types'|'skills-catalog'|'harness'} kind  The contributor class.
+ * @property {string} label   Short human label (tool name, or the lever/catalog name).
  * @property {string | null} detail  Per-file source for CLAUDE.md; null otherwise.
  * @property {number} bytes          The turn-1 byte cost (proxy).
  * @property {number} pctOfFloor     round(bytes / totalBytes * 100); 0 when the floor is empty.
+ * @property {{ name: string, bytes: number, group?: 'tools'|'servers'|null }[] | null} [entries]  Per-entry breakdown for catalog blocks (issue #109), shown by `--detail`; null/absent otherwise.
  */
 
 /**
@@ -110,6 +112,19 @@ export function fmtTokens(n) {
  * tools[]/system[] (a degraded capture), to pick a substantial request over a tiny one.
  */
 const TURN1_BYTE_FLOOR = 4096;
+
+/**
+ * The `label` field carried by each catalog block. `verify` matches contributors across
+ * two sessions on `(kind, label, detail)`, so these strings are part of that identity and
+ * must stay stable — they are the catalog equivalent of a tool block's tool name. The
+ * longer display string lives in {@link blockLabel}.
+ * @type {Record<'deferred-tools' | 'agent-types' | 'skills-catalog', string>}
+ */
+const CATALOG_LABEL = {
+  'deferred-tools': 'deferred tools',
+  'agent-types': 'agent types',
+  'skills-catalog': 'skills',
+};
 
 /**
  * Whether an exchange ships the static floor — a non-empty `tools[]` and/or `system[]`
@@ -206,8 +221,10 @@ export function computeFloor(model, opts = {}) {
   // `windowTokens` is positive by construction above, so tokens is the only null case.
   const pctOfWindow = tokens === null ? null : Math.round((tokens / windowTokens) * 100);
 
+  const turn1Body = parseRequestBlob(turn1?.requestBlob ?? '').json;
+
   // ── per-block attribution: one block per contributor, then rank by byte cost ─
-  /** @type {{ kind: FloorBlock['kind'], label: string, detail: string | null, bytes: number }[]} */
+  /** @type {{ kind: FloorBlock['kind'], label: string, detail: string | null, bytes: number, entries?: FloorBlock['entries'] }[]} */
   const blocks = [];
   // Tools — one block PER tool (gain.tool holds ALL shipped tools, not only denied).
   for (const [name, g] of gain.tool) {
@@ -225,11 +242,40 @@ export function computeFloor(model, opts = {}) {
   if (gain.hook.shipped > 0) {
     blocks.push({ kind: 'hook', label: 'SessionStart hook', detail: null, bytes: gain.hook.shipped });
   }
-  if (gain.mcp.shipped > 0) {
+
+  // Catalog populations (issue #109) — the deferred-tools listing, the agent-types
+  // catalog and the skills catalog, each as its own named, byte-costed row. `floor`
+  // detects these itself ({@link module:floor-catalog.findCatalogBlocks}) instead of
+  // reading `gain.mcp`, because two of the three are INVISIBLE to the gain model: they
+  // ride `messages[*].content`, classify to `harness`, and `chargeExchange` charges
+  // harness only on the `system` surface — so they contributed zero bytes. Making them
+  // visible RAISES the floor total; that is the correctness half of #109.
+  const catalogs = findCatalogBlocks(turn1Body);
+  // Each catalog block reports which existing row already carries its bytes, so a
+  // population is counted exactly once: `mcp` means it IS the `gain.mcp` block (drop
+  // that row — the catalogs replace it), `harness` means it is inside the system[]
+  // preamble figure (deduct it), null means it was previously uncounted (pure gain).
+  const replacesMcp = catalogs.some((c) => c.chargedTo === 'mcp');
+  const takenFromHarness = catalogs.reduce((s, c) => (c.chargedTo === 'harness' ? s + c.bytes : s), 0);
+
+  // The opaque `mcp-deferred` row survives ONLY as the fallback for a capture whose
+  // deferred listing the shared classifier recognizes but whose headers this build of
+  // Claude Code words differently — better one coarse row than a silently dropped one.
+  if (gain.mcp.shipped > 0 && !replacesMcp) {
     blocks.push({ kind: 'mcp-deferred', label: 'MCP deferred listing', detail: null, bytes: gain.mcp.shipped });
   }
-  if (gain.harness.shipped > 0) {
-    blocks.push({ kind: 'harness', label: 'system[] preamble', detail: null, bytes: gain.harness.shipped });
+  const harnessBytes = Math.max(0, gain.harness.shipped - takenFromHarness);
+  if (harnessBytes > 0) {
+    blocks.push({ kind: 'harness', label: 'system[] preamble', detail: null, bytes: harnessBytes });
+  }
+  for (const c of catalogs) {
+    blocks.push({
+      kind: c.kind,
+      label: CATALOG_LABEL[c.kind],
+      detail: null,
+      bytes: c.bytes,
+      entries: parseCatalogEntries(c.kind, c.text).sort((a, b) => b.bytes - a.bytes),
+    });
   }
 
   const totalBytes = blocks.reduce((s, b) => s + b.bytes, 0);
@@ -278,6 +324,15 @@ export function blockLabel(a) {
       return 'hook — SessionStart output';
     case 'mcp-deferred':
       return 'MCP — deferred tool listing';
+    // The three catalog populations #109 split that opaque row into. None says "MCP":
+    // the listing costs bytes whether or not a single MCP server is configured, and the
+    // old name sent users hunting one that was not there.
+    case 'deferred-tools':
+      return 'deferred tools — ToolSearch listing';
+    case 'agent-types':
+      return 'agent types — Agent tool catalog';
+    case 'skills-catalog':
+      return 'skills — Skill tool catalog';
     case 'harness':
       return 'harness — system[] preamble';
     default:
@@ -313,10 +368,16 @@ function tableRow(block, bytesCell, pctCell) {
  * the context, get back the lines. Mirrors the shape of `renderFineTune` /
  * `renderCache`.
  *
+ * `opts.detail` appends the per-entry breakdown of the catalog blocks (issue #109) as a
+ * SEPARATE section below the total, never as extra rows inside the ranked table — the
+ * table stays one row per floor block, so its columns and its 100% total keep meaning
+ * what they meant.
+ *
  * @param {FloorContext} ctx
+ * @param {{ detail?: boolean }} [opts]
  * @returns {{ lines: string[] }}
  */
-export function renderFloor(ctx) {
+export function renderFloor(ctx, opts = {}) {
   /** @type {string[]} */
   const lines = [];
   const turnLbl = ctx.turns > 0 ? `turn 1 of ${ctx.turns}` : 'turn 1 (no exchanges)';
@@ -355,7 +416,44 @@ export function renderFloor(ctx) {
     lines.push(`  ${RULE}`);
     lines.push(tableRow('total', fmtBytes(ctx.totalBytes), '100%'));
   }
+  if (opts.detail) lines.push(...renderDetail(ctx));
   return { lines };
+}
+
+/**
+ * The `--detail` section: for each catalog block, its entries ranked by byte cost, with
+ * the percentages taken against THAT BLOCK (an entry is a fraction of its catalog, not of
+ * the floor — at floor scale every entry would round to 0%). Entry bytes are raw text
+ * lengths and so always sum to less than the block's canonical bytes; the shortfall is
+ * shown as an explicit remainder row rather than left as an unexplained gap.
+ * @param {FloorContext} ctx
+ * @returns {string[]}
+ */
+function renderDetail(ctx) {
+  const withEntries = ctx.attribution.filter((a) => a.entries && a.entries.length > 0);
+  /** @type {string[]} */
+  const lines = ['', 'Per-entry breakdown (--detail) — percentages are of the block, not the floor'];
+  if (withEntries.length === 0) {
+    lines.push('  (no catalog blocks in this floor — nothing to break down)');
+    return lines;
+  }
+  for (const a of withEntries) {
+    const entries = /** @type {NonNullable<FloorBlock['entries']>} */ (a.entries);
+    const pct = (n) => (a.bytes > 0 ? `${Math.round((n / a.bytes) * 100)}%` : '0%');
+    lines.push('');
+    lines.push(tableRow(`${blockLabel(a)}  (${entries.length})`, fmtBytes(a.bytes), `${a.pctOfFloor}%`));
+    let accounted = 0;
+    for (const e of entries) {
+      accounted += e.bytes;
+      // A connecting MCP server rides the same listing as the deferred built-in tools;
+      // marking it keeps the two populations legible in one list.
+      const name = e.group === 'servers' ? `${e.name} (mcp server)` : e.name;
+      lines.push(tableRow(`    · ${name}`, fmtBytes(e.bytes), pct(e.bytes)));
+    }
+    const rest = a.bytes - accounted;
+    if (rest > 0) lines.push(tableRow('    · (headers, separators, envelope)', fmtBytes(rest), pct(rest)));
+  }
+  return lines;
 }
 
 /**
@@ -366,7 +464,7 @@ export function renderFloor(ctx) {
  * is a no-op (the default already is latest). An offline reader of `sessions/`; the
  * daemon is not required.
  *
- * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, windowTokens?: number }} [opts]
+ * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, windowTokens?: number, detail?: boolean }} [opts]
  * @returns {FloorContext & { lines: string[] }}
  */
 export function floor(opts = {}) {
@@ -391,6 +489,6 @@ export function floor(opts = {}) {
 
   const model = loadSession(chosen.dir, chosen.id);
   const ctx = computeFloor(model, { windowTokens: opts.windowTokens });
-  const { lines } = renderFloor(ctx);
+  const { lines } = renderFloor(ctx, { detail: opts.detail });
   return { ...ctx, lines };
 }

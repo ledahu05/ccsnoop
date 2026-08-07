@@ -390,6 +390,7 @@ function runFloor(args) {
     sessionsDir: getFlag(args, '--sessions-dir'),
     session: getFlag(args, '--session'),
     windowTokens: getWindowFlag(args),
+    detail: hasFlag(args, '--detail'),
   });
   for (const line of result.lines) console.log(line);
 }
@@ -595,6 +596,8 @@ Commands:
              --session <id>       session to score (default: latest)
              --latest             most-recent session (same as the default; no corpus mode)
              --window <tokens>    context window for the headline % (default 200000)
+             --detail             break the catalog blocks (deferred tools, agent types,
+                                  skills) down to their per-entry byte cost
   lifetime  Effective context-lifetime metric for one captured session (compaction count,
            turns/wall-time to the first compaction, per-event bytes-dropped)
              --root <path>        capture root (default ./.ccsnoop)
