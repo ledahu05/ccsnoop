@@ -45,6 +45,7 @@ a consumer from it.
 | ------ | -------------------- |
 | **[#116](https://github.com/ledahu05/ccsnoop/issues/116)** — `catalog` added; `safeLevers[mcp].shipped` **narrowed** to the connecting-servers sub-list. | ⚠ **Behavioural, not just additive.** `safeLevers[mcp].shipped` used to carry the *whole* deferred listing — the built-in tool names, and on some captures the agent-types and skills catalogs riding the same block. It now carries only the "MCP servers still connecting" sub-list, so **a session with no MCP server reports `0`** where it previously reported tens of kilobytes. That is the intended correction: no MCP setting could ever have recovered those bytes. A consumer that read `gain.mcp` / `safeLevers[mcp].shipped` to describe the catalog must read [`catalog`](#catalog) instead. **`totals.shipped` also GROWS**: the agent-types and skills catalogs ride `messages[0].content`, where the old model dropped them as conversation — they contributed zero. Naming them is what makes them countable (+7.8 KB on the reference capture). `totals.recoverable` is unaffected. |
 | **[#118](https://github.com/ledahu05/ccsnoop/issues/118)** — `safeLevers` gains a third entry, `skills`; `settings.auto` gains `skillOverrides` (a MAP, the first non-array safe key). | **Additive, with one thing to not double-count.** `safeLevers[skills].shipped` is the same measurement as `catalog.populations[skills-catalog].shipped` — the lever acts on those bytes, it does not add new ones, and `totals.shipped` counts them once through `catalog`. `totals.recoverable` GROWS when the verdict fires: it now includes the descriptions the emitted `name-only` entries stop shipping (capped by what the catalog block actually re-pays). A consumer that writes `settings.auto` must handle a map-valued key: merge entry by entry, never overwrite an entry the user already set, and refuse a value outside `on` / `name-only` / `user-invocable-only` / `off`. The `catalog` section still carries no verdict. |
+| **[#119](https://github.com/ledahu05/ccsnoop/issues/119)** — `adviceLevers` gains `pluginSkills` and `bundledSkills`; `settings.advice` gains `disableBundledSkills`; `safeLevers[skills].items[]` gains `scope` / `scopeKind` / `bundled`. | **Additive.** `adviceLevers` grows from 2 entries to 4 — a consumer that indexed it positionally (`adviceLevers[0]` = hooks) still works, but one that assumed a length of 2 does not; read by `lever`. `totals.recoverable` and `totals.shipped` are **unchanged**: 5b's bytes are the skills catalog's, already counted once through `catalog`, and its actions are unbounded so their recovery is never claimed in the headline. `settings.advice` may now carry a **boolean-valued** key (`disableBundledSkills: true`) — a consumer that assumed every advice value is an array or object must widen. `enabledPlugins` is never emitted anywhere — `adviceLevers[pluginSkills].names` is always `[]` and the actionable plugins are in a sibling `plugins` field. |
 | **[#117](https://github.com/ledahu05/ccsnoop/issues/117)** — the message surface is charged by **lever**, not by position; the header-less MCP fallback now needs the `<system-reminder>` envelope there. | Additive in the normal case, **narrowing in one**: a turn-1 *user message* that merely names an `mcp__<server>__<tool>` used to be swept into `safeLevers[mcp].shipped` by the coarse fallback, because the marker is a bare tool name with no header to key on. On the `messages[*]` surface that fallback is now trusted only inside the `<system-reminder>` envelope Claude Code wraps its injections in, so prose about an MCP tool contributes `0` instead of the whole message. A real listing — headers recognized, or an unrecognized one still wrapped — is unaffected, and the `system[]` surface is unchanged (nothing there is conversation). `totals.recoverable` can only shrink, never grow, from this. |
 
 ### Reuse by `floor --json`
@@ -111,14 +112,18 @@ places:
 | ---- | ------ | --- | ------------ |
 | **safe** (auto-writable) | `tools`, `mcp`, `skills` | Carry **dynamic proof** — a pre-validated denylist; sent-vs-used across a corpus; a skills catalog shipped for sessions and never model-invoked. May be auto-applied on approval. | `settings.auto` |
 | **advice** (paste-only) | `hooks`, `claudeMd` | **No dynamic proof** — injected every session by construction. The skill surfaces them; it never writes them. | `settings.advice` |
+| **advice** (paste-only) | `pluginSkills`, `bundledSkills` | **Proof, but an unbounded action** (ADR-0005 lever 5b). `enabledPlugins` cuts a whole plugin; `disableBundledSkills` is all-or-nothing *and* costs `/name`. Boundedness sets the tier, and the reach of the action enters it as much as the evidence. | `settings.advice` (`disableBundledSkills` only) |
 
 - **`safeLevers`** — `[tools, mcp, skills]`. Each entry has `tier: "safe"`.
-- **`adviceLevers`** — `[hooks, claudeMd]`. Each entry has `tier: "advice"`.
+- **`adviceLevers`** — `[hooks, claudeMd, pluginSkills, bundledSkills]`. Each entry has
+  `tier: "advice"`.
 - **`settings.auto`** — the keys the skill may **write** to `settings.json` on explicit
   approval of a presented diff (`permissions.deny`, `disabledMcpjsonServers`,
   `skillOverrides`).
 - **`settings.advice`** — the keys the skill must only surface **paste-ready**
-  (`hooks.SessionStart`, `claudeMdExcludes`); never written.
+  (`hooks.SessionStart`, `claudeMdExcludes`, `disableBundledSkills`); never written.
+  `enabledPlugins` appears in **neither** block: ccsnoop reports what a plugin costs and
+  which of its skills are in use, and leaves the call to you.
 
 **Invariant:** `settings.auto ∪ settings.advice` reconstructs the exact paste-ready
 block the text renderer emits. The contract serializes a distinction the code already
@@ -303,6 +308,73 @@ sources above the floor. Never "unused".
 - `items` — per source `{ source, shipped, waste, excludable, deny, pctOfSystem }`.
   `source` is `null` for a managed/policy block (inexcludable → `deny: false`).
 
+### `pluginSkills` (advice)
+
+The **plugin signalement** ([ADR-0005](adr/0005-skills-catalog-lever-name-only.md) lever
+5b, [#119](https://github.com/ledahu05/ccsnoop/issues/119)). Same population as the safe
+`skills` lever, same proof — and still advice, because the only action reaches too far:
+no `skillOverrides` entry touches a plugin skill (the resolver returns `"on"` for
+`source === "plugin"` before reading settings), and `enabledPlugins` cuts the **whole
+plugin**, the skills in active use included. This is the case that restated ADR-0004's
+axis: the tier is set by whether a false positive is *bounded*, and the reach of the
+**action** enters that as much as the evidence.
+
+- **It emits no settings key at all** — not in `auto`, and not in `advice` either. Which
+  plugin to keep is a judgment about the skills still in use; offering a value, even
+  paste-ready, would be advice ccsnoop cannot back.
+- `items` — one group per scope, ranked `deadBytes`-descending:
+  `{ plugin, kind, action, shippedSkills, invokedSkills, bytes, deadBytes, skills[] }`.
+  - `kind: "plugin"` carries `action: "enabledPlugins"`; `kind: "directory"` (a
+    path-qualified, directory-scoped skill) carries `action: null` — no settings key
+    disables a directory scope.
+  - `skills[]` — `{ name, skill, bytes, shippedSessions, invokedCount, invoked }`, ranked
+    bytes-descending. The **invoked** ones are listed too, on purpose: they are what
+    disabling the plugin would cost.
+  - `bytes` — what the scope costs on every turn 1, and what disabling it actually
+    **recovers**: all of it, invoked skills included.
+  - `deadBytes` — Σ **whole** entry bytes over the never-invoked skills: the part of
+    `bytes` recoverable *without* losing a skill the model uses. The gap between the two
+    **is the price of the action**, which is why both are reported. (Disabling removes the
+    entry; it does not trim it to `- <name>` the way `name-only` does.)
+- `names` — **always `[]`**. On every other lever `names` is "the names this lever writes",
+  and this one writes nothing; a consumer walking `names` across the levers must find
+  nothing here. The plugins that *have* an action behind them are in **`plugins`**
+  (directory scopes are excluded — they have none).
+- **Not in `totals.recoverable`.** The action prices a cost that is not measured in bytes.
+
+### `bundledSkills` (advice)
+
+The **bundled bulk** — `disableBundledSkills`, offered **only** when the corpus clears the
+same ≥ 3-session guard *and* **not one** skill of the bundled population was model-invoked.
+One invoked bundled skill and the option is withheld: the all-or-nothing gesture then costs
+more than it returns, and per-name `name-only` (the safe `skills` lever) applies instead —
+a `skillOverrides` entry *does* reach a bundled skill (ADR-0005 fact 3).
+
+Bundled skills are therefore **recoverable context, not part of the incompressible floor**
+— point 7 of [#105](https://github.com/ledahu05/ccsnoop/issues/105) answered in the
+negative. `floor.shipped` is the harness `system[]` preamble alone; these bytes live in
+`catalog.populations[skills-catalog]`.
+
+- `verdict` — `"bulk"` when offered, `"none"` otherwise. `reason` says which, in words.
+- `names` — **every** bundled skill it would drop, ranked bytes-descending, populated
+  whether or not the bulk is offered.
+- `shipped` — Σ **whole** entry bytes of those skills (the bulk removes them entirely).
+- `caveat` — it also removes **`/name`** on every bundled skill, not just their
+  descriptions (measured; ADR-0005 amendment, correction 2).
+- `guard` — `{ sessionCount, minSessions, singleSession }`, the skills lever's verbatim.
+- `roster` — `{ size, source, readOn, error }`. **Bundled is a NAME test.** A capture carries names and
+  descriptions, never a `source` marker, so the population is identified against ccsnoop's
+  versioned `data/bundled-skills.json` — the same discipline as the built-in denylist. A
+  name absent from the roster is *"not known to be bundled"*, never *"not bundled"*, which
+  is why the verdict always names its whole population, and why `readOn` (the Claude Code
+  builds the roster was read on) travels with it: on a newer build that list is what lets
+  you catch the drift before acting. `error` is non-null when the roster failed to load —
+  which the `reason` then reports as *"ccsnoop could not check"*, never as "nothing is
+  bundled". An unreadable roster degrades this one verdict; it never fails the run.
+- **Not in `totals.recoverable`.** These are the same entries the safe `skills` lever
+  already claims under a gentler action; counting both would double-count one catalog
+  against itself.
+
 ---
 
 ## `settings`
@@ -311,7 +383,8 @@ sources above the floor. Never "unused".
 "settings": {
   "auto":   { "permissions": { "deny": [...] }, "disabledMcpjsonServers": [...],
               "skillOverrides": { "<skill>": "name-only" } },                     // safe — may write
-  "advice": { "hooks": { "SessionStart": [] }, "claudeMdExcludes": [...] }          // advice — paste only
+  "advice": { "hooks": { "SessionStart": [] }, "claudeMdExcludes": [...],
+              "disableBundledSkills": true }                                       // advice — paste only
 }
 ```
 
@@ -326,6 +399,12 @@ Key-presence rules (identical to the text renderer's block):
   `off`) is refused rather than written.
 - `hooks.SessionStart` — only in `advice` when the hook is above-floor.
 - `claudeMdExcludes` — only in `advice` when ≥ 1 excludable source is above-floor.
+- `disableBundledSkills` — only in `advice`, and only when the bundled bulk is **offered**
+  (`adviceLevers[bundledSkills].verdict === "bulk"`). It is the one 5b half with a
+  determinate value; `enabledPlugins` never appears in either block.
+- **Neither `disableBundledSkills` nor `enabledPlugins` may ever appear in `auto`.** The
+  writer refuses unknown top-level keys, so a report that misplaced one is rejected rather
+  than written — the tier boundary is a property of `apply`, not only of the emitter.
 
 The skill merges `settings.auto` into the project's `settings.json` on approval
 (idempotent, strict read-modify-write — never overwrite, never touch `.ccsnoop/`

@@ -43,7 +43,12 @@ Recoverable (waste, conservative): ~<n> bytes
 ## What it emits — and when
 
 Below the table, `fine-tune` prints a clean, comment-free `settings.json` block. Each
-key appears **only when its lever actually acts** — no empty keys:
+key appears **only when its lever actually acts** — no empty keys.
+
+The block mixes both tiers, so a line **beside** it (never inside — that would break the
+paste) names the keys `ccsnoop apply` will *not* write, whatever you approve. Read it: a
+proven `permissions.deny` and an all-or-nothing `disableBundledSkills` are not equally
+settled, and one column would make them look it.
 
 - **`permissions.deny`** — **always present.** The bare tool names that are the
   intersection of what the session *shipped* with the built-in denylist
@@ -62,12 +67,55 @@ key appears **only when its lever actually acts** — no empty keys:
   `name-only` leaves `/name` working: the skill stays listed and fully invocable, only its
   description stops shipping. **`off` is never emitted.** A scope-qualified skill
   (`plugin:name`) is reported with its cost and never written: no `skillOverrides` entry
-  reaches a plugin skill.
+  reaches a plugin skill — see the two advice-tier sections below.
+- **`disableBundledSkills`** (set to `true`) — the bundled bulk, **advice only**
+  (ADR-0005 lever 5b). Offered *only* when the corpus clears the same ≥ 3-session guard
+  **and not one** of the skills Claude Code ships itself was model-invoked. One invoked
+  bundled skill and the option is withheld, because the gesture is all-or-nothing: from
+  there it is per-name `name-only` that applies (a `skillOverrides` entry *does* reach a
+  bundled skill). It is paste-only in every case, and it carries a caveat — it removes
+  **`/name` on every bundled skill too**, not just their descriptions.
+  Bundled is a **name** test against ccsnoop's versioned `data/bundled-skills.json` (the
+  wire carries no source marker), so the section quotes the roster's provenance and names
+  every skill it would drop: on a Claude Code build newer than the roster, that list is
+  what lets you catch the drift. An unreadable roster degrades this one verdict — which
+  then reports *"ccsnoop could not check"* — and never fails the run.
 - **`hooks.SessionStart`** (set to `[]`) — **only** when a `SessionStart` hook shipped
   ≥ 4096 bytes. It carries the caveat `intent unknown — injected every session; review
   before applying`, because a hook may be load-bearing and `fine-tune` cannot tell.
 - **`claudeMdExcludes`** — source paths, **only** for *excludable* (non-managed)
   CLAUDE.md sources above the floor.
+
+### Plugin skills — measured and named, never written
+
+One key is deliberately **absent** from every block ccsnoop emits: `enabledPlugins`.
+
+A plugin skill carries exactly the same proof as a `name-only` verdict — shipped on every
+turn 1 across the corpus, never invoked by the model — but no `skillOverrides` entry
+reaches it (Claude Code's resolver returns `"on"` for a plugin skill before it reads
+settings at all). The only knob is `enabledPlugins`, and it cuts the **whole plugin**,
+including the skills you do use. That is an unbounded action on good evidence, so
+[ADR-0004](adr/0004-skill-auto-applies-safe-levers.md) keeps it out of the safe tier —
+and ccsnoop does not even offer a value to paste, because *which* plugin to keep is a
+judgment about the skills still in use, not a measurement.
+
+What you get instead is the **signalement**, per plugin and per skill:
+
+```
+Scoped skills (advice — enabledPlugins is yours to decide; ccsnoop never writes it):
+  mattpocock-skills                       1.9K  12 skills, 1 invoked · 1.7K dead · enabledPlugins: mattpocock-skills
+      code-review                          412  invoked 6× — cutting the plugin costs this
+      naming                               501  never invoked
+      …
+  Disabling a plugin recovers its whole cost AND its invoked skills; the dead bytes are the
+  loss-free part. Neither is in the recoverable headline: this action's price is not in bytes.
+```
+
+Both halves are shown on purpose. A verdict that named only the dead bytes would read as
+"uninstall this" — and cost you `code-review`.
+
+> A **directory-scoped** skill (`apps/web:deploy`) is listed qualified too and is grouped
+> the same way, but reports **no action**: no settings key disables a directory scope.
 
 > ### ⚠️ Applying the block invalidates the cache
 >
@@ -124,8 +172,9 @@ then your extras.
 For programmatic consumers — the [context-tuning skill](https://github.com/ledahu05/ccsnoop/issues/94)
 and any automation — pass `--json` to get a stable, versioned JSON contract instead of
 the text table. It carries the same verdicts, structured: each lever's `verdict`,
-`evidence`, and `action`; the **safe vs advice** tier split (safe = `tools` / `mcp`,
-auto-writable; advice = `hooks` / `claudeMd`, paste-only); and the `settings.auto` /
+`evidence`, and `action`; the **safe vs advice** tier split (safe = `tools` / `mcp` /
+`skills`, auto-writable; advice = `hooks` / `claudeMd` / `pluginSkills` /
+`bundledSkills`, paste-only); and the `settings.auto` /
 `settings.advice` partition of the paste-ready block. See
 [`tuning-report-schema.md`](tuning-report-schema.md) for the full schema.
 

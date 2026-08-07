@@ -1,0 +1,22 @@
+{
+  "note": "The skills Claude Code SHIPS ITSELF (source === \"builtin\") — the population `disableBundledSkills` (and CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1) removes. A wire capture carries only names and descriptions, never a source marker, so lever 5b (ADR-0005, issue #119) identifies the bundled population by NAME against this roster. A name absent from it is 'not known to be bundled', never 'not bundled' — read `provenance` before trusting the bulk verdict on a build newer than the ones below.",
+  "readOn": ["2.1.220", "2.1.224"],
+  "skills": [
+    { "name": "dataviz", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "update-config", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "keybindings-help", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "simplify", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "fewer-permission-prompts", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "loop", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "schedule", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "claude-api", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "run", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "init", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "review", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "security-review", "provenance": "wire (frozen bench fixture, 2.1.220 family)" },
+    { "name": "artifact-design", "provenance": "wire (2.1.224)" },
+    { "name": "artifact-diagramming", "provenance": "wire (2.1.224)" },
+    { "name": "artifact-capabilities", "provenance": "wire (2.1.224)" },
+    { "name": "claude-in-chrome", "provenance": "wire (2.1.224)" }
+  ]
+}

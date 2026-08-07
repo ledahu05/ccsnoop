@@ -38,8 +38,12 @@ import {
   EMPTY_SKILL_CORPUS,
   SKILLS_GUARD_MIN_SESSIONS,
   SKILL_OVERRIDE_ACTION,
+  PLUGIN_ACTION,
+  BUNDLED_BULK_ACTION,
   skillOverrideMap,
   skillRecoverableBytes,
+  pluginSkillGroups,
+  bundledBulkVerdict,
 } from './finetune-skills.js';
 
 /**
@@ -309,6 +313,12 @@ function buildSkillsEntry({ skills, gain, skillOverrides, skillsWaste }) {
     shippedSessions: s.shippedSessions,
     invokedCount: s.invokedCount,
     reachable: s.reachable,
+    // The join to the two advice-tier readings of this same population (lever 5b, #119):
+    // `scope`/`scopeKind` group the plugin signalement, `bundled` selects the bulk's
+    // population. Carried as fields so a consumer never re-parses a name to find them.
+    scope: s.scope ?? null,
+    scopeKind: s.scopeKind ?? null,
+    bundled: Boolean(s.bundled),
     override: s.override,
   }));
   const verdict = names.length > 0 ? SKILL_OVERRIDE_ACTION : items.length > 0 ? 'flag-only' : 'none';
@@ -343,6 +353,105 @@ function buildSkillsEntry({ skills, gain, skillOverrides, skillsWaste }) {
     waste: skillsWaste,
     names,
     items,
+  };
+}
+
+/**
+ * The plugin-skills lever (advice tier — ADR-0005 lever 5b, issue #119). Reports, per
+ * plugin AND per skill, what a plugin's catalog entries cost and which of them the model
+ * actually reached. It carries the SAME proof as the safe-tier skills lever and is still
+ * advice, because the only action — `enabledPlugins` — cuts the whole plugin including
+ * the skills in active use. ADR-0004's axis restated: boundedness sets the tier, and the
+ * reach of the ACTION enters that as much as the evidence.
+ *
+ * It emits no settings key at all, not even a paste-ready one: which plugins to keep is a
+ * judgment about the ones still in use, and ccsnoop has no basis for it. `deadBytes` is
+ * what disabling would recover; it is deliberately absent from `totals.recoverable`.
+ *
+ * @param {{ skills: import('./finetune-skills.js').SkillCorpus }} ctx
+ */
+function buildPluginSkillsEntry({ skills }) {
+  const items = pluginSkillGroups(skills);
+  return {
+    lever: 'pluginSkills',
+    population: SKILLS_CATALOG,
+    tier: 'advice',
+    verdict: items.length > 0 ? 'flag-only' : 'none',
+    action: PLUGIN_ACTION,
+    evidence:
+      'Same corpus proof as the skills lever (shipped across sessions, never model-invoked) ' +
+      '— but no skillOverrides entry reaches a plugin skill: the resolver returns "on" for ' +
+      'source === "plugin" before reading settings (ADR-0005 fact 2).',
+    caveat:
+      'enabledPlugins disables the WHOLE plugin, including the skills the model does use. ' +
+      'ccsnoop measures and names both halves; the decision is yours, and it is never written ' +
+      '— not even as a paste-ready value.',
+    scope:
+      'Grouped by the name\'s scope qualifier. kind: "plugin" has enabledPlugins behind it; ' +
+      'kind: "directory" (a path-qualified, directory-scoped skill) has no settings key at all ' +
+      'and carries action: null. Disabling a plugin recovers its WHOLE `bytes` and takes its ' +
+      'invoked skills with it; `deadBytes` is the loss-free part of that, not the recovery — ' +
+      'the gap between the two IS the price. Neither is in totals.recoverable: the action ' +
+      'prices a cost that is not measured in bytes.',
+    shipped: items.reduce((s, g) => s + g.bytes, 0),
+    waste: 0,
+    // `names` is "the names this lever writes" on every other entry, and this one writes
+    // nothing — so it stays empty, and the plugins that HAVE an action behind them get a
+    // key of their own. A consumer walking `names` to build a settings block must find
+    // nothing here, whatever it does with the report.
+    names: [],
+    plugins: items.filter((g) => g.action !== null).map((g) => g.plugin),
+    items,
+  };
+}
+
+/**
+ * The bundled-skills bulk lever (advice tier — ADR-0005 lever 5b, issue #119).
+ * `disableBundledSkills` is offered ONLY when the entire bundled population shows no model
+ * invocation; one invoked bundled skill and lever 5a's per-name `name-only` applies
+ * instead (a `skillOverrides` entry does reach a bundled skill — ADR-0005 fact 3).
+ *
+ * Unlike the plugin half this DOES produce a paste-ready key (`settings.advice
+ * .disableBundledSkills`), because the value is determinate. It is still advice: the
+ * action is all-or-nothing and it removes `/name` on every bundled skill, not just the
+ * descriptions (ADR-0005 amendment, correction 2) — hence the caveat travels with it.
+ *
+ * @param {{ bulk: import('./finetune-skills.js').BundledBulkVerdict }} ctx
+ */
+function buildBundledSkillsEntry({ bulk }) {
+  return {
+    lever: 'bundledSkills',
+    population: SKILLS_CATALOG,
+    tier: 'advice',
+    verdict: bulk.offered ? 'bulk' : 'none',
+    action: BUNDLED_BULK_ACTION,
+    evidence:
+      'corpus guard: sessionCount >= 3 AND NOT ONE skill of the bundled population was ' +
+      'model-invoked. Bundled is a NAME test against ccsnoop\'s versioned roster ' +
+      '(data/bundled-skills.json) — the wire carries no source marker — so a name absent from ' +
+      'the roster is "not known to be bundled", never "not bundled" — so read `roster.readOn` ' +
+      'and check `names` against your own catalog before acting on a newer build.',
+    caveat: bulk.caveat,
+    scope:
+      'All-or-nothing over the bundled population, so it is offered only when that whole ' +
+      'population is dead. The bytes are WHOLE entries and are NOT in totals.recoverable: they ' +
+      'are the same entries the safe-tier skills lever already claims under a gentler action, ' +
+      'and counting both would double-count one catalog against itself. Bundled skills are ' +
+      'RECOVERABLE context, not part of the incompressible floor (ADR-0005 fact 3).',
+    guard: {
+      sessionCount: bulk.sessionCount,
+      minSessions: SKILLS_GUARD_MIN_SESSIONS,
+      singleSession: bulk.singleSession,
+    },
+    // Provenance, not decoration: `readOn` is what a reader on a newer Claude Code build
+    // needs to judge whether this population is still the whole of it, and `error` is what
+    // distinguishes "no bundled skills" from "ccsnoop could not check".
+    roster: bulk.roster,
+    reason: bulk.reason,
+    invokedSkills: bulk.invokedSkills,
+    shipped: bulk.bytes,
+    waste: 0,
+    names: bulk.names,
   };
 }
 
@@ -507,6 +616,12 @@ export function buildJsonReport(ctx, opts = {}) {
   const skillsEntry = buildSkillsEntry({ skills, gain, skillOverrides, skillsWaste });
   const hooksEntry = buildHooksEntry({ hook, gain });
   const claudeMdEntry = buildClaudeMdEntry({ levers, gain });
+  // Lever 5b (#119) — the same skills-catalog population, read twice more, in the tier
+  // where nothing can write it. Neither entry's bytes enter `totals.shipped` (they are the
+  // catalog's, counted once through `catalogEntry`) nor `totals.recoverable`.
+  const bulk = bundledBulkVerdict(skills);
+  const pluginSkillsEntry = buildPluginSkillsEntry({ skills });
+  const bundledSkillsEntry = buildBundledSkillsEntry({ bulk });
   const catalogEntry = buildCatalogEntry({ gain });
 
   // The skills lever is deliberately NOT summed here: its `shipped` is the skills-catalog
@@ -531,6 +646,10 @@ export function buildJsonReport(ctx, opts = {}) {
   const advice = {};
   if (hookDeny) advice.hooks = { SessionStart: [] };
   if (claudeMdExclude.length > 0) advice.claudeMdExcludes = [...claudeMdExclude];
+  // Lever 5b's bundled bulk is the only half with a determinate value to paste. The plugin
+  // half deliberately emits NO key: `enabledPlugins` is a judgment about the skills still
+  // in use, and offering a value — even paste-ready — would be advice ccsnoop cannot back.
+  if (bulk.offered) advice.disableBundledSkills = true;
 
   /** @type {Record<string, any>} */
   const report = {
@@ -544,7 +663,7 @@ export function buildJsonReport(ctx, opts = {}) {
     floor: { shipped: gain.harness.shipped, waste: null, action: 'none', note: FLOOR_NOTE },
     catalog: catalogEntry,
     safeLevers: [toolsEntry, mcpEntry, skillsEntry],
-    adviceLevers: [hooksEntry, claudeMdEntry],
+    adviceLevers: [hooksEntry, claudeMdEntry, pluginSkillsEntry, bundledSkillsEntry],
     settings: { auto, advice },
   };
 

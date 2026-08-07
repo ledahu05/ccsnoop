@@ -222,11 +222,22 @@ test('renderFineTune omits the cache warning when there is nothing to deny', () 
 // ── the skills lever in the text diagnostic (issue #118, ADR-0005 lever 5a) ───
 
 /** A skills corpus in the shape `aggregateSkillCorpus` emits. */
-function skillCorpus(skills, { sessionCount = 3, singleSession = false } = {}) {
+function skillCorpus(skills, { sessionCount = 3, singleSession = false, rosterSize = 0 } = {}) {
   return {
     sessionCount,
     singleSession,
-    skills: skills.map((s) => ({ reachable: true, shippedSessions: sessionCount, invokedCount: 0, override: true, ...s })),
+    roster: { size: rosterSize, source: rosterSize ? 'data/bundled-skills.json' : null, readOn: ['2.1.224'], error: null },
+    skills: skills.map((s) => ({
+      reachable: true,
+      shippedSessions: sessionCount,
+      invokedCount: 0,
+      override: true,
+      scope: null,
+      scopeKind: null,
+      bundled: false,
+      skill: s.name,
+      ...s,
+    })),
   };
 }
 
@@ -534,4 +545,144 @@ test('fineTune runs against the committed FT0 fixture (AC #1)', fixtureOpts, () 
     assert.deepEqual(res.deny, expected, `${id}: deny must equal the bare-name intersection`);
     assert.deepEqual(JSON.parse(res.settingsJson).permissions, { deny: expected });
   }
+});
+
+// ── lever 5b (issue #119) — the two advice sections, and point 3 ─────────────
+
+test('fixture: bundled skills are RECOVERABLE context, never part of the incompressible floor', () => {
+  // ADR-0005 fact 3, and point 3 of issue #119: #105 assumed the bundled scope was
+  // incompressible. It is not — `disableBundledSkills`, `CLAUDE_CODE_DISABLE_BUNDLED_SKILLS`
+  // and per-name `skillOverrides` all reach it. This freezes that nothing in the byte
+  // accounting quietly files them under the harness floor, where they would be shown as
+  // bytes no lever can ever touch.
+  const res = fineTune({ cwd: '/nonexistent', root: FIXTURES_DIR });
+  const bundled = res.skills.skills.filter((s) => s.bundled);
+  assert.ok(bundled.length > 0, 'the fixture ships a bundled catalog — otherwise this proves nothing');
+
+  const catalogBytes = res.gain.catalog.get('skills-catalog').shipped;
+  assert.ok(catalogBytes > 0, 'their bytes are charged to the skills-catalog population…');
+  assert.equal(res.json.catalog.populations.find((p) => p.population === 'skills-catalog').shipped, catalogBytes);
+  // …and the floor block is the harness preamble ALONE. If the catalog were folded in,
+  // `floor.shipped` would carry these bytes under `action: 'none'` — unrecoverable by
+  // construction, which is precisely the wrong answer.
+  assert.equal(res.json.floor.shipped, res.gain.harness.shipped);
+  assert.equal(res.json.floor.action, 'none');
+  assert.ok(res.json.floor.shipped > catalogBytes, 'sanity: the two are distinct populations');
+  // The proof that they are recoverable: lever 5a reaches every one of them by name.
+  for (const s of bundled) assert.equal(s.reachable, true, `${s.name} is reachable by skillOverrides`);
+});
+
+test('fixture: the bundled bulk is surfaced even when withheld, and names its whole population', () => {
+  // "No option shown" and "the option was withheld" are different facts, and only one of
+  // them means the catalog is already lean. The fixture is one session, so the guard
+  // withholds — and the section must still say so, and name what it would have dropped.
+  const res = fineTune({ cwd: '/nonexistent', root: FIXTURES_DIR });
+  const text = res.lines.join('\n');
+  assert.match(text, /Bundled skills \(advice — disableBundledSkills\)/);
+  assert.match(text, /not offered/);
+  assert.match(text, /dataviz/);
+  assert.match(text, /you lose \/name on each of them/, 'the caveat travels with the figure');
+  // Withheld ⇒ absent from the paste-ready block, and from the contract's advice settings.
+  assert.ok(!('disableBundledSkills' in JSON.parse(res.settingsJson)));
+  assert.ok(!('disableBundledSkills' in res.json.settings.advice));
+  assert.equal(res.json.adviceLevers.find((l) => l.lever === 'bundledSkills').verdict, 'none');
+});
+
+test('fixture: `apply` never touches a 5b key, whatever the report says', () => {
+  // The exit criterion of #119: `ccsnoop apply` must have no path, even accidental, to
+  // `enabledPlugins` or `disableBundledSkills`. The safe subset is the only thing it
+  // writes, and neither key can appear there.
+  const res = fineTune({ cwd: '/nonexistent', root: FIXTURES_DIR });
+  const auto = JSON.stringify(res.json.settings.auto);
+  assert.ok(!/disableBundledSkills|enabledPlugins/.test(auto), `safe subset leaked a 5b key: ${auto}`);
+});
+
+test('renderFineTune shows the plugin signalement in its own section, with BOTH halves', () => {
+  // The tier boundary has to be legible: what `apply` writes on approval (5a) and what is
+  // only shown (5b) must not read as one column. And a plugin's report must name the
+  // skills the model DOES use, because `enabledPlugins` would take them down too.
+  const { lines, settingsJson } = renderFineTune({
+    sessionId: 'sess-p',
+    requests: 4,
+    shipped: [],
+    deny: [],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    skills: skillCorpus([
+      { name: 'mattpocock-skills:code-review', skill: 'code-review', bytes: 900, scope: 'mattpocock-skills', scopeKind: 'plugin', reachable: false, invokedCount: 6, override: false },
+      { name: 'mattpocock-skills:naming', skill: 'naming', bytes: 501, scope: 'mattpocock-skills', scopeKind: 'plugin', reachable: false, override: false },
+    ]),
+  });
+  const text = lines.join('\n');
+  assert.match(text, /Scoped skills \(advice — enabledPlugins is yours to decide/);
+  assert.match(text, /mattpocock-skills\s+.*2 skills, 1 invoked/);
+  assert.ok(lines.some((l) => /code-review/.test(l) && /invoked 6×/.test(l)), 'the working skill is named');
+  assert.ok(lines.some((l) => /naming/.test(l) && /never invoked/.test(l)));
+  // Nothing written, and nothing offered to paste: the value is a judgment, not a figure.
+  assert.ok(!/enabledPlugins/.test(settingsJson));
+  assert.deepEqual(JSON.parse(settingsJson), { permissions: { deny: [] } });
+});
+
+test('renderFineTune offers the bundled bulk only when the whole population went un-invoked', () => {
+  const bundled = [
+    { name: 'dataviz', bytes: 1157, bundled: true },
+    { name: 'simplify', bytes: 191, bundled: true },
+  ];
+  const render = (skills) =>
+    renderFineTune({
+      sessionId: 'sess-b',
+      requests: 4,
+      shipped: [],
+      deny: [],
+      mcp: EMPTY_MCP_CORPUS,
+      gain: skillsGain(5119),
+      skills: skillCorpus(skills, { rosterSize: 16 }),
+    });
+
+  const dead = render(bundled);
+  assert.match(dead.lines.join('\n'), /would drop 2 skills/);
+  assert.equal(JSON.parse(dead.settingsJson).disableBundledSkills, true, 'paste-ready, never auto-written');
+
+  // One invoked bundled skill and the all-or-nothing gesture costs more than it returns:
+  // from there it is lever 5a's per-name `name-only` that applies.
+  const used = render([bundled[0], { ...bundled[1], invokedCount: 2, override: false }]);
+  assert.match(used.lines.join('\n'), /not offered — 1 bundled skill\(s\) were model-invoked/);
+  assert.ok(!('disableBundledSkills' in JSON.parse(used.settingsJson)));
+  assert.deepEqual(JSON.parse(used.settingsJson).skillOverrides, { dataviz: 'name-only' });
+});
+
+test('the paste-ready block names its ADVICE keys — the two tiers must not read as one column', () => {
+  // Issue #119's boundary requirement: what `apply` writes on approval and what is only
+  // shown must not read the same. The block itself stays pure JSON (that is what makes it
+  // pasteable), so the split is stated beside it — otherwise a proven deny and an
+  // all-or-nothing gesture that costs `/name` look equally settled.
+  const { lines } = renderFineTune({
+    sessionId: 'sess-t',
+    requests: 4,
+    shipped: [],
+    deny: ['Workflow'],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    levers: { systemBytes: 100, hook: { bytes: 8000, aboveFloor: true, deny: true }, claudeMd: [] },
+    skills: skillCorpus([{ name: 'dataviz', bytes: 1157, bundled: true }], { rosterSize: 16 }),
+  });
+  const label = lines.find((l) => /ADVICE/.test(l));
+  assert.ok(label, 'the advice keys are called out beside the block');
+  assert.match(label, /disableBundledSkills/);
+  assert.match(label, /hooks/);
+  assert.match(label, /will NOT write/);
+  assert.ok(!/permissions|skillOverrides/.test(label), 'the safe keys are not swept into the warning');
+});
+
+test('a block with only safe keys carries no advice warning — the label means something', () => {
+  const { lines } = renderFineTune({
+    sessionId: 'sess-t2',
+    requests: 4,
+    shipped: [],
+    deny: ['Workflow'],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    skills: skillCorpus([{ name: 'dataviz', bytes: 1157 }]),
+  });
+  assert.ok(!lines.some((l) => /ADVICE/.test(l)));
 });
