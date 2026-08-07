@@ -33,9 +33,14 @@ import { computeGain, EMPTY_GAIN, NULL_SOURCE } from './finetune-gain.js';
 import {
   sessionSkillProfile,
   aggregateSkillCorpus,
+  loadBundledSkillsOrEmpty,
+  pluginSkillGroups,
+  bundledBulkVerdict,
   EMPTY_SKILL_CORPUS,
   SKILL_OVERRIDE_ACTION,
   SKILLS_GUARD_MIN_SESSIONS,
+  BUNDLED_BULK_ACTION,
+  PLUGIN_ACTION,
 } from './finetune-skills.js';
 import { fitLabel } from './format.js';
 import { buildJsonReport, summarizeLevers, sumMcpServerBytes } from './finetune-json.js';
@@ -44,6 +49,15 @@ import { SKILLS_CATALOG } from './finetune-system.js';
 
 /** The single reused cost floor (spec §3.5) gating the hooks + CLAUDE.md levers. */
 const BLOAT_FLOOR = DEFAULT_WASTE_CONFIG.bloatFloorBytes;
+
+/**
+ * The keys of the paste-ready block that belong to the ADVICE tier — the ones `ccsnoop
+ * apply` will never write, whatever the user approves. The block itself is pure JSON (that
+ * is what makes it pasteable), so the split is stated in a line beside it; this constant is
+ * what that line reads. It mirrors `settings.advice` in the JSON contract — the same
+ * distinction, in the surface a human copies from.
+ */
+const ADVICE_BLOCK_KEYS = ['hooks', 'claudeMdExcludes', 'disableBundledSkills'];
 
 /**
  * A byte count as a compact human string (e.g. 8192 → "8.0K"). The diagnostic's
@@ -167,6 +181,74 @@ function buildByteCostRanking({ gain, levers, shipped, deny, mcpDeny }) {
   }
 
   return entries.sort((a, b) => b.shipped - a.shipped || b.waste - a.waste);
+}
+
+/**
+ * The plugin signalement (ADR-0005 lever 5b, issue #119) — per plugin AND per skill.
+ *
+ * A plugin skill is out of `skillOverrides`' reach, so lever 5a drops it from the diff.
+ * This is where it resurfaces with its cost. The section deliberately shows BOTH halves of
+ * each plugin — the skills the model reached and the ones it never did — because the only
+ * action, `enabledPlugins`, is whole-plugin: a verdict that named only the dead bytes
+ * would read as "uninstall this" and cost the working skills. ccsnoop states the two
+ * figures; the user decides, and ccsnoop never writes the key.
+ *
+ * Empty when the corpus ships no scope-qualified skill.
+ * @param {import('./finetune-skills.js').PluginSkillGroup[]} groups
+ * @returns {string[]}
+ */
+function renderPluginSkills(groups) {
+  if (groups.length === 0) return [];
+  const lines = ['', `Scoped skills (advice — ${PLUGIN_ACTION} is yours to decide; ccsnoop never writes it):`];
+  for (const g of groups) {
+    const knob = g.action ? `${PLUGIN_ACTION}: ${g.plugin}` : 'directory scope — no settings key disables it';
+    lines.push(
+      `  ${fitLabel(g.plugin, RANK.entry)} ${fmtBytes(g.bytes).padStart(RANK.bytes)}  ` +
+        `${g.shippedSkills} skill${g.shippedSkills === 1 ? '' : 's'}, ${g.invokedSkills} invoked · ` +
+        `${fmtBytes(g.deadBytes)} dead · ${knob}`
+    );
+    // Indented one level under its group, in the ranking table's own columns — a
+    // hardcoded width here would drift the moment RANK changes.
+    for (const s of g.skills) {
+      const detail = s.invoked ? `invoked ${s.invokedCount}× — cutting the plugin costs this` : 'never invoked';
+      lines.push(`      ${fitLabel(s.skill, RANK.entry - 4)} ${fmtBytes(s.bytes).padStart(RANK.bytes)}  ${detail}`);
+    }
+  }
+  lines.push('  Disabling a plugin recovers its whole cost AND its invoked skills; the dead bytes are the');
+  lines.push('  loss-free part. Neither is in the recoverable headline: this action’s price is not in bytes.');
+  return lines;
+}
+
+/**
+ * The bundled bulk (ADR-0005 lever 5b, issue #119) — `disableBundledSkills`.
+ *
+ * Offered ONLY when the entire bundled population went un-invoked; otherwise the section
+ * says why not, because "no option shown" and "the option was withheld" are different
+ * facts and only one of them means the catalog is already lean. Every bundled skill is
+ * NAMED whether or not the bulk is offered: bundled is a name test against a versioned
+ * roster, and naming the population is what lets a reader catch a stale one.
+ *
+ * Silent when the corpus ships no known-bundled skill at all.
+ * @param {import('./finetune-skills.js').BundledBulkVerdict} bulk
+ * @returns {string[]}
+ */
+function renderBundledBulk(bulk) {
+  if (bulk.names.length === 0) return [];
+  const head = bulk.offered
+    ? `would drop ${bulk.names.length} skills, ${fmtBytes(bulk.bytes)} — ${bulk.reason}`
+    : `not offered — ${bulk.reason}`;
+  const readOn = bulk.roster.readOn.length > 0 ? bulk.roster.readOn.join(', ') : 'unrecorded';
+  return [
+    '',
+    `Bundled skills (advice — ${BUNDLED_BULK_ACTION}): ${head}`,
+    `  ${bulk.names.join(', ')}`,
+    `  ⚠ ${bulk.caveat}`,
+    // Bundled is a NAME test, so the population is only as complete as the roster. Quoting
+    // its provenance next to the names is what lets a reader on a newer build catch the drift.
+    `  Population read by name against a ${bulk.roster.size}-name roster (Claude Code ${readOn}) — check the list above against your own catalog.`,
+    '  Bundled skills are recoverable context, not the incompressible floor — but these bytes are',
+    '  the ones lever 5a already claims under a gentler action, so they are not added to the headline.',
+  ];
 }
 
 /**
@@ -407,6 +489,9 @@ export function renderFineTune({
     gain,
   });
   const skillNames = Object.keys(skillOverrides);
+  // Lever 5b (#119) — computed here so the paste-ready block and the advice section below
+  // read the ONE verdict, and the two can never disagree about whether the bulk is offered.
+  const bundledBulk = bundledBulkVerdict(skills);
 
   /** @type {{ lever: string, label: string, shipped: number, waste: number | null, action: string }[]} */
   const rows = [];
@@ -549,6 +634,14 @@ export function renderFineTune({
   lines.push(`Recoverable (waste, conservative): ~${fmtBytes(recoverable)} bytes — Σ reused-uncached over the actionable levers.`);
   lines.push('Cache: <shipped> travels every request; <waste> is re-paid after a cache break. Cutting a lever may also restore cache hits (not modeled).');
 
+  // ── lever 5b (issue #119): the advice half of the skills catalog ─────────────
+  // Printed in its OWN section, below the recoverable headline and clear of the
+  // paste-ready block, because that is where the tier boundary has to be visible: what
+  // `apply` writes on approval (5a) and what is only shown (5b) must not read as one
+  // column. Neither figure is in the headline above — see the note each carries.
+  lines.push(...renderPluginSkills(pluginSkillGroups(skills)));
+  lines.push(...renderBundledBulk(bundledBulk));
+
   // ── byte-cost ranking (issue #100): ALL shipped tools / per-server MCP / CLAUDE.md ─
   // Always-on (the data is already in the gain model — no new accounting, no flag) but
   // omitted entirely when nothing was captured to rank, so an empty session prints no
@@ -576,9 +669,24 @@ export function renderFineTune({
   if (skillNames.length > 0) block.skillOverrides = skillOverrides;
   if (hook.deny) block.hooks = { SessionStart: [] };
   if (claudeMdExclude.length > 0) block.claudeMdExcludes = claudeMdExclude;
+  // Lever 5b's bundled bulk (#119) — the one half with a determinate value, so it is
+  // paste-ready like every other advice key. `enabledPlugins` is deliberately absent: the
+  // value is a judgment about the plugin's still-used skills, not a measurement.
+  if (bundledBulk.offered) block.disableBundledSkills = true;
   const settingsJson = JSON.stringify(block, null, 2);
   lines.push('settings.json (paste-ready):');
   lines.push(settingsJson);
+  // Which keys of that block `ccsnoop apply` would write on approval, and which are yours
+  // to weigh first. The block stays pure comment-free JSON — that is what makes it
+  // pasteable — so the split is stated NEXT to it rather than inside it. Without this the
+  // one column reads as one authority, and a proven deny and an all-or-nothing gesture
+  // that costs `/name` would look equally settled (ADR-0004; issue #119).
+  const adviceKeys = Object.keys(block).filter((k) => ADVICE_BLOCK_KEYS.includes(k));
+  if (adviceKeys.length > 0) {
+    lines.push(
+      `  ⚠ ${adviceKeys.join(', ')} — ADVICE: 'ccsnoop apply' will NOT write ${adviceKeys.length === 1 ? 'it' : 'them'}. Weigh ${adviceKeys.length === 1 ? 'it' : 'them'} yourself; the rest is the safe subset apply writes on approval.`
+    );
+  }
   return { lines, settingsJson };
 }
 
@@ -613,7 +721,8 @@ function uniqueById(sessions) {
  * id) — its corpus story is a later ticket.
  *
  * @param {{ cwd?: string, root?: string, sessionsDir?: string, session?: string, latest?: boolean, all?: boolean,
- *   denyExtra?: string[], denyAllow?: string[], denylistPath?: string, includeTokens?: boolean }} [opts]
+ *   denyExtra?: string[], denyAllow?: string[], denylistPath?: string, includeTokens?: boolean,
+ *   bundledSkillsPath?: string }} [opts]
  * @returns {{ sessionId: string, requests: number, shipped: string[], deny: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus,
  *   skills: import('./finetune-skills.js').SkillCorpus,
@@ -667,9 +776,19 @@ export function fineTune(opts = {}) {
 
   // Skills corpus (lever 5a, issue #118) — the same corpus, the same guard: shipped in the
   // turn-1 catalog across ≥ 3 sessions and never invoked by the model ⇒ `name-only`.
+  // The bundled roster (lever 5b, issue #119) only STAMPS each verdict: a capture carries
+  // no `source` marker, so the population `disableBundledSkills` would drop is identified
+  // by name against `data/bundled-skills.json` — the same "the file is the source of
+  // truth" discipline the built-in denylist follows.
+  //
+  // It loads with `…OrEmpty`, NOT the throwing loader the denylist uses. The denylist is
+  // load-bearing for a lever that writes; this roster feeds one advice-tier verdict, and an
+  // unreadable advice data file has no business taking down levers 1–5a. The failure is
+  // carried into the bulk verdict's `reason` instead of swallowed, so it reads as "ccsnoop
+  // could not check", never as "nothing is bundled".
   const skills = aggregateSkillCorpus(
     corpusSessions.map((s) => sessionSkillProfile(s.dir, s.id)),
-    { singleSession }
+    { singleSession, bundled: loadBundledSkillsOrEmpty(opts.bundledSkillsPath) }
   );
 
   // Hooks + CLAUDE.md levers (FT5) — static by construction (injected every

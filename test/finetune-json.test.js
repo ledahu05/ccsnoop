@@ -136,7 +136,7 @@ test('buildJsonReport emits the versioned tuning-report envelope', () => {
 
 // ── the safe / advice tier split (GAP A — the contract's reason to exist) ─────
 
-test('safeLevers holds tools + mcp + skills; adviceLevers holds hooks + claudeMd', () => {
+test('safeLevers holds tools + mcp + skills; adviceLevers holds hooks + claudeMd + the two 5b halves', () => {
   const r = buildJsonReport({
     sessionId: 's1',
     requests: 1,
@@ -164,7 +164,7 @@ test('safeLevers holds tools + mcp + skills; adviceLevers holds hooks + claudeMd
   );
   assert.deepEqual(
     r.adviceLevers.map((l) => l.lever),
-    ['hooks', 'claudeMd']
+    ['hooks', 'claudeMd', 'pluginSkills', 'bundledSkills']
   );
   for (const l of r.safeLevers) assert.equal(l.tier, 'safe');
   for (const l of r.adviceLevers) assert.equal(l.tier, 'advice');
@@ -589,11 +589,22 @@ test('totals.shipped absorbs the catalog — the bytes are counted once, under t
 // `catalog.populations[skills-catalog]` reports, never a second helping in `totals.shipped`.
 
 /** A skills corpus in the shape `aggregateSkillCorpus` emits. */
-function skillCorpus(skills, { sessionCount = 3, singleSession = false } = {}) {
+function skillCorpus(skills, { sessionCount = 3, singleSession = false, rosterSize = 0 } = {}) {
   return {
     sessionCount,
     singleSession,
-    skills: skills.map((s) => ({ reachable: true, shippedSessions: sessionCount, invokedCount: 0, override: true, ...s })),
+    roster: { size: rosterSize, source: rosterSize ? 'data/bundled-skills.json' : null, readOn: ['2.1.224'], error: null },
+    skills: skills.map((s) => ({
+      reachable: true,
+      shippedSessions: sessionCount,
+      invokedCount: 0,
+      override: true,
+      scope: null,
+      scopeKind: null,
+      bundled: false,
+      skill: s.name.includes(':') ? s.name.slice(s.name.indexOf(':') + 1) : s.name,
+      ...s,
+    })),
   };
 }
 
@@ -877,4 +888,131 @@ test('fixture: fine-tune --json contract is well-formed + settings reconstruct t
   for (const l of [...j.safeLevers, ...j.adviceLevers]) {
     assert.ok(l.tier && l.verdict && l.action && l.evidence);
   }
+});
+
+// ── lever 5b (issue #119) — plugin skills + bundled bulk, in the ADVICE tier ──
+//
+// Same proof as 5a, unbounded actions, so the contract must place them where nothing can
+// write them and must not fold their bytes into the headline: the bundled bulk overlaps
+// 5a's population by construction, and the plugin figure prices an action whose real cost
+// is not in bytes.
+
+test('the plugin signalement is an advice lever, per plugin and per skill', () => {
+  const r = skillsReport([
+    { name: 'mattpocock-skills:code-review', bytes: 900, scope: 'mattpocock-skills', scopeKind: 'plugin', reachable: false, invokedCount: 6, override: false },
+    { name: 'mattpocock-skills:naming', bytes: 501, scope: 'mattpocock-skills', scopeKind: 'plugin', reachable: false, override: false },
+  ]);
+  const plugins = r.adviceLevers.find((l) => l.lever === 'pluginSkills');
+  assert.equal(plugins.tier, 'advice');
+  assert.equal(plugins.action, 'enabledPlugins');
+  assert.equal(plugins.verdict, 'flag-only');
+  const [g] = plugins.items;
+  assert.equal(g.plugin, 'mattpocock-skills');
+  assert.equal(g.invokedSkills, 1);
+  assert.equal(g.deadBytes, 501, 'only the skills the model never reached');
+  assert.deepEqual(g.skills.map((s) => s.skill), ['code-review', 'naming']);
+});
+
+test('the plugin lever never produces a settings key — enabledPlugins stays the user’s call', () => {
+  const r = skillsReport([
+    { name: 'dead-plugin:a', bytes: 900, scope: 'dead-plugin', scopeKind: 'plugin', reachable: false, override: false },
+  ]);
+  assert.ok(!('enabledPlugins' in r.settings.advice), 'not even paste-ready — the value is a judgment ccsnoop cannot make');
+  assert.ok(!('enabledPlugins' in r.settings.auto));
+  assert.equal(r.totals.recoverable, 0, 'an unbounded action’s bytes never enter the headline');
+});
+
+test('the bundled bulk lands in settings.advice when the whole population is dead', () => {
+  const r = skillsReport(
+    [
+      { name: 'dataviz', bytes: 1157, bundled: true },
+      { name: 'simplify', bytes: 191, bundled: true },
+    ],
+    { rosterSize: 16 },
+  );
+  const bundled = r.adviceLevers.find((l) => l.lever === 'bundledSkills');
+  assert.equal(bundled.tier, 'advice');
+  assert.equal(bundled.action, 'disableBundledSkills');
+  assert.equal(bundled.verdict, 'bulk');
+  assert.equal(bundled.shipped, 1157 + 191);
+  assert.deepEqual(bundled.names, ['dataviz', 'simplify']);
+  assert.match(bundled.caveat, /\/name/);
+  assert.equal(r.settings.advice.disableBundledSkills, true);
+  assert.ok(!('disableBundledSkills' in r.settings.auto), 'the safe subset must have no path to it');
+});
+
+test('the bundled bulk bytes are reported but never counted into recoverable', () => {
+  // They are the SAME entries lever 5a already claims (a harsher action on one
+  // population), so adding them would double-count the catalog against itself.
+  const r = skillsReport([{ name: 'dataviz', bytes: 1157, bundled: true }], { rosterSize: 16 });
+  const residue = Buffer.byteLength('- dataviz\n', 'utf8');
+  assert.equal(r.totals.recoverable, 1157 - residue, 'still exactly lever 5a’s figure');
+});
+
+test('one invoked bundled skill and the bulk is reported, not offered, and writes nothing', () => {
+  const r = skillsReport(
+    [
+      { name: 'dataviz', bytes: 1157, bundled: true },
+      { name: 'simplify', bytes: 191, bundled: true, invokedCount: 2, override: false },
+    ],
+    { rosterSize: 16 },
+  );
+  const bundled = r.adviceLevers.find((l) => l.lever === 'bundledSkills');
+  assert.equal(bundled.verdict, 'none');
+  assert.equal(bundled.invokedSkills, 1);
+  assert.ok(bundled.reason.length > 0, 'the reader is told why the option is off');
+  assert.ok(!('disableBundledSkills' in r.settings.advice));
+  // …and 5a still acts on the dead one, by name.
+  assert.deepEqual(r.settings.auto.skillOverrides, { dataviz: 'name-only' });
+});
+
+test('both 5b levers are always listed, even inert — absence of a row is not absence of a population', () => {
+  const r = skillsReport([{ name: 'tdd', bytes: 400 }]);
+  assert.deepEqual(
+    r.adviceLevers.map((l) => l.lever),
+    ['hooks', 'claudeMd', 'pluginSkills', 'bundledSkills'],
+  );
+  for (const lever of ['pluginSkills', 'bundledSkills']) {
+    assert.equal(r.adviceLevers.find((l) => l.lever === lever).verdict, 'none');
+  }
+});
+
+test('the skills lever items carry the 5b join — scope and bundled, per skill', () => {
+  // One population, three readings: 5a's reach, 5b's plugin grouping, 5b's bundled bulk.
+  // Carrying the join as fields keeps a consumer from re-parsing names to find it.
+  const r = skillsReport([
+    { name: 'plug:a', bytes: 900, scope: 'plug', scopeKind: 'plugin', reachable: false, override: false },
+    { name: 'dataviz', bytes: 500, bundled: true },
+  ]);
+  const items = r.safeLevers.find((l) => l.lever === 'skills').items;
+  assert.deepEqual(
+    items.map((i) => [i.name, i.scope, i.scopeKind, i.bundled]),
+    [
+      ['plug:a', 'plug', 'plugin', false],
+      ['dataviz', null, null, true],
+    ],
+  );
+});
+
+test('the plugin lever’s `names` is empty — it writes nothing, and says so in the field consumers read', () => {
+  // Every other lever's `names` is "the names this lever writes". A consumer walking
+  // `names` across the levers to build a settings block must find nothing here, whatever
+  // else it does with the report. The actionable plugins get a key of their own.
+  const r = skillsReport([
+    { name: 'plug:a', bytes: 900, scope: 'plug', scopeKind: 'plugin', reachable: false, override: false },
+    { name: 'apps/web:deploy', bytes: 300, scope: 'apps/web', scopeKind: 'directory', reachable: false, override: false },
+  ]);
+  const plugins = r.adviceLevers.find((l) => l.lever === 'pluginSkills');
+  assert.deepEqual(plugins.names, []);
+  assert.deepEqual(plugins.plugins, ['plug'], 'the directory scope has no action, so it is not listed');
+});
+
+test('the bundled lever carries the roster’s provenance, not just its size', () => {
+  // Bundled is a NAME test, so the population is only as complete as the roster. `readOn`
+  // is what a reader on a newer Claude Code build needs to catch the drift before acting.
+  const r = skillsReport([{ name: 'dataviz', bytes: 1157, bundled: true }], { rosterSize: 16 });
+  const { roster } = r.adviceLevers.find((l) => l.lever === 'bundledSkills');
+  assert.equal(roster.size, 16);
+  assert.deepEqual(roster.readOn, ['2.1.224']);
+  assert.equal(roster.error, null);
 });

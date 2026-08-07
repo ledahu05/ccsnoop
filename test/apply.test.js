@@ -687,3 +687,55 @@ test('ccsnoop apply with no --from runs fine-tune on the capture and applies it'
   // Workflow is in the shipped denylist intersection → written to permissions.deny.
   assert.deepEqual(readJson(settingsFile).permissions, { deny: ['Workflow'] });
 });
+
+// ── lever 5b (issue #119) — the advice tier must have NO path to a write ─────
+//
+// 5b's two actions are `enabledPlugins` (cuts a whole plugin, working skills included)
+// and `disableBundledSkills` (all-or-nothing, and it costs `/name` on every bundled
+// skill). Both carry the same proof lever 5a does; both are unbounded, so ADR-0004 keeps
+// them paste-only. These tests freeze that: not a diff line, not a written key, not even
+// an accidental route through the merge.
+
+test('5b: disableBundledSkills in the advice tier is surfaced and never written', () => {
+  const dir = mkTmp();
+  const file = path.join(dir, '.claude', 'settings.json');
+  const report = {
+    settings: {
+      auto: { permissions: { deny: [] }, skillOverrides: { dataviz: 'name-only' } },
+      advice: { disableBundledSkills: true },
+    },
+  };
+  const res = apply({ report, approved: true, settingsFile: file });
+  assert.equal(res.wrote, true, 'the safe half still applies');
+
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(written.skillOverrides, { dataviz: 'name-only' });
+  assert.ok(!('disableBundledSkills' in written), 'the advice key never reaches settings.json');
+  assert.ok(res.lines.join('\n').includes('disableBundledSkills'), 'but it IS surfaced, paste-ready');
+  assert.ok(!res.diff.some((d) => /disableBundledSkills|enabledPlugins/.test(d.key)));
+});
+
+test('5b: the merge refuses disableBundledSkills / enabledPlugins in the SAFE subset', () => {
+  // Belt and braces: even a report that mislabels a 5b key as safe (a bug upstream, or a
+  // hand-edited file) must be refused rather than written. Refusing foreign keys is what
+  // keeps the tier boundary a property of `apply`, not just of the emitter.
+  for (const key of ['disableBundledSkills', 'enabledPlugins']) {
+    assert.throws(
+      () => computeMergeSettings({}, { [key]: true }),
+      (err) => err instanceof ApplyError && /refusing unknown settings key/.test(err.message),
+      `${key} must not be writable`,
+    );
+  }
+});
+
+test('5b: a plugin signalement produces no settings key at all — nothing to write, nothing to paste', () => {
+  // The plugin half emits no value even in `advice`: which plugin to disable is a judgment
+  // about the skills still in use, which ccsnoop has no basis to make.
+  const res = apply({
+    report: { settings: { auto: { permissions: { deny: [] } }, advice: {} } },
+    approved: true,
+    settingsFile: path.join(mkTmp(), '.claude', 'settings.json'),
+  });
+  assert.ok(!res.lines.join('\n').includes('enabledPlugins'));
+  assert.equal(res.wrote, false);
+});

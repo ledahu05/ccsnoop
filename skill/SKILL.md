@@ -135,6 +135,8 @@ proof, its tier, and the settings key it writes — once, here:
 | skills catalog | **dynamic** — a corpus of ≥ 3 sessions listing it, never invoked *by the model* | **safe** | `skillOverrides` (always `name-only`) |
 | SessionStart hooks | none — injected every session | **advice** | `hooks.SessionStart` |
 | CLAUDE.md | none — injected every session | **advice** | `claudeMdExcludes` |
+| plugin skills | **dynamic** — same proof as the skills catalog | **advice** | *none* — `enabledPlugins` is reported, never emitted |
+| bundled bulk | **dynamic** — ≥ 3 sessions and *not one* bundled skill model-invoked | **advice** | `disableBundledSkills` |
 
 **Safe** = written only on a presented diff + explicit `--yes`. **Advice** = surfaced
 paste-only, **never** written. Applying twice is identical to applying once
@@ -147,6 +149,25 @@ is unprompted discoverability. A skill the report marks `reachable: false` is a 
 directory-scoped) skill no `skillOverrides` entry reaches; report its cost, never propose a
 key for it. `skillOverrides` is a MAP: `apply` adds entries and never touches one the user
 already set, so a hand-set `off` survives.
+
+The last two rows are **lever 5b**: the same proof as the skills catalog, an action that
+reaches too far, so they are measured and shown and never written. Present them that way:
+
+- **`adviceLevers[pluginSkills]`** — read `items[]` and name, per plugin, what it costs
+  (`bytes`), which of its skills the model *did* invoke, and how much is dead
+  (`deadBytes`). Then stop. Do not recommend `enabledPlugins` for the user: disabling
+  recovers the whole `bytes` and takes the `invokedSkills` with it — the gap between the
+  two figures IS the price, and only the user can weigh it. `names` is always `[]` here
+  (this lever writes nothing); the actionable plugins are in `plugins`. A group with
+  `action: null` is a directory scope — no settings key disables it at all.
+- **`adviceLevers[bundledSkills]`** — surface `disableBundledSkills` only when
+  `verdict === "bulk"`, and **always with its `caveat`**: it removes `/name` on every
+  bundled skill, not just their descriptions. When `verdict === "none"`, say *why*
+  (`reason`) rather than staying silent — "the option was withheld" is not "there is
+  nothing there", and `roster.error` non-null means ccsnoop **could not check** at all.
+  `roster` is a **name** list ccsnoop ships; on a Claude Code build newer than
+  `roster.readOn` it may be stale, so quote `names` and let the user recognize their own.
+- Neither one's bytes are in `totals.recoverable`. Never add them to the headline.
 
 ## Redaction discipline (spec §1.3 — non-negotiable)
 

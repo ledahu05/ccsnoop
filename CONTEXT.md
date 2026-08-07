@@ -61,8 +61,20 @@ A fine-tune lever that carries **dynamic proof** of waste — the built-in tools
 _Avoid_: confirmed tier, applied tier
 
 **Advice tier** (paste-only):
-A fine-tune lever with **no dynamic proof** — the SessionStart hooks lever (`hooks.SessionStart`) and the CLAUDE.md lever (`claudeMdExcludes`), both injected every session by construction so their bytes can never prove disuse. `ccsnoop apply` surfaces these as a paste-ready block and **never writes them**. Serialized as `adviceLevers` / `settings.advice` in the contract. ADR-0005 adds lever 5b (plugin skills): proof exists, but `enabledPlugins` is the only reachable action and it takes down the whole plugin — an unbounded action lands here even with good evidence.
+A fine-tune lever with **no dynamic proof** — the SessionStart hooks lever (`hooks.SessionStart`) and the CLAUDE.md lever (`claudeMdExcludes`), both injected every session by construction so their bytes can never prove disuse. `ccsnoop apply` surfaces these as a paste-ready block and **never writes them**. Serialized as `adviceLevers` / `settings.advice` in the contract. ADR-0005 adds lever 5b (#119), which has proof and is still advice because its actions reach too far: `enabledPlugins` takes down a whole plugin, `disableBundledSkills` is all-or-nothing *and* costs `/name`. So the tier is no longer "no proof" — it is "no bounded action", by proof or by reach.
 _Avoid_: unconfirmed tier, manual tier
+
+**Plugin signalement**:
+Lever 5b's report on the plugin skills a corpus ships (#119) — per plugin and per skill: what it costs, which of its skills the model actually invoked, and the dead bytes in the rest. It names the only knob (`enabledPlugins`) and emits no value for it, not even paste-ready, because choosing between a plugin's dead and working skills is a judgment ccsnoop has no basis to make. Both halves are always shown: a verdict naming only the dead bytes would read as "uninstall this".
+_Avoid_: plugin verdict, plugin deny
+
+**Bundled population**:
+The skills Claude Code ships itself (`source === "builtin"`) — the set `disableBundledSkills` drops. Identified by **name** against `data/bundled-skills.json`, because a capture carries no source marker; a name absent from the roster is *not known to be bundled*, never *not bundled*. It is recoverable context, not part of the incompressible floor: `disableBundledSkills` reaches it in bulk and per-name `skillOverrides` reaches it one at a time (ADR-0005 fact 3).
+_Avoid_: built-in skills, harness skills, the skills floor
+
+**Bundled bulk**:
+Lever 5b's all-or-nothing advice — `disableBundledSkills: true`, offered only when the corpus clears the ≥ 3-session guard and *not one* skill of the bundled population was model-invoked. One invoked bundled skill and it is withheld: per-name `name-only` applies instead. Always carries the measured caveat that it removes `/name` on every bundled skill, not just their descriptions.
+_Avoid_: disable skills, bundled deny
 
 **Skills catalog**:
 The population of skills Claude Code lists to the model on turn 1, each entry shipping a name *and* a full description. One of the three sibling populations of the deferred listing, alongside the deferred built-in tools and the agent types. Routinely the largest single line item of the turn-1 floor.
@@ -101,9 +113,9 @@ A skill reached by the model through the `Skill` tool — the only kind of use `
 _Avoid_: skill usage, invocation
 
 **Bounded action**:
-An action whose false positive costs discoverability rather than capability. The property that admits a lever to the safe tier alongside dynamic proof — `name-only` is bounded; disabling a whole plugin is not, however good the evidence (ADR-0005).
+An action whose false positive costs discoverability rather than capability. The property that admits a lever to the safe tier alongside dynamic proof — `name-only` is bounded; disabling a whole plugin, or the whole bundled population, is not, however good the evidence (ADR-0005, #119).
 _Avoid_: soft lever, low-risk lever
 
 **Apply**:
-The tiered-apply glue (`ccsnoop apply` / `src/apply.js`, #98) that turns a `fine-tune --json` report into action under ADR-0004: presents a diff of the safe-subset `settings.json` changes, writes ONLY the safe subset on explicit approval (`--yes`) via an idempotent read-modify-write merge (merge, never overwrite; refuse foreign keys; never touch `.ccsnoop/`), emits the advice levers as paste-only output, and emits a restart reminder after any write. Consumes the contract's tier split directly — does not re-derive tiers. Since #118 the safe subset holds one MAP-valued key, `skillOverrides`, so the merge has two shapes: arrays are unioned, a map gains its **absent entries only** — a value the user already set is never rewritten (`off` is stricter than `name-only`; the lever adds, it never relaxes). Refusing foreign *keys* extends there to refusing foreign *values*: anything outside the four-member enum is rejected rather than written.
+The tiered-apply glue (`ccsnoop apply` / `src/apply.js`, #98) that turns a `fine-tune --json` report into action under ADR-0004: presents a diff of the safe-subset `settings.json` changes, writes ONLY the safe subset on explicit approval (`--yes`) via an idempotent read-modify-write merge (merge, never overwrite; refuse foreign keys; never touch `.ccsnoop/`), emits the advice levers as paste-only output, and emits a restart reminder after any write. Consumes the contract's tier split directly — does not re-derive tiers. Since #118 the safe subset holds one MAP-valued key, `skillOverrides`, so the merge has two shapes: arrays are unioned, a map gains its **absent entries only** — a value the user already set is never rewritten (`off` is stricter than `name-only`; the lever adds, it never relaxes). Refusing foreign *keys* extends there to refusing foreign *values*: anything outside the four-member enum is rejected rather than written. That refusal is what freezes lever 5b out (#119): neither `enabledPlugins` nor `disableBundledSkills` is in the safe subset, so a report that misplaced one is rejected rather than written — the tier boundary is a property of `apply`, not only of the emitter.
 _Avoid_: auto-tuner, settings patcher
