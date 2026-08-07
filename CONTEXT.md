@@ -54,15 +54,31 @@ _Avoid_: manual lever
 A before/after pair of captures linked across the restart that applies a tuning — the unit of *"did this tuning actually lower the floor?"* Without it, there is no verify step, only guesswork.
 _Avoid_: tuning run, A/B pair
 
-## Fine-tune authority (ADR-0004)
+## Fine-tune authority (ADR-0004, amended by ADR-0005)
 
 **Safe tier** (auto-writable):
-A fine-tune lever that carries **dynamic proof** of waste — the built-in tools lever (`permissions.deny`: shipped ∩ the pre-validated denylist ∩ uncalled) and the MCP lever (`disabledMcpjsonServers`: shipped across ≥ 3 sessions and never called, under the T4 guard). `ccsnoop apply` may write these to `.claude/settings.json` on approval of a presented diff. Serialized as `safeLevers` / `settings.auto` in the `--json` contract (#95).
+A fine-tune lever that carries **dynamic proof** of waste — the built-in tools lever (`permissions.deny`: shipped ∩ the pre-validated denylist ∩ uncalled) and the MCP lever (`disabledMcpjsonServers`: shipped across ≥ 3 sessions and never called, under the T4 guard). `ccsnoop apply` may write these to `.claude/settings.json` on approval of a presented diff. Serialized as `safeLevers` / `settings.auto` in the `--json` contract (#95). ADR-0005 adds lever 5a (`skillOverrides`: shipped across ≥ 3 sessions, never model-invoked) and restates the axis — dynamic proof establishes a *bounded action*, and it is boundedness that admits a lever here.
 _Avoid_: confirmed tier, applied tier
 
 **Advice tier** (paste-only):
-A fine-tune lever with **no dynamic proof** — the SessionStart hooks lever (`hooks.SessionStart`) and the CLAUDE.md lever (`claudeMdExcludes`), both injected every session by construction so their bytes can never prove disuse. `ccsnoop apply` surfaces these as a paste-ready block and **never writes them**. Serialized as `adviceLevers` / `settings.advice` in the contract.
+A fine-tune lever with **no dynamic proof** — the SessionStart hooks lever (`hooks.SessionStart`) and the CLAUDE.md lever (`claudeMdExcludes`), both injected every session by construction so their bytes can never prove disuse. `ccsnoop apply` surfaces these as a paste-ready block and **never writes them**. Serialized as `adviceLevers` / `settings.advice` in the contract. ADR-0005 adds lever 5b (plugin skills): proof exists, but `enabledPlugins` is the only reachable action and it takes down the whole plugin — an unbounded action lands here even with good evidence.
 _Avoid_: unconfirmed tier, manual tier
+
+**Skills catalog**:
+The population of skills Claude Code lists to the model on turn 1, each entry shipping a name *and* a full description. One of the three sibling populations of the deferred listing, alongside the deferred built-in tools and the agent types. Routinely the largest single line item of the turn-1 floor.
+_Avoid_: skill list, MCP deferred, the deferred block
+
+**Name-only**:
+The `skillOverrides` value that keeps a skill fully invocable while dropping its description from the catalog. The action lever 5a emits (ADR-0005) — it recovers the dominant byte term without removing capability, which is what makes its false positive *bounded*.
+_Avoid_: truncate, collapse, disable
+
+**Model invocation**:
+A skill reached by the model through the `Skill` tool — the only kind of use `name-only` can cost. A user typing `/name` is *not* model invocation, so a skill only ever invoked by slash command is a skill whose description bought nothing. The disuse predicate of lever 5.
+_Avoid_: skill usage, invocation
+
+**Bounded action**:
+An action whose false positive costs discoverability rather than capability. The property that admits a lever to the safe tier alongside dynamic proof — `name-only` is bounded; disabling a whole plugin is not, however good the evidence (ADR-0005).
+_Avoid_: soft lever, low-risk lever
 
 **Apply**:
 The tiered-apply glue (`ccsnoop apply` / `src/apply.js`, #98) that turns a `fine-tune --json` report into action under ADR-0004: presents a diff of the safe-subset `settings.json` changes, writes ONLY the safe subset on explicit approval (`--yes`) via an idempotent read-modify-write merge (merge, never overwrite; refuse foreign keys; never touch `.ccsnoop/`), emits the advice levers as paste-only output, and emits a restart reminder after any write. Consumes the contract's tier split directly — does not re-derive tiers.
