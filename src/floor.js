@@ -97,7 +97,7 @@ export function fmtTokens(n) {
  * @typedef {object} FloorContext
  * @property {string | null} sessionId
  * @property {number} turns            Total exchanges in the session.
- * @property {number | null} turn1Index Index of the exchange the floor was taken from — the first exchange shipping the static floor (NOT always 0: an interactive session's exchanges[0] is a preflight probe). Null when empty.
+ * @property {number | null} turn1Index Index of the exchange the floor was taken from — the exchange shipping the static floor (NOT always 0: an interactive session's exchanges[0] is a preflight probe, a `-p` session's is an auxiliary round-trip). Null when empty.
  * @property {string | null} model     Captured request model name (display only).
  * @property {number} windowTokens     The window the headline % was scored against.
  * @property {FloorHeadline} headline
@@ -106,10 +106,13 @@ export function fmtTokens(n) {
  */
 
 /**
- * The byte floor below which a request is assumed to carry no static floor. Claude
- * Code's interactive preflight is a ~1 KB probe; the real conversation opening is
- * tens of KB. Used only as the fallback when no exchange ships a recognizable
- * tools[]/system[] (a degraded capture), to pick a substantial request over a tiny one.
+ * The byte floor below which a request is assumed to carry no static floor. Claude Code's
+ * interactive preflight is a ~1 KB probe and a `-p` session's auxiliary round-trip ~2.3 KB
+ * (#120); a real conversation opening is tens of KB. Read twice by {@link findTurn1}: as
+ * the "substantial" half of {@link isOpening}, which is what tells an auxiliary call
+ * carrying a `system[]` from a tool-less opening carrying one; and as the last fallback
+ * for a degraded capture whose body never parsed, to pick a substantial request over a
+ * tiny one.
  */
 const TURN1_BYTE_FLOOR = 4096;
 
@@ -127,21 +130,36 @@ const CATALOG_LABEL = {
 };
 
 /**
- * Whether an exchange ships the static floor — a non-empty `tools[]` and/or `system[]`
- * in its parsed request body. The interactive preflight Claude Code emits before turn 1
- * carries neither (a small probe, sometimes a non-JSON HEAD whose body does not parse),
- * so it reads as no tools and no system; every real conversation turn carries both.
- * Reads the same {@link parseRequestBlob} path `computeGain` does. Internal to turn-1
- * selection; not the gain model's notion of an attributed block.
- * @param {any} ex
+ * Whether an exchange ships a PROMPT SURFACE — a non-empty `tools[]`, or one of the three
+ * catalog populations. This is the strong signal that an exchange is the conversation's
+ * opening, and it is the one all three research probes (#52, #115, the bench comparability
+ * probe) had already re-implemented for themselves, each because {@link carriesSystem}
+ * alone was not enough. Issue #120 brought it down here so `floor` — and `verify`, which
+ * inherits its turn-1 isolation — stop disagreeing with the probes about which request is
+ * the opening.
+ *
+ * The catalog half matters as well as the tools half: an opening ships tools[] AND the
+ * catalogs together in practice, but reading only `tools[]` would make the criterion a
+ * restatement of one probe's convenience rather than of what a floor IS — the static
+ * prompt Claude Code re-ships every turn.
+ * @param {any} body  A parsed request body, or null.
  * @returns {boolean}
  */
-function carriesFloor(ex) {
-  const body = parseRequestBlob(ex?.requestBlob ?? '').json;
+function carriesPromptSurface(body) {
   if (!body || typeof body !== 'object') return false;
   if (Array.isArray(body.tools) && body.tools.length > 0) return true;
-  // `system` may be an array of blocks or a bare prompt string (both valid per the
-  // Anthropic API); either is a floor only when non-empty — `system: ""` is not.
+  return findCatalogBlocks(body).length > 0;
+}
+
+/**
+ * Whether an exchange ships a non-empty `system[]` (or a non-empty bare `system` string —
+ * both are valid per the Anthropic API). The #107 predicate, kept as the weaker fallback
+ * signal: `system: ""` and an absent `system` are not a floor.
+ * @param {any} body  A parsed request body, or null.
+ * @returns {boolean}
+ */
+function carriesSystem(body) {
+  if (!body || typeof body !== 'object') return false;
   const sys = body.system;
   if (Array.isArray(sys)) return sys.length > 0;
   if (typeof sys === 'string') return sys.length > 0;
@@ -149,28 +167,84 @@ function carriesFloor(ex) {
 }
 
 /**
- * Locate turn 1 — the first exchange that ships the static floor — and its index.
- * Index 0 is NOT reliably turn 1: an interactive session's first captured request is
- * Claude Code's preflight probe (no tools[], no system[]), not the opening, so
- * anchoring on `exchanges[0]` zeroed the whole metric (issue #107). Falls back, in
- * order, to the first exchange at least {@link TURN1_BYTE_FLOOR} bytes (a degraded
- * capture with no recognizable floor), then to index 0, so a session still renders
- * rather than reading as an empty floor.
+ * The byte length of an exchange's captured request. `requestBlob` is a string on a loaded
+ * session and a Buffer on a hand-built test model ({@link module:capture.buildRequestBlob});
+ * size both the same way.
+ * @param {any} ex
+ * @returns {number}
+ */
+function blobBytes(ex) {
+  const blob = ex?.requestBlob;
+  return typeof blob === 'string' ? Buffer.byteLength(blob, 'utf8') : Buffer.isBuffer(blob) ? blob.length : 0;
+}
+
+/**
+ * Whether an exchange reads as the conversation's OPENING — the request the static floor
+ * is attributed from. Two ways to qualify, and a capture needs only one:
+ *
+ *   • it ships a prompt surface ({@link carriesPromptSurface}) — the strong signal; or
+ *   • it ships a `system[]` ({@link carriesSystem}) AND is substantial (at least
+ *     {@link TURN1_BYTE_FLOOR} bytes).
+ *
+ * The second clause is what keeps #120's fix from costing more than it recovers. A
+ * legitimate opening CAN ship an empty `tools[]` and no catalog — a restricted sub-agent,
+ * or a run with every tool denied — so a prompt surface must not be *required*. But
+ * `system[]` alone is what let the auxiliary round-trip through in the first place, so
+ * size is what separates the two: the auxiliary call in #120 is 2.3 KB, an opening is
+ * tens of KB. This is the issue's own wording — "la première requête **substantielle**
+ * portant un catalogue ou des outils".
+ *
+ * ⚠ The premise of that second clause — that an opening can ship no tools at all — is
+ * REASONED, not measured: no capture of a `--tools none` run or a restricted sub-agent has
+ * been taken. It is deliberately the conservative side of the unknown (a false accept
+ * costs a slightly wrong anchor; a false reject re-zeroes the whole metric, which is the
+ * bug being fixed). Worth a probe before this clause is ever tightened.
+ *
+ * @param {any} ex
+ * @returns {boolean}
+ */
+function isOpening(ex) {
+  const body = parseRequestBlob(ex?.requestBlob ?? '').json;
+  if (carriesPromptSurface(body)) return true;
+  return carriesSystem(body) && blobBytes(ex) >= TURN1_BYTE_FLOOR;
+}
+
+/**
+ * Locate turn 1 — the exchange that ships the static floor — and its index.
+ *
+ * Index 0 is NOT reliably turn 1, and it is wrong in two DIFFERENT ways depending on how
+ * the session was started:
+ *
+ *   • interactive (#107) — Claude Code emits a preflight probe carrying neither tools[]
+ *     nor system[] (sometimes a non-JSON HEAD that does not even parse). Anchoring on it
+ *     zeroed the whole metric.
+ *   • scripted, `claude -p` (#120) — the session opens with an auxiliary round-trip that
+ *     ships a real, non-empty `system[]` and no tools[] and no catalog. It satisfies the
+ *     #107 predicate, so `floor` anchored on it and reported the ~500 tokens of an
+ *     auxiliary call as the floor, with `--detail` announcing "no catalog blocks" on a
+ *     capture carrying three. `-p` is the shape the probes and the bench use, so this
+ *     silently corrupted every scripted measurement.
+ *
+ * Selection is FIRST-MATCH on one predicate ({@link isOpening}) — deliberately not a
+ * session-wide preference for the strongest signal. Ranking the whole session by "has a
+ * prompt surface" would let any later sub-agent side-call, which ships its own small
+ * `tools[]`, outrank a legitimate tool-less opening and re-zero the very captures
+ * {@link isOpening}'s second clause exists to protect. The opening is the FIRST request
+ * that looks like one; later ones are the conversation, not a better candidate.
+ *
+ * Falls back, in order, to the first exchange of at least {@link TURN1_BYTE_FLOOR} bytes
+ * (a degraded capture whose body never parsed), then to index 0, so a session still
+ * renders rather than reading as an empty floor.
+ *
  * @param {Array<Record<string, any>>} exchanges
  * @returns {{ turn1: Record<string, any> | null, turn1Index: number | null }}
  */
 function findTurn1(exchanges) {
   for (let i = 0; i < exchanges.length; i++) {
-    if (carriesFloor(exchanges[i])) return { turn1: exchanges[i], turn1Index: i };
+    if (isOpening(exchanges[i])) return { turn1: exchanges[i], turn1Index: i };
   }
   for (let i = 0; i < exchanges.length; i++) {
-    const blob = exchanges[i]?.requestBlob;
-    // `requestBlob` is a string on a loaded session and a Buffer on a hand-built test
-    // model (buildRequestBlob); size both the same way.
-    const len = typeof blob === 'string' ? Buffer.byteLength(blob, 'utf8') : Buffer.isBuffer(blob) ? blob.length : 0;
-    if (len >= TURN1_BYTE_FLOOR) {
-      return { turn1: exchanges[i], turn1Index: i };
-    }
+    if (blobBytes(exchanges[i]) >= TURN1_BYTE_FLOOR) return { turn1: exchanges[i], turn1Index: i };
   }
   return { turn1: exchanges[0] ?? null, turn1Index: exchanges.length > 0 ? 0 : null };
 }
@@ -180,9 +254,10 @@ function findTurn1(exchanges) {
  * loaded session model. Turn-1 isolation profiles ONLY the exchange that ships the
  * static floor — every static block is re-shipped each turn, so that opening is the
  * canonical floor, and ignoring later turns drops any mid-session mutation from the
- * baseline. The opening is NOT always `exchanges[0]`: an interactive session begins
- * with a preflight probe that carries no floor, so {@link findTurn1} skips it
- * (issue #107).
+ * baseline. The opening is NOT always `exchanges[0]`: an interactive session begins with
+ * a preflight probe carrying no floor (#107) and a `-p` session with an auxiliary
+ * round-trip carrying a `system[]` but no prompt surface (#120), so {@link findTurn1}
+ * skips past both.
  *
  * The byte figures are the turn-1 slice of {@link module:finetune-gain.computeGain};
  * the headline tokens are the real captured `usage`. Never re-tokenizes. Null-safe:
@@ -204,10 +279,10 @@ export function computeFloor(model, opts = {}) {
   const exchanges = model?.exchanges ?? [];
   const turns = exchanges.length;
 
-  // Turn-1 isolation: attribute the floor from the first exchange that SHIPS it. The
-  // opening is not always exchanges[0] — Claude Code emits a preflight probe before the
-  // first real turn on interactive sessions (#107), so index 0 can be a floor-less
-  // request that would zero the whole metric. `findTurn1` skips past it.
+  // Turn-1 isolation: attribute the floor from the exchange that SHIPS it. The opening is
+  // not always exchanges[0] — an interactive session opens with a preflight probe (#107)
+  // and a `-p` session with an auxiliary round-trip (#120), either of which would anchor
+  // the metric on a request that is not the opening. `findTurn1` skips past both.
   const { turn1, turn1Index } = findTurn1(exchanges);
   const gain = computeGain({ exchanges: turn1 ? [turn1] : [] });
 
