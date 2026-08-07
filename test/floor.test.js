@@ -246,6 +246,111 @@ test('computeFloor attributes each CLAUDE.md source separately; a source-less on
   assert.match(renderFloor(f).lines.join('\n'), /CLAUDE\.md \(managed\)/);
 });
 
+// ── computeFloor: interactive preflight at exchanges[0] (issue #107) ───────────
+//
+// Claude Code emits a small preflight probe before the first real conversation turn
+// on every interactive session. It carries NO tools[] and NO system[] (sometimes a
+// non-JSON HEAD), so `exchanges[0]` is that probe, not the opening — and anchoring
+// turn 1 on index 0 zeroed the whole floor (issue #107). Turn 1 is now the first
+// exchange that ships the static floor.
+
+/** A preflight exchange: no tools[], no system[], tiny body, no usage — the probe
+ *  Claude Code emits before the real turn-1 opening on every interactive session. */
+function preflightExchange() {
+  return {
+    turn: 1,
+    usage: null,
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-test', messages: [{ role: 'user', content: 'probe' }] })),
+    }),
+    segments: [{ slot: 'message#0', bytes: 5, kind: 'reused-cached' }],
+  };
+}
+
+/** An interactive session: the preflight at exchanges[0], the real opening at [1]. */
+function interactiveModel() {
+  const real = synthModel();
+  const opening = real.model.exchanges[0]; // the known floor (tools + system + usage)
+  return {
+    model: { sessionId: 'interactive', exchanges: [preflightExchange(), { ...opening, turn: 2 }] },
+    expected: real.expected,
+  };
+}
+
+test('computeFloor skips the interactive preflight and attributes the real opening (issue #107)', () => {
+  const { model, expected } = interactiveModel();
+  const f = computeFloor(model);
+  assert.equal(f.turns, 2, 'sees both exchanges');
+  assert.equal(f.turn1Index, 1, 'turn-1 is the opening at exchanges[1], NOT the preflight at [0]');
+  // The real floor is attributed — not the zero the preflight would yield.
+  assert.ok(f.totalBytes > 0, 'floor is non-zero (the preflight no longer zeroes it)');
+  const read = f.attribution.find((a) => a.kind === 'tool' && a.label === 'Read');
+  assert.equal(read.bytes, expected.Read, 'the opening tool size');
+  // Headline tokens come from the opening's usage, not the preflight (which had none).
+  assert.equal(f.headline.tokens, 3000);
+});
+
+test('computeFloor does not mistake an empty system string for a floor (carriesFloor edge)', () => {
+  // A preflight that ships `system: ""` (or empty tools) is NOT the floor — turn 1 must
+  // still skip it for the real opening. An overly loose predicate would anchor here.
+  const preflightEmpty = {
+    turn: 1,
+    usage: null,
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-test', system: '', tools: [], messages: [{ role: 'user', content: 'probe' }] })),
+    }),
+    segments: [],
+  };
+  const real = synthModel();
+  const opening = real.model.exchanges[0];
+  const f = computeFloor({ sessionId: 'edge', exchanges: [preflightEmpty, { ...opening, turn: 2 }] });
+  assert.equal(f.turn1Index, 1, 'the empty-system preflight is skipped for the real opening');
+  assert.ok(f.totalBytes > 0);
+});
+
+test('computeFloor renders a real floor for an interactive session, not "nothing attributed" (issue #107)', () => {
+  const { model } = interactiveModel();
+  const out = renderFloor(computeFloor(model)).lines.join('\n');
+  assert.doesNotMatch(out, /nothing attributed/i, 'no longer claims an empty floor');
+  assert.match(out, /3[ ,]?000 tokens/, 'the opening headline reports');
+});
+
+test('computeFloor falls back to the first substantial exchange when none carries a recognizable floor', () => {
+  // A degraded capture: neither exchange ships tools[]/system[], but the second clears
+  // the byte floor. Floor picks it over the tiny first (and still reports its usage).
+  const tiny = {
+    turn: 1,
+    usage: null,
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-test', messages: [{ role: 'user', content: 'x' }] })),
+    }),
+    segments: [],
+  };
+  const big = {
+    turn: 2,
+    usage: { inputTokens: 500, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0 },
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-test', messages: [{ role: 'user', content: 'y'.repeat(5000) }] })),
+    }),
+    segments: [],
+  };
+  const f = computeFloor({ sessionId: 'degraded', exchanges: [tiny, big] });
+  assert.equal(f.turn1Index, 1, 'the substantial exchange, not the tiny one');
+  assert.equal(f.headline.tokens, 500, 'usage read from the picked exchange');
+});
+
 // ── renderFloor: text output ───────────────────────────────────────────────────
 
 test('renderFloor leads with the real token headline and labels the byte proxy', () => {

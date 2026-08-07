@@ -248,12 +248,74 @@ test('computeVerify ranks per-block deltas by absolute change, descending', () =
   assert.deepEqual(mags, [...mags].sort((a, b) => b - a), 'biggest movers first');
 });
 
-test('computeVerify is null-safe on two empty models (flat, no blocks)', () => {
+test('computeVerify is null-safe on two empty models (unknown — no floor on either side)', () => {
+  // Two empty captures is a capture gap on BOTH sides, not a 'flat' tuning result: a
+  // 0-byte floor must never yield a confident verdict (issue #107 guard #1).
   const v = computeVerify({ sessionId: 'a', exchanges: [] }, { sessionId: 'b', exchanges: [] });
   assert.equal(v.delta.tokens.before, null);
-  assert.equal(v.delta.verdict, 'flat');
+  assert.equal(v.delta.verdict, 'unknown');
   assert.equal(v.delta.basis, 'bytes');
   assert.deepEqual(v.delta.bytes.blocks, []);
+});
+
+test('computeVerify emits UNKNOWN — never a false lowered — when a side captured no floor (issue #107)', () => {
+  // The after side is a capture gap: no usage, no attributed bytes. Before the fix,
+  // verify scored this as verdict 'lowered' / −100% — a confident, false claim that
+  // the tuning had removed the entire floor.
+  const before = synthModel({
+    sessionId: 'before',
+    tools: { Read: 4000 },
+    usage: { inputTokens: 1000, cacheCreationInputTokens: 2000, cacheReadInputTokens: 0 },
+  });
+  const after = { sessionId: 'after', exchanges: [{ turn: 1, usage: null, requestBlob: '', segments: [] }] };
+  const v = computeVerify(before, after);
+  assert.equal(v.after.totalBytes, 0, 'after side captured no floor');
+  assert.equal(v.after.headline.tokens, null);
+  assert.equal(v.delta.verdict, 'unknown', 'a capture gap is not a tuning result');
+  assert.equal(v.delta.basis, 'bytes');
+  assert.equal(v.delta.bytes.relative, null, 'no bogus −100% leaks into the JSON');
+  assert.deepEqual(v.delta.bytes.blocks, [], 'no shrank-to-0 rows leak into the JSON contract');
+  // The renderer says UNKNOWN — never a confident lowered.
+  const out = renderVerify(v).lines.join('\n');
+  assert.match(out, /verdict: UNKNOWN/i);
+  assert.doesNotMatch(out, /FLOOR LOWERED/i);
+  assert.doesNotMatch(out, /-100%/, 'no bogus −100% anywhere in the render');
+  assert.match(out, /suppressed/i, 'the per-block table is suppressed under unknown');
+  assert.match(out, /not scored/i, 'the byte delta declines to score a capture gap');
+});
+
+test('computeVerify reads an interactive after-side from its real opening, not the preflight (issue #107)', () => {
+  // The after session is interactive: a preflight at exchanges[0] (no floor), the real
+  // opening at [1]. Before the fix, verify anchored the after floor on the preflight,
+  // read 0 bytes, and emitted a false 'lowered' / −100%.
+  const before = synthModel({
+    sessionId: 'before',
+    tools: { Read: 4000 },
+    usage: { inputTokens: 1000, cacheCreationInputTokens: 2000, cacheReadInputTokens: 0 },
+  });
+  const opening = synthModel({
+    sessionId: 'after',
+    tools: { Read: 1800 },
+    usage: { inputTokens: 800, cacheCreationInputTokens: 1600, cacheReadInputTokens: 0 },
+  }).exchanges[0];
+  const preflight = {
+    turn: 1,
+    usage: null,
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(JSON.stringify({ model: 'claude-test', messages: [{ role: 'user', content: 'probe' }] })),
+    }),
+    segments: [{ slot: 'message#0', bytes: 5, kind: 'reused-cached' }],
+  };
+  const after = { sessionId: 'after', exchanges: [preflight, { ...opening, turn: 2 }] };
+  const v = computeVerify(before, after);
+  assert.equal(v.after.turn1Index, 1, 'after floor taken from the opening, not the preflight');
+  assert.ok(v.after.totalBytes > 0, 'after floor is non-zero');
+  // A real verdict on real tokens — not 'unknown', not a bogus −100% lowered.
+  assert.equal(v.delta.verdict, 'lowered');
+  assert.equal(v.delta.basis, 'tokens');
 });
 
 // ── renderVerify: text output ─────────────────────────────────────────────────
