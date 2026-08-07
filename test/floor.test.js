@@ -809,6 +809,25 @@ test('computeFloor: an empty description is still a named entry, colon not swall
   assert.deepEqual(skills.entries.map((e) => e.name).sort(), ['dataviz', 'tdd'], 'names carry no trailing colon');
 });
 
+test('computeFloor: a scope-qualified skill keeps its whole name (issue #118)', () => {
+  // `- plugin:skill: <description>` is how Claude Code lists a plugin skill. Cutting the
+  // name at its first colon hands back `plugin` — a name that reads UNQUALIFIED, and the
+  // qualifier is precisely what tells lever 5a no `skillOverrides` entry reaches this skill
+  // (ADR-0005 fact 2). A truncated name would earn a `skillOverrides` key that does nothing.
+  const txt =
+    'The following skills are available for use with the Skill tool:\n\n' +
+    '- skill-creator:skill-creator: Create new skills from scratch.\n' +
+    '- apps/web:deploy: Deploy the web app.\n' +
+    '- tdd: Test-driven development.\n';
+  const model = catalogModel('separate', { skillsText: txt });
+  const skills = computeFloor(model).attribution.find((a) => a.kind === 'skills-catalog');
+  assert.deepEqual(
+    skills.entries.map((e) => e.name),
+    ['skill-creator:skill-creator', 'apps/web:deploy', 'tdd'],
+    'qualifiers survive; an unqualified name is unaffected',
+  );
+});
+
 test('renderFloor: --detail adds a per-entry section below the total, leaving the table intact', () => {
   const ctx = computeFloor(catalogModel('separate'));
   const plain = renderFloor(ctx).lines.join('\n');

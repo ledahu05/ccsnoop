@@ -219,6 +219,120 @@ test('renderFineTune omits the cache warning when there is nothing to deny', () 
   assert.ok(!lines.some((l) => /invalidates the cache/.test(l)), 'no warning for an empty deny');
 });
 
+// ── the skills lever in the text diagnostic (issue #118, ADR-0005 lever 5a) ───
+
+/** A skills corpus in the shape `aggregateSkillCorpus` emits. */
+function skillCorpus(skills, { sessionCount = 3, singleSession = false } = {}) {
+  return {
+    sessionCount,
+    singleSession,
+    skills: skills.map((s) => ({ reachable: true, shippedSessions: sessionCount, invokedCount: 0, override: true, ...s })),
+  };
+}
+
+/**
+ * A gain model whose only charged bucket is the skills catalog.
+ * @returns {import('../src/finetune-gain.js').GainModel}
+ */
+function skillsGain(shipped, waste = shipped) {
+  return {
+    tool: new Map(),
+    claudeMd: new Map(),
+    hook: { shipped: 0, waste: 0 },
+    mcp: { shipped: 0, waste: 0 },
+    catalog: new Map([['skills-catalog', { shipped, waste }]]),
+    harness: { shipped: 0, waste: 0 },
+  };
+}
+
+test('renderFineTune gives the skills catalog an ACTION and names each skill under it', () => {
+  const { lines, settingsJson } = renderFineTune({
+    sessionId: 'sess-s',
+    requests: 4,
+    shipped: [],
+    deny: [],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    skills: skillCorpus([
+      { name: 'dataviz', bytes: 1157 },
+      { name: 'tdd', bytes: 400, invokedCount: 2, override: false },
+    ]),
+  });
+  const row = lines.find((l) => /skills-catalog/.test(l));
+  assert.ok(/name-only/.test(row), `the row carries the action, got: ${row}`);
+  // Per-skill detail, the way the MCP row lists its servers.
+  assert.ok(lines.some((l) => /dataviz/.test(l) && /name-only/.test(l)));
+  assert.ok(
+    lines.some((l) => /\btdd\b/.test(l) && /invoked 2\/3/.test(l)),
+    'an invoked skill is shown with its evidence, not silently dropped',
+  );
+  assert.deepEqual(JSON.parse(settingsJson).skillOverrides, { dataviz: 'name-only' });
+  assert.ok(lines.some((l) => /invalidates the cache/.test(l)), 'the block changes the prompt prefix');
+});
+
+test('renderFineTune keeps the catalog row cost-only when no skill qualifies', () => {
+  const { lines, settingsJson } = renderFineTune({
+    sessionId: 'sess-s2',
+    requests: 4,
+    shipped: [],
+    deny: [],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    skills: skillCorpus([{ name: 'tdd', bytes: 400, invokedCount: 1, override: false }]),
+  });
+  const row = lines.find((l) => /skills-catalog/.test(l));
+  assert.ok(!/name-only/.test(row), `no action claimed without a verdict, got: ${row}`);
+  assert.ok(!('skillOverrides' in JSON.parse(settingsJson)));
+  // One line saying why, instead of one "does not qualify" line per skill: with the guard
+  // met, "none qualifies" means the skills are in use — a different fact from thin evidence.
+  const note = lines.find((l) => /^Skills:/.test(l));
+  assert.match(note, /none qualifies/);
+  assert.match(note, /model-invoked/);
+});
+
+test('a catalog with too little evidence says so, and does not read as "already lean"', () => {
+  const { lines } = renderFineTune({
+    sessionId: 'sess-s3',
+    requests: 1,
+    shipped: [],
+    deny: [],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    skills: skillCorpus([{ name: 'dataviz', bytes: 1157, override: false }], { sessionCount: 1, singleSession: true }),
+  });
+  const note = lines.find((l) => /^Skills:/.test(l));
+  assert.match(note, /1\/3 sessions/, 'the guard denominator, not a silent flag-only');
+  assert.ok(!lines.some((l) => /keep \(invoked/.test(l)), 'no per-skill paragraph under a cost-only row');
+});
+
+test('renderFineTune counts the skills recovery once — the total is not inflated by the lever', () => {
+  // The lever measures the SAME bytes as the catalog row it acts on, so adding a second row
+  // would double the shipped total of a session that ships one catalog.
+  const withLever = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: [],
+    deny: [],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+    skills: skillCorpus([{ name: 'dataviz', bytes: 1157 }]),
+  });
+  const withoutLever = renderFineTune({
+    sessionId: 's',
+    requests: 1,
+    shipped: [],
+    deny: [],
+    mcp: EMPTY_MCP_CORPUS,
+    gain: skillsGain(5119),
+  });
+  const total = (r) => r.lines.find((l) => /^Total/.test(l));
+  assert.equal(
+    total(withLever).match(/(\d[\d.]*K?)\s+\S+$/)[1],
+    total(withoutLever).match(/(\d[\d.]*K?)\s+\S+$/)[1],
+    'same shipped total with and without a verdict',
+  );
+});
+
 // ── fineTune() end-to-end on a synthetic session ──────────────────────────────
 
 test('fineTune intersects the session tools[] with the denylist (denylist order)', () => {
@@ -248,6 +362,80 @@ test('fineTune honors --session and defaults to the latest session', () => {
 
   assert.equal(fineTune({ cwd: '/nonexistent', root }).sessionId, 'new', 'latest by default');
   assert.equal(fineTune({ cwd: '/nonexistent', root, session: 'old' }).sessionId, 'old', '--session honored');
+});
+
+/**
+ * Write a captured session whose turn-1 message carries a skills catalog listing `entries`,
+ * and whose response invokes `invoked` through the `Skill` tool — the two halves of lever
+ * 5a's evidence, in the shapes Claude Code actually puts on the wire.
+ */
+function writeSkillsSession(root, id, entries, invoked = []) {
+  const dir = path.join(root, 'sessions', id);
+  fs.mkdirSync(dir, { recursive: true });
+  const catalog =
+    '<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n' +
+    entries.map(([name, desc]) => `- ${name}: ${desc}`).join('\n') +
+    '\n</system-reminder>';
+  fs.writeFileSync(
+    path.join(dir, '0001.request.http'),
+    buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(
+        JSON.stringify({
+          model: 'claude-x',
+          system: [{ type: 'text', text: 'You are Claude Code.' }],
+          tools: [{ name: 'Bash' }],
+          messages: [{ role: 'user', content: [{ type: 'text', text: catalog }, { type: 'text', text: 'hi' }] }],
+        })
+      ),
+    })
+  );
+  let sse = 'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+  invoked.forEach((skill, i) => {
+    sse += `data: ${JSON.stringify({ type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: `t${i}`, name: 'Skill' } })}\n\n`;
+    sse += `data: ${JSON.stringify({ type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: JSON.stringify({ skill }) } })}\n\n`;
+  });
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), sse);
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, thread_id: id, request_blob: '0001.request.http', response_blob: '0001.response.sse' }) + '\n'
+  );
+  return dir;
+}
+
+test('fineTune emits name-only over the corpus for a skill the model never invoked', () => {
+  const root = mkTmpDir();
+  const entries = [
+    ['dataviz', 'a long description that costs real bytes on every single request'],
+    ['tdd', 'red-green-refactor'],
+  ];
+  writeSkillsSession(root, 'sess-1', entries, ['tdd']);
+  writeSkillsSession(root, 'sess-2', entries);
+  writeSkillsSession(root, 'sess-3', entries);
+
+  const res = fineTune({ cwd: '/nonexistent', root });
+  assert.equal(res.skills.sessionCount, 3);
+  assert.deepEqual(res.json.settings.auto.skillOverrides, { dataviz: 'name-only' }, 'tdd was invoked — spared');
+  assert.deepEqual(JSON.parse(res.settingsJson).skillOverrides, { dataviz: 'name-only' });
+  // The contract invariant: auto ∪ advice IS the paste-ready block (issue #95).
+  assert.deepEqual({ ...res.json.settings.auto, ...res.json.settings.advice }, JSON.parse(res.settingsJson));
+  const skills = res.json.safeLevers.find((l) => l.lever === 'skills');
+  assert.ok(skills.items.find((i) => i.name === 'dataviz').bytes > 0, 'the verdict names bytes');
+});
+
+test('fineTune never emits a skills verdict in single-session mode', () => {
+  const root = mkTmpDir();
+  const entries = [['dataviz', 'a long description']];
+  writeSkillsSession(root, 'sess-1', entries);
+  writeSkillsSession(root, 'sess-2', entries);
+  writeSkillsSession(root, 'sess-3', entries);
+
+  const res = fineTune({ cwd: '/nonexistent', root, latest: true });
+  assert.equal(res.skills.singleSession, true);
+  assert.ok(!('skillOverrides' in res.json.settings.auto), 'one session is too thin for a global verdict');
+  assert.equal(res.json.safeLevers.find((l) => l.lever === 'skills').verdict, 'flag-only');
 });
 
 test('fineTune throws like report on a missing session and on no sessions', () => {

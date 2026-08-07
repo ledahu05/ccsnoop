@@ -71,6 +71,13 @@ export const SYSTEM_LEVERS = /** @type {const} */ ([
 ]);
 
 /**
+ * The skills catalog population, by name. The lever that acts on it (ADR-0005 lever 5a) and
+ * the two surfaces that display it all need this string; naming it here — beside the lever
+ * list it belongs to — keeps them from each spelling it themselves.
+ */
+export const SKILLS_CATALOG = /** @type {const} */ ('skills-catalog');
+
+/**
  * The subset of levers that are CATALOG POPULATIONS — the `<system-reminder>` listings
  * Claude Code injects, several of which may ride one block and therefore be carved out of
  * it. In the order a block presents them, which is also `floor`'s stable row order.
@@ -221,11 +228,14 @@ const CONTENTS_OF_PATH = /Contents of (\S[^()\n]*?)\s+\((?:project|user|local)\s
 
 /**
  * The text payload of a `system` block — a bare string, or the `text` field of a
- * `{ type: 'text', text, cache_control? }` content block. Never throws.
+ * `{ type: 'text', text, cache_control? }` content block. Never throws. Exported because
+ * every consumer of the classifier needs it to decide whether a block carries text at all,
+ * and three of them had copied it (issue #118 review) — the module that decides what a
+ * block IS owns how to read one.
  * @param {any} block
  * @returns {string}
  */
-function blockText(block) {
+export function blockText(block) {
   if (typeof block === 'string') return block;
   if (block && typeof block.text === 'string') return block.text;
   return '';
@@ -371,6 +381,38 @@ export function classifySystemBlock(block, opts = {}) {
   // decide v1. `surface` is live (issue #117).
   const { lever, floor, source } = classifySystemSpans(block, { surface: opts.surface })[0];
   return { lever, floor, source };
+}
+
+/**
+ * Visit every text block of a parsed request body with the SURFACE it rode — `system[]`
+ * first, then every `messages[*].content` block. Both surfaces are walked because which one
+ * Claude Code injects a listing into is a build detail (bench/SPEC.md §4), and the surface
+ * travels with the block because {@link classifySystemSpans} needs it to tell an injected
+ * reminder from the user's own prose (issue #117).
+ *
+ * One walk, shared by every consumer that classifies whole bodies (`floor-catalog.js`,
+ * `finetune-skills.js`). `finetune-gain.js` keeps its own: it must also carry the `system#<i>`
+ * / `message#<m>` INDEX to find each block's carrier segment, which is a different question.
+ * Null-safe.
+ *
+ * @param {any} body  Parsed request JSON (null-safe).
+ * @returns {Generator<{ block: any, surface: 'system' | 'message' }>}
+ */
+export function* walkTextBlocks(body) {
+  if (!body || typeof body !== 'object') return;
+  const sys = body.system;
+  const sysBlocks = Array.isArray(sys) ? sys : sys == null ? [] : [sys];
+  for (const block of sysBlocks) yield { block, surface: 'system' };
+  const msgs = Array.isArray(body.messages) ? body.messages : [];
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue;
+    const c = m.content;
+    if (Array.isArray(c)) {
+      for (const block of c) yield { block, surface: 'message' };
+    } else {
+      yield { block: c, surface: 'message' }; // a bare-string message content
+    }
+  }
 }
 
 /**

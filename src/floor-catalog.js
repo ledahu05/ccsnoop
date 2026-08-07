@@ -37,7 +37,14 @@
 // double-counted. Per-block bytes are therefore unchanged from #113: the inversion is a
 // refactor of provenance, not of measurement.
 
-import { classifySystemSpans, CATALOG_LEVERS, SUBLIST_HEADERS, isCatalogLever } from './finetune-system.js';
+import {
+  classifySystemSpans,
+  CATALOG_LEVERS,
+  SUBLIST_HEADERS,
+  isCatalogLever,
+  blockText,
+  walkTextBlocks,
+} from './finetune-system.js';
 
 /**
  * The three catalog populations, as `floor`-block kinds — the shared classifier's
@@ -85,6 +92,21 @@ const BARE_TOKEN = /^[A-Za-z0-9_.-]+$/;
 /** A bulleted catalog entry: `- <name>: <rest>`. The name stops at the first colon. */
 const BULLET_ENTRY = /^-\s+([^:]+):\s*(.*)$/;
 /**
+ * A bulleted entry whose name is SCOPE-QUALIFIED: `- plugin:skill: <description>`, the shape
+ * Claude Code lists a plugin skill under (and a directory-scoped one, `apps/web:deploy`).
+ * Tried before BULLET_ENTRY, which would cut such a name at its first colon and hand
+ * `plugin` back — a name that looks unqualified. Lever 5a reads exactly that qualifier to
+ * decide a skill is out of `skillOverrides`' reach (ADR-0005 fact 2), so the truncation
+ * would turn an unreachable skill into a phantom `skillOverrides` entry that silently does
+ * nothing.
+ *
+ * The name is a run of bare tokens joined by colons; a colon may only JOIN (the char after
+ * it must be a name character), so an ordinary `- tdd: description` still yields `tdd` and
+ * `- tdd:` (empty description) still yields `tdd`. A name carrying anything outside the
+ * charset — a space, say — falls through to BULLET_ENTRY unchanged.
+ */
+const QUALIFIED_ENTRY = /^-\s+([A-Za-z0-9_./-]+(?::[A-Za-z0-9_./-]+)*):\s*(.*)$/;
+/**
  * A catalog entry listed WITHOUT its description: `- <name>`, nothing else on the line
  * (issue #115). Claude Code emits this shape from two independent paths — a
  * `skillOverrides` entry set to `name-only` (the action ADR-0005's lever 5a writes, and
@@ -107,51 +129,6 @@ const NAME_ONLY_ENTRY = /^-\s+([A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)\s*$/;
 const REMINDER_TAG = /^<\/?system-reminder>/;
 
 /**
- * The text payload of a content block — a bare string, or the `text` field of a
- * `{ type: 'text', text }` block. Null-safe (mirrors `finetune-system.js`'s `blockText`).
- * @param {any} block
- * @returns {string}
- */
-function blockText(block) {
-  if (typeof block === 'string') return block;
-  if (block && typeof block.text === 'string') return block.text;
-  return '';
-}
-
-/**
- * Visit every content block of a parsed request body — `body.system` and every
- * `messages[*].content` block. Mirrors the surface walk `finetune-gain.js` /
- * `finetune-mcp.js` use; floor needs its own because those modules' walks are private.
- * Null-safe.
- *
- * Both surfaces are walked because the fidelity question of WHERE CC injects these blocks
- * (`system[]` vs the first user message) is exactly the open question FT3 left
- * (test/fixtures/finetune/README.md); detecting on both surfaces is robust across CC
- * builds. Which surface a block rode is yielded with it and handed to the classifier: a
- * population is header-detected and so surface-independent, but passing it keeps every
- * consumer of the one authority asking the same question (issue #117) rather than leaving
- * this walk the only surface-blind caller.
- * @param {any} body  Parsed request JSON.
- * @returns {Generator<{ block: any, surface: 'system' | 'message' }>}
- */
-function* walkBodyBlocks(body) {
-  if (!body || typeof body !== 'object') return;
-  const sys = body.system;
-  const sysBlocks = Array.isArray(sys) ? sys : sys == null ? [] : [sys];
-  for (const block of sysBlocks) yield { block, surface: 'system' };
-  const msgs = Array.isArray(body.messages) ? body.messages : [];
-  for (const m of msgs) {
-    if (!m || typeof m !== 'object') continue;
-    const c = m.content;
-    if (Array.isArray(c)) {
-      for (const block of c) yield { block, surface: 'message' };
-    } else {
-      yield { block: c, surface: 'message' }; // a bare-string message content
-    }
-  }
-}
-
-/**
  * Find the catalog populations in a parsed turn-1 body. Walks every text block on both
  * surfaces, hands each to the shared classifier, and keeps the spans that are catalog
  * populations — one `CatalogBlock` each. The classifier covers both capture shapes: a
@@ -171,7 +148,7 @@ export function findCatalogBlocks(body) {
   const out = [];
   /** @type {Set<CatalogKind>} */
   const seen = new Set();
-  for (const { block, surface } of walkBodyBlocks(body)) {
+  for (const { block, surface } of walkTextBlocks(body)) {
     if (!blockText(block)) continue;
     const spans = classifySystemSpans(block, { surface });
     if (!spans.some((s) => isCatalogLever(s.lever))) continue;
@@ -272,10 +249,11 @@ function parseDeferredTools(text) {
  * An entry may also arrive WITHOUT its description (`- <name>`, no colon) — see
  * NAME_ONLY_ENTRY, which is tried first.
  *
- * For a described entry the name stops at the first colon. Scope-prefixed names
- * (`plugin:name`) are issue #105's territory and are not split here — none appears in the
- * committed fixture. A name-only entry is the one exception: there is no description to
- * separate, so its colons are part of the name.
+ * A scope-qualified name (`plugin:skill`, `apps/web:deploy`) is kept WHOLE by
+ * QUALIFIED_ENTRY, tried next: the qualifier is what tells lever 5a the skill is out of
+ * `skillOverrides`' reach, so cutting the name at its first colon would hide that. Only a
+ * name the qualified pattern cannot describe (one with a space, say) falls through to
+ * BULLET_ENTRY, where the name stops at the first colon.
  * @param {string} text
  * @returns {CatalogEntry[]}
  */
@@ -287,7 +265,7 @@ function parseBulleted(text) {
   for (const raw of text.split('\n')) {
     const line = raw.trim();
     if (REMINDER_TAG.test(line)) continue;
-    const m = line.match(NAME_ONLY_ENTRY) ?? line.match(BULLET_ENTRY);
+    const m = line.match(NAME_ONLY_ENTRY) ?? line.match(QUALIFIED_ENTRY) ?? line.match(BULLET_ENTRY);
     if (m) {
       if (cur) flushBulleted(cur, out);
       cur = { name: m[1].trim(), lines: [raw] };

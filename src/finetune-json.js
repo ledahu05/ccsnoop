@@ -13,7 +13,7 @@
 // — it would have to re-derive which levers carry dynamic proof. So this module
 // produces the split INSIDE fine-tune, in two mirrored places:
 //
-//   • lever tiers — `safeLevers` (tools, mcp: dynamic proof → auto-appliable) and
+//   • lever tiers — `safeLevers` (tools, mcp, skills: dynamic proof → auto-appliable) and
 //     `adviceLevers` (hooks, claudeMd: no dynamic proof → paste-only).
 //   • settings    — `settings.auto` (the keys the skill may write on approval) and
 //     `settings.advice` (the keys it must only surface for the user to paste).
@@ -33,7 +33,14 @@
 import { DEFAULT_WASTE_CONFIG } from './waste.js';
 import { NULL_SOURCE, HOOK_INTENT_CAVEAT } from './finetune-levers.js';
 import { mcpServerOf, MCP_GUARD_MIN_SESSIONS } from './finetune-mcp.js';
-import { CATALOG_LEVERS } from './finetune-system.js';
+import { CATALOG_LEVERS, SKILLS_CATALOG } from './finetune-system.js';
+import {
+  EMPTY_SKILL_CORPUS,
+  SKILLS_GUARD_MIN_SESSIONS,
+  SKILL_OVERRIDE_ACTION,
+  skillOverrideMap,
+  skillRecoverableBytes,
+} from './finetune-skills.js';
 
 /**
  * The pinned URI of this contract version. Resolves to the in-tree schema doc
@@ -58,16 +65,21 @@ const NOTE =
 const FLOOR_NOTE = 'Incompressible harness system[] preamble — shown for context, never recoverable.';
 
 /**
- * The catalog note. These populations are byte cost with NO lever behind them yet: naming
- * them is what #116 delivered, acting on them (`skillOverrides`, ADR-0005 lever 5a) is a
- * later slice. Saying so explicitly keeps a consumer from reading `shipped` as a claim.
+ * The catalog note. These populations are byte COST — the section itself never carries a
+ * verdict. Two of the three still have no lever at all; the third (skills) does since #118,
+ * and its verdict lives in `safeLevers[skills]`, reporting the SAME bytes this section
+ * measures. Saying both things explicitly keeps a consumer from reading `shipped` as a
+ * claim, and from adding the skills lever's figure to this one.
  */
 const CATALOG_NOTE =
   'The <system-reminder> catalogs Claude Code injects: the ToolSearch deferred-tools ' +
-  'listing, the Agent-tool agent types, and the Skill-tool catalog. Byte cost only at ' +
-  'this version — no lever acts on them, so none of these bytes is in totals.recoverable. ' +
-  'Before #116 these bytes were charged to safeLevers[mcp].shipped (or dropped entirely ' +
-  'when they rode the message surface); reading gain.mcp as "the catalog" no longer works.';
+  'listing, the Agent-tool agent types, and the Skill-tool catalog. Byte cost only — this ' +
+  'section carries no verdict. The deferred-tools and agent-types populations have no lever ' +
+  'at all, so none of their bytes is in totals.recoverable; the skills catalog does since ' +
+  '#118 (ADR-0005 lever 5a) and is reported under safeLevers[skills], which measures THESE ' +
+  'bytes — do not add the two. Before #116 all of it was charged to safeLevers[mcp].shipped ' +
+  '(or dropped entirely when it rode the message surface); reading gain.mcp as "the ' +
+  'catalog" no longer works.';
 
 /**
  * The levers that actually act, and the byte sums behind the headline. Shared by the
@@ -79,13 +91,21 @@ const CATALOG_NOTE =
  * excludable-above-floor CLAUDE.md). Non-actionable waste (flag-only MCP, below-floor
  * hook, managed CLAUDE.md, the harness floor) is shown but never counted.
  *
+ * The skills lever's share (issue #118) is the one figure not read straight out of the gain
+ * model: the block's `waste` is what the whole catalog re-pays, while the lever recovers
+ * only the DESCRIPTIONS of the qualifying skills. So it is the per-skill recovery CAPPED by
+ * the block's re-payment — a lever may never claim more than the block it lives in re-pays,
+ * and a fully-cached catalog recovers nothing, exactly like every other lever here.
+ *
  * @param {{ deny: string[], mcp: import('./finetune-mcp.js').McpCorpus,
+ *   skills?: import('./finetune-skills.js').SkillCorpus,
  *   levers: import('./finetune-levers.js').LeverVerdicts,
  *   gain: import('./finetune-gain.js').GainModel }} ctx
  * @returns {{ hook: import('./finetune-levers.js').HookVerdict, mcpDeny: string[],
- *   claudeMdExclude: string[], hookDeny: boolean, recoverable: number }}
+ *   claudeMdExclude: string[], hookDeny: boolean, skillOverrides: Record<string, string>,
+ *   skillsWaste: number, recoverable: number }}
  */
-export function summarizeLevers({ deny, mcp, levers, gain }) {
+export function summarizeLevers({ deny, mcp, skills = EMPTY_SKILL_CORPUS, levers, gain }) {
   const hook = levers.hook;
   const mcpDeny = mcp.servers.filter((s) => s.deny).map((s) => s.name);
   // deny ⇒ excludable ⇒ source is a non-null path, so these are plain strings.
@@ -99,7 +119,29 @@ export function summarizeLevers({ deny, mcp, levers, gain }) {
     .filter((c) => c.deny)
     .reduce((s, c) => s + (gain.claudeMd.get(c.source ?? NULL_SOURCE)?.waste ?? 0), 0);
 
-  return { hook, mcpDeny, claudeMdExclude, hookDeny, recoverable: deniedToolsWaste + mcpWaste + hookWaste + claudeMdWaste };
+  const skillOverrides = skillOverrideMap(skills);
+  const skillsWaste = Math.min(skillRecoverableBytes(skills), skillsCatalogGain(gain).waste);
+
+  return {
+    hook,
+    mcpDeny,
+    claudeMdExclude,
+    hookDeny,
+    skillOverrides,
+    skillsWaste,
+    recoverable: deniedToolsWaste + mcpWaste + hookWaste + claudeMdWaste + skillsWaste,
+  };
+}
+
+/**
+ * The gain model's skills-catalog bucket — the population the skills lever acts on. The one
+ * lookup, shared by the summary and the lever entry, so "which bytes is this lever about"
+ * has a single answer.
+ * @param {import('./finetune-gain.js').GainModel} gain
+ * @returns {{ shipped: number, waste: number }}
+ */
+function skillsCatalogGain(gain) {
+  return gain.catalog?.get(SKILLS_CATALOG) ?? { shipped: 0, waste: 0 };
 }
 
 /**
@@ -244,6 +286,67 @@ function buildMcpEntry({ mcp, gain, perServer, mcpDeny }) {
 }
 
 /**
+ * The skills-catalog lever (safe tier — ADR-0005 lever 5a, issue #118). Emits
+ * `skillOverrides: name-only` for every skill the corpus shipped and the model never
+ * invoked, under the MCP lever's guard verbatim (`sessionCount >= 3`, never in
+ * single-session mode); otherwise flag-only.
+ *
+ * `shipped` is the skills-catalog population's bytes — the SAME figure
+ * `catalog.populations[skills-catalog].shipped` reports, deliberately not a second helping,
+ * which is why `totals.shipped` counts it through the catalog section alone. `waste` is the
+ * capped per-skill recovery (see {@link summarizeLevers}); per-skill `bytes` are the raw
+ * entry bytes `floor --detail` ranks on, a lower bound on the canonical loss.
+ *
+ * @param {{ skills: import('./finetune-skills.js').SkillCorpus,
+ *   gain: import('./finetune-gain.js').GainModel,
+ *   skillOverrides: Record<string, string>, skillsWaste: number }} ctx
+ */
+function buildSkillsEntry({ skills, gain, skillOverrides, skillsWaste }) {
+  const names = Object.keys(skillOverrides);
+  const items = skills.skills.map((s) => ({
+    name: s.name,
+    bytes: s.bytes,
+    shippedSessions: s.shippedSessions,
+    invokedCount: s.invokedCount,
+    reachable: s.reachable,
+    override: s.override,
+  }));
+  const verdict = names.length > 0 ? SKILL_OVERRIDE_ACTION : items.length > 0 ? 'flag-only' : 'none';
+  return {
+    lever: 'skills',
+    // The catalog population these bytes belong to. The issue's exit criterion asks for a
+    // "skills-catalog verdict", and this is the field that joins the verdict to the
+    // `catalog.populations[]` row measuring the same bytes — findable by either name.
+    population: SKILLS_CATALOG,
+    tier: 'safe',
+    verdict,
+    action: 'skillOverrides',
+    evidence:
+      'corpus guard: sessionCount >= 3 AND the MODEL never invoked the skill (a Skill ' +
+      'tool_use). A /name the user typed is not an invocation and never spares a skill — ' +
+      'name-only leaves /name working, so a slash-only skill is one whose description ' +
+      'bought nothing. Binary on absence; never acts in single-session mode.',
+    guard: {
+      sessionCount: skills.sessionCount,
+      minSessions: SKILLS_GUARD_MIN_SESSIONS,
+      singleSession: Boolean(skills.singleSession),
+    },
+    scope:
+      'The action is always name-only, never off or user-invocable-only: the skill stays ' +
+      'listed and fully invocable, only its description stops shipping. A scope-qualified ' +
+      'name (reachable: false) is a plugin (or directory-scoped) skill no skillOverrides ' +
+      'entry reaches — reported, never written (ADR-0005 lever 5b). shipped is the same ' +
+      'measurement as catalog.populations[skills-catalog].shipped, not an addition to it; ' +
+      'per-skill bytes are raw entry bytes, a lower bound on the canonical bytes the block ' +
+      'loses (the block is measured as escaped JSON).',
+    shipped: skillsCatalogGain(gain).shipped,
+    waste: skillsWaste,
+    names,
+    items,
+  };
+}
+
+/**
  * The SessionStart hooks lever (advice tier — no dynamic proof). Emits
  * `hooks.SessionStart` removal only above the floor, always carrying the
  * "intent unknown" caveat; never claims "unused".
@@ -364,9 +467,13 @@ function sumTokens(exchanges) {
  * {@link buildToolsEntry}. Each defaults to `[]`, which costs a consumer only detail,
  * never a wrong verdict.
  *
+ * `skills` is the skills-catalog corpus (issue #118); it defaults to the empty corpus, so a
+ * caller that does not compute it gets an inert lever entry rather than a crash.
+ *
  * @param {{ sessionId: string, requests: number, scope?: 'corpus' | 'single',
  *   shipped: string[], deny: string[], denyAllowed?: string[],
  *   mcp: import('./finetune-mcp.js').McpCorpus,
+ *   skills?: import('./finetune-skills.js').SkillCorpus,
  *   levers: import('./finetune-levers.js').LeverVerdicts,
  *   gain: import('./finetune-gain.js').GainModel,
  *   exchanges?: Array<{ usage?: any }> }} ctx
@@ -374,15 +481,37 @@ function sumTokens(exchanges) {
  * @returns {Record<string, any>}
  */
 export function buildJsonReport(ctx, opts = {}) {
-  const { sessionId, requests, scope = 'corpus', shipped = [], deny, denyAllowed = [], mcp, levers, gain, exchanges } = ctx;
-  const { mcpDeny, claudeMdExclude, hook, hookDeny, recoverable } = summarizeLevers({ deny, mcp, levers, gain });
+  const {
+    sessionId,
+    requests,
+    scope = 'corpus',
+    shipped = [],
+    deny,
+    denyAllowed = [],
+    mcp,
+    skills = EMPTY_SKILL_CORPUS,
+    levers,
+    gain,
+    exchanges,
+  } = ctx;
+  const { mcpDeny, claudeMdExclude, hook, hookDeny, skillOverrides, skillsWaste, recoverable } = summarizeLevers({
+    deny,
+    mcp,
+    skills,
+    levers,
+    gain,
+  });
 
   const toolsEntry = buildToolsEntry({ shipped, deny, denyAllowed, gain });
   const mcpEntry = buildMcpEntry({ mcp, gain, perServer: sumMcpServerBytes(gain.tool), mcpDeny });
+  const skillsEntry = buildSkillsEntry({ skills, gain, skillOverrides, skillsWaste });
   const hooksEntry = buildHooksEntry({ hook, gain });
   const claudeMdEntry = buildClaudeMdEntry({ levers, gain });
   const catalogEntry = buildCatalogEntry({ gain });
 
+  // The skills lever is deliberately NOT summed here: its `shipped` is the skills-catalog
+  // population, which `catalogEntry.shipped` already carries. One measurement, two names,
+  // counted once (see `buildSkillsEntry`).
   const totalShipped =
     toolsEntry.shipped +
     mcpEntry.shipped +
@@ -398,6 +527,7 @@ export function buildJsonReport(ctx, opts = {}) {
   // mutate, so it must never alias the caller's `deny` / the summary's own arrays.
   const auto = { permissions: { deny: [...deny] } };
   if (mcpDeny.length > 0) auto.disabledMcpjsonServers = [...mcpDeny];
+  if (Object.keys(skillOverrides).length > 0) auto.skillOverrides = { ...skillOverrides };
   const advice = {};
   if (hookDeny) advice.hooks = { SessionStart: [] };
   if (claudeMdExclude.length > 0) advice.claudeMdExcludes = [...claudeMdExclude];
@@ -413,7 +543,7 @@ export function buildJsonReport(ctx, opts = {}) {
     totals: { shipped: totalShipped, recoverable },
     floor: { shipped: gain.harness.shipped, waste: null, action: 'none', note: FLOOR_NOTE },
     catalog: catalogEntry,
-    safeLevers: [toolsEntry, mcpEntry],
+    safeLevers: [toolsEntry, mcpEntry, skillsEntry],
     adviceLevers: [hooksEntry, claudeMdEntry],
     settings: { auto, advice },
   };
