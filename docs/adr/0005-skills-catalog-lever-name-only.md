@@ -4,6 +4,14 @@
 - **Date**: 2026-08-07
 - **Context**: ccsnoop fine-tune — the skills catalog is the first line item of the turn-1 floor
 - **Ticket**: [#105](https://github.com/ledahu05/ccsnoop/issues/105); builds on [#109](https://github.com/ledahu05/ccsnoop/issues/109) (floor ventilation), governed by [ADR-0004](./0004-skill-auto-applies-safe-levers.md)
+- **Confirmed**: [#115](https://github.com/ledahu05/ccsnoop/issues/115) —
+  [`docs/research/skill-overrides-name-only.md`](../research/skill-overrides-name-only.md). The
+  three binary reads below hold on the bench-pinned `2.1.220` as well as on `2.1.224`, and the
+  action was measured on the wire: a `name-only` entry falls to exactly its name line
+  (`dataviz` 1 157 → 10 B), with no residue. Two amendments from that measurement: the symbol
+  names quoted here (`p4e`, `ho`, `O4_`) are `2.1.224`'s, not `2.1.220`'s (same code, different
+  minifier output); and `disableBundledSkills` drops bundled skills from the **slash-command**
+  list too, not only from the model's — so lever 5b must present it as losing `/name` as well.
 
 ## Context
 

@@ -686,6 +686,72 @@ test('computeFloor: catalog entries are parsed, ranked, and sum to under the blo
   }
 });
 
+// ── name-only entries (issue #115) ────────────────────────────────────────────
+//
+// A skill listed WITHOUT its description renders as a bare `- <name>` line — no colon.
+// Two independent paths produce it, so this shape is not exotic:
+//   • `skillOverrides: { "<name>": "name-only" }` in settings.json — the key Claude Code's
+//     own `/skills` UI writes, and the action lever 5a will emit (ADR-0005);
+//   • Claude Code's own catalog budget: on overflow it degrades the biggest entries to
+//     `- <name>`, biggest-first (`budgetTruncatedSkills`) — no user setting involved.
+// Both were confirmed on the bench-pinned build; see docs/research/skill-overrides-name-only.md.
+
+/** The `- name` (no colon) shape, alongside a normal `- name: description` entry. */
+const SKILLS_NAME_ONLY_TXT =
+  'The following skills are available for use with the Skill tool:\n\n- dataviz\n- claude-api: Reference for the Claude API.\nTRIGGER — read BEFORE opening the target file.\n';
+
+test('computeFloor: a name-only skill is its own entry, not bytes folded into its neighbour (issue #115)', () => {
+  const wrap = (t) => ({ type: 'text', text: `<system-reminder>\n${t}</system-reminder>` });
+  const model = catalogModel('separate');
+  // Swap the skills block for one carrying a name-only entry, leaving the rest alone.
+  const content = [{ type: 'text', text: 'hello' }, wrap(DEFERRED_TXT), wrap(AGENTS_TXT), wrap(SKILLS_NAME_ONLY_TXT)];
+  const body = {
+    model: 'claude-test',
+    system: [{ type: 'text', text: 'harness preamble' + 'H'.repeat(400) }],
+    tools: [{ name: 'Read' }],
+    messages: [{ role: 'user', content }],
+  };
+  model.exchanges[0].requestBlob = buildRequestBlob({
+    method: 'POST',
+    url: '/v1/messages',
+    rawHeaders: ['Content-Type', 'application/json'],
+    body: Buffer.from(JSON.stringify(body)),
+  });
+
+  const skills = computeFloor(model).attribution.find((a) => a.kind === 'skills-catalog');
+  assert.deepEqual(skills.entries.map((e) => e.name).sort(), ['claude-api', 'dataviz'], 'the name-only skill is named');
+  const viz = skills.entries.find((e) => e.name === 'dataviz');
+  // This is the whole point of `name-only`: the entry costs its name and nothing else.
+  assert.equal(viz.bytes, Buffer.byteLength('- dataviz\n', 'utf8'), 'a name-only entry costs exactly its name line');
+  // The failure mode being pinned: a no-colon line read as a CONTINUATION would charge
+  // dataviz's bytes to whatever entry precedes it, inflating a skill that is in active use.
+  const api = skills.entries.find((e) => e.name === 'claude-api');
+  assert.ok(!/dataviz/.test(String(api.bytes)) && api.bytes < skills.bytes, 'no cross-charge to the neighbour');
+});
+
+test('computeFloor: a bulleted description is never mistaken for a name-only entry (issue #115)', () => {
+  // The discriminator is "a single bare token after the dash". A description whose
+  // continuation line happens to start with `- ` is prose — it must still fold in.
+  const wrap = (t) => ({ type: 'text', text: `<system-reminder>\n${t}</system-reminder>` });
+  const txt =
+    'The following skills are available for use with the Skill tool:\n\n- tdd: Test-driven development.\n- when the user wants red-green-refactor\n';
+  const model = catalogModel('separate');
+  const body = {
+    model: 'claude-test',
+    system: [{ type: 'text', text: 'harness preamble' + 'H'.repeat(400) }],
+    tools: [{ name: 'Read' }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }, wrap(txt)] }],
+  };
+  model.exchanges[0].requestBlob = buildRequestBlob({
+    method: 'POST',
+    url: '/v1/messages',
+    rawHeaders: ['Content-Type', 'application/json'],
+    body: Buffer.from(JSON.stringify(body)),
+  });
+  const skills = computeFloor(model).attribution.find((a) => a.kind === 'skills-catalog');
+  assert.deepEqual(skills.entries.map((e) => e.name), ['tdd'], 'the prose line folded into tdd, it is not an entry');
+});
+
 test('renderFloor: --detail adds a per-entry section below the total, leaving the table intact', () => {
   const ctx = computeFloor(catalogModel('separate'));
   const plain = renderFloor(ctx).lines.join('\n');
