@@ -135,6 +135,19 @@ const MCP_TOOL_NAME = /\bmcp__[A-Za-z0-9_.-]+__/;
 const DEFERRED_TOOLS_HDR = /^The following deferred tools are now available via ToolSearch\./m;
 const AGENT_TYPES_HDR = /^Available agent types for the Agent tool:/m;
 const SKILLS_HDR = /^The following skills are available for use with the Skill tool:/m;
+// The envelope Claude Code wraps every block it INJECTS into a user message in. On the
+// `system` surface nothing is conversation, so no envelope is needed there; on the
+// `messages[*]` surface it is the discriminator between an injected block and the user's
+// own prose (issue #117). Only the header-less fallbacks consult it — a block carrying a
+// population header, a CLAUDE.md `Contents of …` line or a hook status line is
+// positively identified with or without it.
+//
+// Matched on the OPENING TAG NAME only, case-insensitively: a build that adds an
+// attribute (`<system-reminder priority="high">`) must still read as injected. Requiring
+// the exact `<system-reminder>` would make a real listing invisible again — the failure
+// this whole slice exists to remove.
+const REMINDER_ENVELOPE = /<system-reminder/i;
+
 // The MCP sub-list of the deferred listing. This — and ONLY this — is what
 // `mcp-deferred` names now: a repo with no MCP server never emits this header, so it
 // never reports `mcp-deferred` bytes (issue #116's exit criterion).
@@ -175,6 +188,19 @@ export const SUBLIST_HEADERS = /** @type {const} */ ({
  */
 export function isCatalogLever(lever) {
   return /** @type {readonly string[]} */ (CATALOG_LEVERS).includes(lever);
+}
+
+/**
+ * Is this block wrapped in the `<system-reminder>` envelope Claude Code puts around
+ * everything it INJECTS into a user message? The one probe: the fallback inside
+ * {@link classifySystemSpans} needs it to tell an injected listing from prose, and
+ * `finetune-levers.js` needs it to decide whether a message block belongs in the
+ * "% of system" denominator. Two consumers, one spelling (issue #117).
+ * @param {any} block
+ * @returns {boolean}
+ */
+export function hasReminderEnvelope(block) {
+  return REMINDER_ENVELOPE.test(blockText(block));
 }
 
 // Real-capture markers (CC v2.1.220, the FT0 fixture's format). The sentinels
@@ -279,10 +305,18 @@ function populationHits(t) {
  *   • otherwise one span: an MCP deferred listing by its `mcp__<server>__*` names, else
  *     the harness floor.
  *
+ * `opts.surface` says which surface the block came from, and only the LAST shape reads
+ * it. That fallback recognizes a listing by stray tool names rather than by a header, so
+ * on the `messages[*]` surface it is trusted only inside CC's `<system-reminder>`
+ * envelope: a user prompt that merely names `mcp__server__tool` is prose, and charging it
+ * to the MCP lever would inflate the floor by whatever the user typed (issue #117). It
+ * defaults to `'system'`, where nothing is conversation and no envelope is required.
+ *
  * @param {any} block  One `body.system[i]` or `messages[*].content[j]`.
+ * @param {{ surface?: 'system' | 'message' }} [opts]  Which surface the block rode.
  * @returns {SystemSpan[]}  Non-empty.
  */
-export function classifySystemSpans(block) {
+export function classifySystemSpans(block, opts = {}) {
   const t = blockText(block);
   const total = segBytes(block);
 
@@ -291,7 +325,12 @@ export function classifySystemSpans(block) {
 
   const hits = populationHits(t);
   if (hits.length === 0) {
-    const lever = MCP_TOOL_NAME.test(t) || MCP_STUB_TOOL.test(t) ? 'mcp-deferred' : 'harness';
+    // Header-less: the `mcp__<server>__*` names are the only evidence, so on the message
+    // surface the injection envelope must corroborate them. Unmatched → `harness`, which
+    // the gain model charges on the `system` surface only, i.e. conversation costs nothing.
+    const injected = opts.surface !== 'message' || REMINDER_ENVELOPE.test(t);
+    const mcpish = MCP_TOOL_NAME.test(t) || MCP_STUB_TOOL.test(t);
+    const lever = injected && mcpish ? 'mcp-deferred' : 'harness';
     return [{ lever, floor: lever === 'harness', source: null, text: t, bytes: total }];
   }
 
@@ -319,15 +358,18 @@ export function classifySystemSpans(block) {
  * Classify a single `system` block to its source lever (AC #1). The single-verdict view
  * of {@link classifySystemSpans}: a block's lever is its FIRST span's — its dominant
  * population. `opts.index` is reserved for an order-based refinement (v1 is
- * content-sufficient).
+ * content-sufficient); `opts.surface` is forwarded, so a caller walking BOTH surfaces gets
+ * the same verdict the gain model charges on — one block can never carry two verdicts.
  *
  * @param {any} block   One `body.system[i]` (string or `{type:'text',text}` block).
- * @param {{ index?: number, total?: number }} [opts]  Order context (reserved; v1 unused).
+ * @param {{ index?: number, total?: number, surface?: 'system' | 'message' }} [opts]
+ *     Order context (reserved; v1 unused) + which surface the block rode.
  * @returns {SystemLeverVerdict}
  */
 export function classifySystemBlock(block, opts = {}) {
-  void opts; // order seam — see module header; sentinels + floor-fallback decide v1.
-  const { lever, floor, source } = classifySystemSpans(block)[0];
+  // `index`/`total` are the order seam — see module header; sentinels + floor-fallback
+  // decide v1. `surface` is live (issue #117).
+  const { lever, floor, source } = classifySystemSpans(block, { surface: opts.surface })[0];
   return { lever, floor, source };
 }
 

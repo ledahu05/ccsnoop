@@ -38,7 +38,7 @@ import path from 'node:path';
 
 import { parseRequestBlob } from './report.js';
 import { canonicalize, DEFAULT_WASTE_CONFIG } from './waste.js';
-import { classifySystemBlock } from './finetune-system.js';
+import { classifySystemBlock, hasReminderEnvelope } from './finetune-system.js';
 
 /**
  * The diagnostic caveat every emitted hook removal carries (spec §3.3). A guard
@@ -112,18 +112,6 @@ export const EMPTY_LEVER_VERDICTS = /** @type {LeverVerdicts} */ ({
 });
 
 /**
- * The text payload of a content block — a bare string, or the `text` field of a
- * `{ type: 'text', text }` block. Null-safe. (Mirrors the FT3/FT4 helpers.)
- * @param {any} block
- * @returns {string}
- */
-function blockTextOf(block) {
-  if (typeof block === 'string') return block;
-  if (block && typeof block.text === 'string') return block.text;
-  return '';
-}
-
-/**
  * Canonical byte length of a block — delegated to waste.js' `canonicalize` so a
  * lever block's bytes use the SAME byte-length proxy as FT3's `Segment.bytes`
  * (one byte accounting, never re-tokenized). Null/undefined → 0.
@@ -154,14 +142,20 @@ function isExcludable(source) {
  * STATIC system context — `system[]`, any lever block, and any `<system-reminder>`
  * envelope (agents/skills listings CC injects) — NOT plain conversation history,
  * which grows turn over turn and would dilute the percentage.
+ *
+ * The surface is handed to the classifier (issue #117) so this walk and the gain model's
+ * reach the SAME verdict on the same block: without it, a user prompt that merely names an
+ * `mcp__<server>__<tool>` classified `mcp-deferred` here — not `harness` — and slipped
+ * into the denominator through the first clause below, quietly shrinking every CLAUDE.md
+ * percentage by whatever the user had typed.
  * @param {any} block
  * @param {{ hookBytes: number, claudeMd: Map<string, number>, systemBytes: number }} acc
  * @param {boolean} fromSystem
  */
 function visitBlock(block, acc, fromSystem) {
-  const verdict = classifySystemBlock(block);
+  const verdict = classifySystemBlock(block, { surface: fromSystem ? 'system' : 'message' });
   const bytes = blockBytes(block);
-  if (fromSystem || verdict.lever !== 'harness' || /<system-reminder/i.test(blockTextOf(block))) {
+  if (fromSystem || verdict.lever !== 'harness' || hasReminderEnvelope(block)) {
     acc.systemBytes += bytes;
   }
   if (verdict.lever === 'hook') {

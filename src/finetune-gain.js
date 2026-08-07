@@ -34,6 +34,32 @@
 // `messages[<m>]` share the `message#<m>` carrier. Plain conversation content (an
 // unmatched message block) is NOT the harness floor — only `system[]` blocks are —
 // so a user prompt is never mistaken for incompressible harness bytes.
+//
+// ── the billing criterion is the LEVER, never the position (issue #117) ──────────
+// Both surfaces are charged, but a block earns its charge by classifying onto a lever —
+// not by sitting in `messages[0]`. The two failure modes that criterion holds off pull in
+// opposite directions:
+//
+//   • charge too little — a `<system-reminder>` Claude Code injects into the first user
+//     message is floor. Miss it and the lever measures a gain of zero on the population it
+//     targets: before #116 the skills and agent-types catalogs were not merely opaque but
+//     INVISIBLE, since a message block that matched no marker fell to `harness`, which is
+//     charged on the `system` surface only.
+//   • charge too much — the user's own prompt rides that same message. Bill it and the
+//     first turn of a chatty session inflates the floor by whatever was typed. This is why
+//     the `harness` FALLBACK stays system-only: an unmatched message block is conversation.
+//
+// The header-less MCP fallback sits between the two, so the classifier is told which
+// surface a block rode: on `messages[*]` it trusts stray `mcp__<server>__*` names only
+// inside the `<system-reminder>` envelope CC wraps its injections in. Prose about an MCP
+// tool is a sentence, not a listing.
+//
+// Reconciliation. `floor` (#99) sums THIS model's buckets for its own total, except that it
+// reads the catalog rows through `floor-catalog.js`, which folds the connecting-servers
+// sub-list back into the listing it interrupts. Both paths must reach the same number: a
+// span already charged to `mcp-deferred` is REPLACED in floor's row, never added to it. The
+// gate over both (a frozen total on the committed capture, every capture shape the fold
+// handles) is in test/floor.test.js — "no byte counted twice" is a test, not a comment.
 
 import { parseRequestBlob } from './report.js';
 import { classifySystemSpans, isCatalogLever } from './finetune-system.js';
@@ -80,6 +106,27 @@ export const EMPTY_GAIN = /** @type {GainModel} */ ({
 /** @returns {LeverGain} */
 function zero() {
   return { shipped: 0, waste: 0 };
+}
+
+/**
+ * Every byte this model charged — Σ `shipped` over ALL six buckets. The reconciliation
+ * basis (issue #117): `floor`'s attribution total must equal it, on every capture shape,
+ * because both are the same turn-1 prompt measured through the same spans. Since the spans
+ * of a block tile it, each byte lands in exactly one bucket, so this sum counts nothing
+ * twice — and a bucket left out of it would be a byte silently dropped, which is why the
+ * enumeration lives here once rather than in each caller.
+ *
+ * Not the same figure as the JSON contract's `totals.shipped`, which sums the LEVER ENTRIES
+ * it publishes (per-server MCP tool definitions ride `items`, not the lever total). This is
+ * the model's own total.
+ * @param {GainModel} gain
+ * @returns {number}
+ */
+export function chargedBytes(gain) {
+  const sum = (/** @type {Map<string, LeverGain>} */ m) => [...m.values()].reduce((s, g) => s + g.shipped, 0);
+  return (
+    sum(gain.tool) + sum(gain.claudeMd) + gain.hook.shipped + gain.mcp.shipped + sum(gain.catalog) + gain.harness.shipped
+  );
 }
 
 /**
@@ -173,7 +220,10 @@ export function chargeExchange(exchange, acc) {
     // sub-list ride one block, and a combined `<system-reminder>` can hold all three
     // catalogs. The shared classifier carves it into spans that TILE the block, so
     // charging span by span attributes every byte exactly once (issue #116).
-    for (const span of classifySystemSpans(block)) {
+    // The surface is evidence, not a filter: it tells the classifier whether a
+    // header-less block can be trusted as an injected listing (issue #117). What decides
+    // whether a span is CHARGED is still its lever, never its position.
+    for (const span of classifySystemSpans(block, { surface })) {
       const bytes = span.bytes;
       const waste = uncached ? bytes : 0;
 

@@ -3,12 +3,14 @@
 // `floor`'s per-block attribution used to fold the deferred-tools listing into one
 // opaque "MCP deferred listing" row fed by `gain.mcp`, while the skills and agent-types
 // catalogs — sibling `<system-reminder>` blocks Claude Code injects into
-// `messages[0].content` — were INVISIBLE: they classify to `harness`, but `chargeExchange`
-// only charges `harness` for the `system` surface (`src/finetune-gain.js`), so a
-// message-surface block that misses every lever marker is dropped as "conversation" and
-// contributes zero bytes. This module gives `floor` its own detection of the three catalog
+// `messages[0].content` — were INVISIBLE: they classified to `harness`, which
+// `chargeExchange` charges on the `system` surface ONLY (`src/finetune-gain.js`), so a
+// message-surface block that missed every lever marker was dropped as "conversation" and
+// contributed zero bytes. This module gives `floor` its own detection of the three catalog
 // populations so each shows as a named, byte-costed block — and `--detail` drills into the
-// per-entry lines.
+// per-entry lines. Since #116 each population is a lever of the shared model, so those
+// bytes are charged on either surface; the harness fallback stays system-only, which is
+// what keeps the user's own prompt out of the floor (#117).
 //
 // It USED to carry its own header detection, deliberately, so as not to preempt issue
 // #105's decision about the shared lever model. That decision has landed (ADR-0005) and
@@ -123,26 +125,28 @@ function blockText(block) {
  * Null-safe.
  *
  * Both surfaces are walked because the fidelity question of WHERE CC injects these blocks
- * (`system[]` vs `message#0`) is exactly the open question FT3 left (test/fixtures/finetune/
- * README.md); detecting on both surfaces is robust across CC builds. The surface itself no
- * longer matters here: since #116 a catalog block classifies to its own lever on either
- * surface, so it is never folded into the harness figure it would have to be deducted from.
+ * (`system[]` vs the first user message) is exactly the open question FT3 left
+ * (test/fixtures/finetune/README.md); detecting on both surfaces is robust across CC
+ * builds. Which surface a block rode is yielded with it and handed to the classifier: a
+ * population is header-detected and so surface-independent, but passing it keeps every
+ * consumer of the one authority asking the same question (issue #117) rather than leaving
+ * this walk the only surface-blind caller.
  * @param {any} body  Parsed request JSON.
- * @returns {Generator<{ block: any }>}
+ * @returns {Generator<{ block: any, surface: 'system' | 'message' }>}
  */
 function* walkBodyBlocks(body) {
   if (!body || typeof body !== 'object') return;
   const sys = body.system;
   const sysBlocks = Array.isArray(sys) ? sys : sys == null ? [] : [sys];
-  for (const block of sysBlocks) yield { block };
+  for (const block of sysBlocks) yield { block, surface: 'system' };
   const msgs = Array.isArray(body.messages) ? body.messages : [];
   for (const m of msgs) {
     if (!m || typeof m !== 'object') continue;
     const c = m.content;
     if (Array.isArray(c)) {
-      for (const block of c) yield { block };
+      for (const block of c) yield { block, surface: 'message' };
     } else {
-      yield { block: c }; // a bare-string message content
+      yield { block: c, surface: 'message' }; // a bare-string message content
     }
   }
 }
@@ -167,9 +171,9 @@ export function findCatalogBlocks(body) {
   const out = [];
   /** @type {Set<CatalogKind>} */
   const seen = new Set();
-  for (const { block } of walkBodyBlocks(body)) {
+  for (const { block, surface } of walkBodyBlocks(body)) {
     if (!blockText(block)) continue;
-    const spans = classifySystemSpans(block);
+    const spans = classifySystemSpans(block, { surface });
     if (!spans.some((s) => isCatalogLever(s.lever))) continue;
 
     /** The catalog spans of THIS block, each with any following MCP sub-list folded in. */

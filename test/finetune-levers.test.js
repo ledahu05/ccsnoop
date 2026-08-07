@@ -235,6 +235,26 @@ test('scanRequestLeverBlocks is null-safe and reports nothing for a body with no
   assert.ok(scan.systemBytes > 0);
 });
 
+test('a user prompt naming an mcp__ tool stays OUT of the "% of system" denominator (#117)', () => {
+  // The coarse `mcp__<server>__<tool>` marker is the classifier's safety net for a deferred
+  // listing whose headers a future build words differently. Unwrapped, on the message
+  // surface, it is prose — and it used to classify `mcp-deferred` HERE while the gain model
+  // called the same block conversation. Two verdicts for one block; the denominator grew by
+  // whatever the user had typed, shrinking every CLAUDE.md percentage with it.
+  const md = '<system-reminder>\nContents of ./CLAUDE.md (project instructions):\nmemory\n</system-reminder>';
+  const ask = (text) =>
+    scanRequestLeverBlocks({
+      system: [{ type: 'text', text: 'system preamble' }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: md }, { type: 'text', text }] }],
+    });
+  const plain = ask('why does this keep failing on this repo?');
+  const naming = ask(`why does mcp__github__create_issue keep failing? ${'context. '.repeat(200)}`);
+  assert.equal(naming.systemBytes, plain.systemBytes, 'the question grew, the denominator did not');
+  // The safety net still fires where CC actually injects a listing: inside the envelope.
+  const wrapped = ask('<system-reminder>\nmcp__stub__t01\nmcp__stub__t02\n</system-reminder>');
+  assert.ok(wrapped.systemBytes > plain.systemBytes, 'a wrapped listing IS static system context');
+});
+
 test('the "% of system" denominator excludes plain conversation history (only the static context counts)', () => {
   // system[] + a CLAUDE.md reminder are static system context; a huge assistant
   // reply and the bare first prompt are conversation, which grows turn over turn

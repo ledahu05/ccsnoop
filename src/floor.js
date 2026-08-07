@@ -251,6 +251,12 @@ export function computeFloor(model, opts = {}) {
   // they contributed zero. Making them visible RAISES the floor total; that is the
   // correctness half of #109. Since #116 they are levers of the shared model too, so the
   // gain model no longer folds any of them into the harness figure.
+  //
+  // These rows are therefore the ONE place floor's total and the gain model's total are
+  // reached by different routes: the fold below replaces `gain.mcp` inside a catalog row
+  // rather than adding to it, and `gain.catalog` splits the same bytes the other way. The
+  // two totals must still be equal — the reconciliation gate in test/floor.test.js (#117)
+  // freezes that on the committed capture and on every shape the fold has to handle.
   const catalogs = findCatalogBlocks(turn1Body);
   // A population that absorbed the connecting-servers sub-list reports `chargedTo: 'mcp'`
   // — `gain.mcp` holds that share, so its row must be dropped, not shown alongside.

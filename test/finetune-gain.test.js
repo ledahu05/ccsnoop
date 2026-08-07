@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { chargeExchange, computeGain, EMPTY_GAIN, NULL_SOURCE } from '../src/finetune-gain.js';
+import { chargeExchange, chargedBytes, computeGain, EMPTY_GAIN, NULL_SOURCE } from '../src/finetune-gain.js';
 import { canonicalize } from '../src/waste.js';
 import { buildRequestBlob } from '../src/capture.js';
 import { fineTune, renderFineTune } from '../src/finetune.js';
@@ -256,6 +256,81 @@ test('a catalog span is re-paid per its carrier segment, like every other lever'
   assert.equal(skills.waste, skills.shipped, 'a cold cache re-pays the catalog in full');
 });
 
+// ── tranche B (#117): the message surface is charged by LEVER, never by position ─
+//
+// The criterion is "this block classifies onto a lever", not "this block sits in
+// messages[0]". Both halves of that are load-bearing, and they pull in opposite
+// directions: a `<system-reminder>` Claude Code injects into the first user message is
+// floor and must be charged (issue #116 did the catalogs), while the user's own prompt
+// riding the SAME message must not be — otherwise the first turn of a chatty session
+// inflates the floor by whatever the user happened to type.
+//
+// The sharp edge is the coarse `mcp__<server>__<tool>` fallback: it has no header to
+// key on, so on the message surface it can only be trusted inside CC's own
+// `<system-reminder>` envelope. Prose ABOUT an MCP tool is a sentence, not a listing.
+
+/** A body whose first user message carries `text` as its only content block. */
+function chattyBody(text) {
+  return {
+    system: [{ type: 'text', text: 'You are a Claude agent, built on Anthropic.' }],
+    tools: [],
+    messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+  };
+}
+
+/** The one segment `chattyBody`'s message rides, plus its system#0 carrier. */
+function chattySegs(body) {
+  return [
+    { slot: 'system#0', bytes: cbytes(body.system[0]), kind: 'new' },
+    { slot: 'message#0', bytes: cbytes(body.messages[0]), kind: 'new' },
+  ];
+}
+
+test('a user prompt that merely NAMES an mcp__ tool is conversation, not the MCP lever', () => {
+  // The `mcp__<server>__<tool>` marker is the classifier's safety net for a deferred
+  // listing whose headers a future CC build words differently. Unwrapped, on the message
+  // surface, it is just prose: charging it would bill the user's own question to a lever
+  // no setting could ever recover.
+  const body = chattyBody('why does mcp__github__create_issue keep failing on this repo?');
+  const acc = structuredGain();
+  chargeExchange({ segments: chattySegs(body), body }, acc);
+  assert.equal(acc.mcp.shipped, 0, 'a sentence about an MCP tool charges no MCP bytes');
+  assert.equal(acc.harness.shipped, cbytes(body.system[0]), 'and it is not the floor either');
+});
+
+test('the same mcp__ marker INSIDE a <system-reminder> still charges the MCP lever', () => {
+  // The safety net survives where it matters: CC wraps every block it injects into the
+  // first user message, so the envelope is what tells an injected listing from prose.
+  const listing = '<system-reminder>\nmcp__stub__t01\nmcp__stub__t02\n</system-reminder>';
+  const body = chattyBody(listing);
+  const acc = structuredGain();
+  chargeExchange({ segments: chattySegs(body), body }, acc);
+  assert.equal(acc.mcp.shipped, cbytes(body.messages[0].content[0]), 'the wrapped listing is charged whole');
+});
+
+test('on the system surface the mcp__ marker needs no envelope — system[] is never conversation', () => {
+  const body = {
+    system: [{ type: 'text', text: 'still connecting… mcp__stub__t01 mcp__stub__t02' }],
+    tools: [],
+    messages: [],
+  };
+  const acc = structuredGain();
+  chargeExchange({ segments: [{ slot: 'system#0', bytes: cbytes(body.system[0]), kind: 'new' }], body }, acc);
+  assert.equal(acc.mcp.shipped, cbytes(body.system[0]));
+  assert.equal(acc.harness.shipped, 0, 'and it is not double-charged to the floor');
+});
+
+test('a chatty first turn adds NOTHING to any lever — the floor is what CC ships, not what you type', () => {
+  const short = chattyBody('hi');
+  const long = chattyBody(`hi. ${'and here is a very long pasted stack trace. '.repeat(200)}`);
+  const a = structuredGain();
+  const b = structuredGain();
+  chargeExchange({ segments: chattySegs(short), body: short }, a);
+  chargeExchange({ segments: chattySegs(long), body: long }, b);
+  assert.equal(chargedBytes(a), chargedBytes(b), 'the prompt grew by ~9 KB and the charge did not move');
+  assert.equal(chargedBytes(a), cbytes(short.system[0]), 'the whole charge is the system[] preamble');
+});
+
 // ── computeGain: re-parses the captured request blobs ─────────────────────────
 
 test('computeGain re-parses requestBlob per exchange and never throws on an unparseable body', () => {
@@ -488,6 +563,14 @@ function segs1(body) {
 function withKind(segs, kind) {
   return segs.map((s) => ({ ...s, kind }));
 }
+
+test('the gain model has exactly six buckets — a seventh must be added to every total', () => {
+  // `chargedBytes` (and every consumer that sums the model: `floor`'s attribution,
+  // `buildJsonReport`'s totals.shipped) enumerates the buckets by hand. Pinning the shape
+  // here is what turns "someone added a lever and forgot the total" from a silent
+  // under-count into a failing test.
+  assert.deepEqual(Object.keys(EMPTY_GAIN).sort(), ['catalog', 'claudeMd', 'harness', 'hook', 'mcp', 'tool']);
+});
 
 // EMPTY_GAIN sanity: it shares the all-zero shape.
 test('EMPTY_GAIN is the all-zero no-op gain', () => {
