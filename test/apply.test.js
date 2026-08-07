@@ -56,9 +56,10 @@ function readJson(file) {
  * tiers. Mirrors `buildJsonReport`'s `settings` shape exactly, so `apply`
  * consumes it the same way it consumes a real `fine-tune --json` report.
  */
-function report({ deny = [], mcp = [], hooks = false, claudeMdExcludes = [] } = {}) {
+function report({ deny = [], mcp = [], skillOverrides = null, hooks = false, claudeMdExcludes = [] } = {}) {
   const auto = { permissions: { deny: [...deny] } };
   if (mcp.length > 0) auto.disabledMcpjsonServers = [...mcp];
+  if (skillOverrides && Object.keys(skillOverrides).length > 0) auto.skillOverrides = { ...skillOverrides };
   const advice = {};
   if (hooks) advice.hooks = { SessionStart: [] };
   if (claudeMdExcludes.length > 0) advice.claudeMdExcludes = [...claudeMdExcludes];
@@ -202,6 +203,139 @@ test('computeMergeSettings never mutates the existing object it was given', () =
   const snapshot = JSON.parse(JSON.stringify(existing));
   computeMergeSettings(existing, { permissions: { deny: ['Workflow'] } });
   assert.deepEqual(existing, snapshot, 'caller object left untouched');
+});
+
+// ── the object branch: `skillOverrides` (issue #118, ADR-0005 lever 5a) ───────
+//
+// Every safe key before this one is an ARRAY unioned into place. `skillOverrides` is a
+// `Record<string, enum>`, so the merge needs a path it never had — and the invariants that
+// path must hold are new, not inherited:
+//
+//   • the merge stays idempotent in read-modify-write;
+//   • "refuse foreign KEYS" extends to "refuse foreign VALUES" — a value outside the
+//     four-member enum is rejected, because a settings.json Claude Code cannot parse is
+//     worse than no write at all;
+//   • an entry the USER already set is never overwritten. The lever adds; it never walks a
+//     stricter setting back down to `name-only`.
+
+test('skillOverrides entries are added to the existing map (never a wholesale overwrite)', () => {
+  const existing = { skillOverrides: { tdd: 'off' }, model: 'opus' };
+  const { merged, added, changed } = computeMergeSettings(existing, {
+    skillOverrides: { dataviz: 'name-only', simplify: 'name-only' },
+  });
+  assert.deepEqual(merged.skillOverrides, { tdd: 'off', dataviz: 'name-only', simplify: 'name-only' });
+  assert.equal(merged.model, 'opus', 'unrelated key preserved');
+  assert.deepEqual(added.skillOverrides, { dataviz: 'name-only', simplify: 'name-only' });
+  assert.equal(changed, true);
+});
+
+test("a skill the user already set is left alone — the merge never relaxes a stricter value", () => {
+  // `off` is stricter than `name-only`: the user hid the skill entirely. Downgrading it to
+  // `name-only` would silently re-expose a skill they took out, which is the one thing a
+  // "merge, never overwrite" writer must not do.
+  const { merged, added, changed } = computeMergeSettings(
+    { skillOverrides: { tdd: 'off', dataviz: 'name-only' } },
+    { skillOverrides: { tdd: 'name-only', dataviz: 'name-only' } },
+  );
+  assert.deepEqual(merged.skillOverrides, { tdd: 'off', dataviz: 'name-only' }, 'both entries untouched');
+  assert.equal(changed, false, 'nothing to add');
+  assert.equal(added.skillOverrides, undefined);
+});
+
+test('a skill named after an Object prototype member is still written', () => {
+  // The "already set by the user" test must ask about the object's OWN keys: `'toString' in
+  // {}` is true, so a prototype-chain test would silently drop such a skill from the write.
+  const { merged, added } = computeMergeSettings({}, { skillOverrides: { toString: 'name-only' } });
+  assert.deepEqual(merged.skillOverrides, { toString: 'name-only' });
+  assert.deepEqual(added.skillOverrides, { toString: 'name-only' });
+});
+
+test('the skillOverrides merge is idempotent — applying it to its own output is a no-op', () => {
+  const subset = { skillOverrides: { dataviz: 'name-only' } };
+  const first = computeMergeSettings({}, subset);
+  assert.equal(first.changed, true);
+  const second = computeMergeSettings(first.merged, subset);
+  assert.equal(second.changed, false);
+  assert.deepEqual(second.merged, first.merged);
+});
+
+test('an empty skillOverrides map adds nothing and creates no empty key', () => {
+  const { merged, added, changed } = computeMergeSettings({}, { permissions: { deny: [] }, skillOverrides: {} });
+  assert.deepEqual(merged, {});
+  assert.deepEqual(added, {});
+  assert.equal(changed, false);
+});
+
+test('a value outside the four-member enum is REFUSED (foreign values, not just keys)', () => {
+  assert.throws(
+    () => computeMergeSettings({}, { skillOverrides: { dataviz: 'name_only' } }),
+    /skillOverrides\['dataviz'\] must be one of on, name-only, user-invocable-only, off/,
+  );
+  assert.throws(
+    () => computeMergeSettings({}, { skillOverrides: { dataviz: true } }),
+    /skillOverrides\['dataviz'\] must be one of/,
+  );
+  assert.throws(
+    () => computeMergeSettings({}, { skillOverrides: { dataviz: { mode: 'name-only' } } }),
+    /skillOverrides\['dataviz'\] must be one of/,
+  );
+});
+
+test('the four enum members are all writable — the guard constrains values, not intent', () => {
+  // ccsnoop's LEVER only ever emits `name-only` (ADR-0005 decision 1), but the merge is a
+  // settings writer: a hand-written report asking for a legal value must not be refused on
+  // a policy the schema does not have.
+  const { merged } = computeMergeSettings({}, {
+    skillOverrides: { a: 'on', b: 'name-only', c: 'user-invocable-only', d: 'off' },
+  });
+  assert.deepEqual(merged.skillOverrides, { a: 'on', b: 'name-only', c: 'user-invocable-only', d: 'off' });
+});
+
+test('a non-object skillOverrides in the subset is refused, not silently ignored', () => {
+  assert.throws(
+    () => computeMergeSettings({}, { skillOverrides: ['dataviz'] }),
+    /skillOverrides must be an object/,
+  );
+  assert.throws(
+    () => computeMergeSettings({}, { skillOverrides: 'dataviz' }),
+    /skillOverrides must be an object/,
+  );
+});
+
+test('an existing skillOverrides of the wrong shape is refused, never overwritten', () => {
+  assert.throws(
+    () => computeMergeSettings({ skillOverrides: ['tdd'] }, { skillOverrides: { dataviz: 'name-only' } }),
+    /existing skillOverrides is not an object/,
+  );
+});
+
+test('safeMergeSettings writes the skillOverrides map and re-applies as a no-op', () => {
+  const dir = mkTmp();
+  const file = path.join(dir, 'settings.json');
+  const subset = { permissions: { deny: [] }, skillOverrides: { dataviz: 'name-only', tdd: 'name-only' } };
+
+  assert.equal(safeMergeSettings(file, subset).changed, true);
+  assert.deepEqual(readJson(file).skillOverrides, { dataviz: 'name-only', tdd: 'name-only' });
+  const first = fs.readFileSync(file, 'utf8');
+
+  assert.equal(safeMergeSettings(file, subset).changed, false, 'second merge reports no change');
+  assert.equal(fs.readFileSync(file, 'utf8'), first, 'file byte-identical after re-apply');
+});
+
+test('apply presents each skillOverrides entry in the diff and writes it on approval', () => {
+  const dir = mkTmp();
+  const file = path.join(dir, 'settings.json');
+  const rep = report({ skillOverrides: { dataviz: 'name-only' } });
+
+  const preview = apply({ report: rep, settingsFile: file });
+  const entry = preview.diff.find((d) => d.key === 'skillOverrides');
+  assert.deepEqual(entry.added, ['dataviz=name-only'], 'the diff names the skill AND the value');
+  assert.ok(preview.lines.some((l) => l.includes('dataviz=name-only')));
+  assert.equal(fs.existsSync(file), false, 'preview writes nothing');
+
+  const res = apply({ report: rep, settingsFile: file, approved: true });
+  assert.equal(res.wrote, true);
+  assert.deepEqual(readJson(file).skillOverrides, { dataviz: 'name-only' });
 });
 
 // ── safeMergeSettings: idempotent read-modify-write (AC #3) ───────────────────

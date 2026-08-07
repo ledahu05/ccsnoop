@@ -136,7 +136,7 @@ test('buildJsonReport emits the versioned tuning-report envelope', () => {
 
 // ── the safe / advice tier split (GAP A — the contract's reason to exist) ─────
 
-test('safeLevers holds tools + mcp; adviceLevers holds hooks + claudeMd', () => {
+test('safeLevers holds tools + mcp + skills; adviceLevers holds hooks + claudeMd', () => {
   const r = buildJsonReport({
     sessionId: 's1',
     requests: 1,
@@ -160,7 +160,7 @@ test('safeLevers holds tools + mcp; adviceLevers holds hooks + claudeMd', () => 
   });
   assert.deepEqual(
     r.safeLevers.map((l) => l.lever),
-    ['tools', 'mcp']
+    ['tools', 'mcp', 'skills']
   );
   assert.deepEqual(
     r.adviceLevers.map((l) => l.lever),
@@ -579,6 +579,146 @@ test('catalog is byte cost only — it acts on nothing and adds nothing to recov
 test('totals.shipped absorbs the catalog — the bytes are counted once, under their own name', () => {
   const r = catalogReport(471);
   assert.equal(r.totals.shipped, r.catalog.shipped + 471, 'catalog + the narrowed MCP lever');
+});
+
+// ── the skills lever (issue #118, ADR-0005 lever 5a) ─────────────────────────
+//
+// The skills catalog gained an ACTION: `skillOverrides: name-only` on every skill the
+// corpus shipped and the model never invoked. Two contract properties matter most —
+// the verdict is per-skill and byte-ranked, and its bytes are the SAME bytes
+// `catalog.populations[skills-catalog]` reports, never a second helping in `totals.shipped`.
+
+/** A skills corpus in the shape `aggregateSkillCorpus` emits. */
+function skillCorpus(skills, { sessionCount = 3, singleSession = false } = {}) {
+  return {
+    sessionCount,
+    singleSession,
+    skills: skills.map((s) => ({ reachable: true, shippedSessions: sessionCount, invokedCount: 0, override: true, ...s })),
+  };
+}
+
+/** A report of a session shipping the catalogs, with `skills` as the lever's corpus. */
+function skillsReport(skills, opts) {
+  return buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'corpus',
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 3, singleSession: false, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: { ...catalogGain(0), catalog: new Map([['skills-catalog', { shipped: 5119, waste: 5119 }]]) },
+    skills: skillCorpus(skills, opts),
+  });
+}
+
+test('the skills lever is a SAFE lever, keyed on skillOverrides', () => {
+  const r = skillsReport([{ name: 'dataviz', bytes: 1157 }]);
+  assert.deepEqual(
+    r.safeLevers.map((l) => l.lever),
+    ['tools', 'mcp', 'skills'],
+  );
+  const skills = r.safeLevers.find((l) => l.lever === 'skills');
+  assert.equal(skills.tier, 'safe');
+  assert.equal(skills.action, 'skillOverrides');
+  assert.equal(skills.verdict, 'name-only');
+  assert.ok(skills.evidence.length > 0);
+  assert.deepEqual(skills.guard, { sessionCount: 3, minSessions: 3, singleSession: false });
+});
+
+test('settings.auto carries the skillOverrides map — every qualifying skill, one diff', () => {
+  const r = skillsReport([
+    { name: 'dataviz', bytes: 1157 },
+    { name: 'claude-api', bytes: 1093 },
+  ]);
+  assert.deepEqual(r.settings.auto.skillOverrides, { dataviz: 'name-only', 'claude-api': 'name-only' });
+  assert.deepEqual(r.safeLevers.find((l) => l.lever === 'skills').names, ['dataviz', 'claude-api']);
+});
+
+test('the emitted value is only ever `name-only` — never off, never user-invocable-only', () => {
+  const r = skillsReport([{ name: 'dataviz', bytes: 1157 }]);
+  assert.deepEqual([...new Set(Object.values(r.settings.auto.skillOverrides))], ['name-only']);
+});
+
+test('skills items are byte-ranked and carry the evidence per skill', () => {
+  const r = skillsReport([
+    { name: 'dataviz', bytes: 1157 },
+    { name: 'init', bytes: 68, invokedCount: 2, override: false },
+  ]);
+  const skills = r.safeLevers.find((l) => l.lever === 'skills');
+  assert.deepEqual(
+    skills.items.map((i) => [i.name, i.bytes, i.invokedCount, i.override]),
+    [
+      ['dataviz', 1157, 0, true],
+      ['init', 68, 2, false],
+    ],
+  );
+  assert.deepEqual(skills.names, ['dataviz'], 'an invoked skill is listed but never actioned');
+});
+
+test('a skill no skillOverrides entry can reach is reported, never written', () => {
+  // A plugin skill resolves to "on" unconditionally (ADR-0005 fact 2) — lever 5b's
+  // territory. Reporting its cost is honest; emitting a key for it would be a no-op write.
+  const r = skillsReport([{ name: 'plug:heavy', bytes: 900, reachable: false, override: false }]);
+  const skills = r.safeLevers.find((l) => l.lever === 'skills');
+  assert.equal(skills.items[0].reachable, false);
+  assert.deepEqual(skills.names, []);
+  assert.ok(!('skillOverrides' in r.settings.auto), 'no empty map written either');
+});
+
+test('nothing qualifies ⇒ verdict flag-only, no settings key', () => {
+  const r = skillsReport([{ name: 'tdd', bytes: 400, invokedCount: 1, override: false }]);
+  const skills = r.safeLevers.find((l) => l.lever === 'skills');
+  assert.equal(skills.verdict, 'flag-only');
+  assert.ok(!('skillOverrides' in r.settings.auto));
+});
+
+test('no skills catalog at all ⇒ verdict none, and the lever is still listed', () => {
+  const r = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'single',
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 1, singleSession: true, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    gain: EMPTY_GAIN,
+  });
+  const skills = r.safeLevers.find((l) => l.lever === 'skills');
+  assert.equal(skills.verdict, 'none', 'a caller that omits the corpus gets an inert lever, not a crash');
+  assert.deepEqual(skills.items, []);
+});
+
+test('recoverable counts the description, not the whole entry, and never exceeds the block waste', () => {
+  // `name-only` leaves `- <name>\n` on the wire, so the entry's name line is not recovered
+  // — and no lever may claim more re-payment than the block it lives in actually re-pays.
+  const r = skillsReport([{ name: 'dataviz', bytes: 1157 }]);
+  const residue = Buffer.byteLength('- dataviz\n', 'utf8');
+  assert.equal(r.totals.recoverable, 1157 - residue);
+
+  const cached = buildJsonReport({
+    sessionId: 's1',
+    requests: 1,
+    scope: 'corpus',
+    shipped: [],
+    deny: [],
+    mcp: { sessionCount: 3, singleSession: false, servers: [] },
+    levers: EMPTY_LEVER_VERDICTS,
+    // The catalog block was never re-paid (waste 0) → nothing to stop re-paying.
+    gain: { ...EMPTY_GAIN, catalog: new Map([['skills-catalog', { shipped: 5119, waste: 0 }]]) },
+    skills: skillCorpus([{ name: 'dataviz', bytes: 1157 }]),
+  });
+  assert.equal(cached.totals.recoverable, 0);
+});
+
+test('the skills lever reports the SAME bytes as the catalog population, not a second helping', () => {
+  const r = skillsReport([{ name: 'dataviz', bytes: 1157 }]);
+  const skills = r.safeLevers.find((l) => l.lever === 'skills');
+  const population = r.catalog.populations.find((p) => p.population === 'skills-catalog');
+  assert.equal(skills.shipped, population.shipped, 'one measurement, reported twice under two names');
+  assert.equal(r.totals.shipped, r.catalog.shipped, 'and counted ONCE in the total');
+  assert.match(skills.scope, /catalog/, 'the scope note says so in words');
+  assert.equal(skills.population, 'skills-catalog', 'the join is a field, not only prose');
 });
 
 // ── optional token opt-in (GAP C — from captured usage, never re-tokenized) ───

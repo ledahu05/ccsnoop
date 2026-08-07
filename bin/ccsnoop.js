@@ -264,8 +264,8 @@ function runFineTune(args) {
  * `apply` — the tiered-apply glue (issue #98, ADR-0004). Consumes a
  * `fine-tune --json` report and turns its lever verdicts into action: presents
  * a diff of the proposed safe-subset `settings.json` changes, then on `--yes`
- * writes ONLY the safe subset (`permissions.deny`, `disabledMcpjsonServers`)
- * via an idempotent read-modify-write merge. The advice levers (hooks,
+ * writes ONLY the safe subset (`permissions.deny`, `disabledMcpjsonServers`,
+ * `skillOverrides`) via an idempotent read-modify-write merge. The advice levers (hooks,
  * CLAUDE.md) are emitted as a paste-only block — never written. A restart
  * reminder follows any write.
  *
@@ -567,8 +567,8 @@ Commands:
   fine-tune  Print a byte diagnostic + paste-ready settings.json (all sessions by default)
              --root <path>        capture root (default ./.ccsnoop)
              --sessions-dir <p>   dir holding session subdirs (overrides --root)
-             --session <id>       one session (weak-evidence: no MCP deny)
-             --latest             most-recent session (weak-evidence: no MCP deny)
+             --session <id>       one session (weak-evidence: no MCP/skills verdict)
+             --latest             most-recent session (weak-evidence: no MCP/skills verdict)
              --all                widen discovery across ~/.ccsnoop/routes.json
              --deny-extra <a,b>   add denylist names for this run only
              --deny-allow <a>     drop a denylist name for this run only

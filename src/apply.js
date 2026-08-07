@@ -1,8 +1,9 @@
 // Tiered-apply glue (issue #98, epic #94) — turns `fine-tune --json`'s lever
 // verdicts into action under **ADR-0004's two-tier authority**:
 //
-//   • safe   (tools, mcp)        — carry DYNAMIC PROOF (a pre-validated
-//     denylist; sent-vs-used across a corpus). Auto-writable on approval.
+//   • safe   (tools, mcp, skills) — carry DYNAMIC PROOF (a pre-validated
+//     denylist; sent-vs-used across a corpus; shipped-but-never-model-invoked skills).
+//     Auto-writable on approval.
 //   • advice (hooks, claudeMd)   — NO dynamic proof (injected every session by
 //     construction). Paste-only — surfaced for the human, NEVER written.
 //
@@ -17,14 +18,21 @@
 // Non-negotiables (ADR-0004 + spec §3): merge, never overwrite; refuse
 // foreign/unknown keys (the advice tier must never slip into a write); never
 // touch `.ccsnoop/` capture data; output for the advice tier is paste-only.
+//
+// Since issue #118 the safe subset holds one MAP-valued key, `skillOverrides` (ADR-0005
+// lever 5a), so "merge, never overwrite" gained a second shape and one new invariant:
+// refusing foreign keys extends to refusing foreign VALUES (the four-member enum), and an
+// entry the user already set is never rewritten — `off` is stricter than `name-only`, and
+// the merge only ever adds.
 
 import path from 'node:path';
 
 import { readJsonStrict, writeJson } from './init.js';
 import { assertNotUnderCcsnoop } from './guard.js';
+import { SKILL_OVERRIDE_ENUM } from './finetune-skills.js';
 
 /** The settings keys apply is allowed to write (the ADR-0004 safe subset). */
-const SAFE_TOP_KEYS = ['permissions', 'disabledMcpjsonServers'];
+const SAFE_TOP_KEYS = ['permissions', 'disabledMcpjsonServers', 'skillOverrides'];
 /** `permissions` may carry only `deny` — never `allow`/`ask`/`defaultMode`/…. */
 const SAFE_PERM_KEYS = ['deny'];
 
@@ -106,20 +114,89 @@ function unionInto(container, key, incoming, label) {
 }
 
 /**
+ * Validate an incoming `skillOverrides` map: an object whose every value belongs to the
+ * four-member enum `settings.json` accepts. A foreign VALUE is refused exactly as a
+ * foreign KEY is — writing `"name_only"` would leave behind a settings file Claude Code
+ * cannot parse, which is worse than not writing at all. Absent → `{}` (nothing to add).
+ *
+ * The lever only ever emits `name-only` (ADR-0005 decision 1), but this is a settings
+ * writer, not the lever: the constraint it enforces is the schema's, not the lever's.
+ *
+ * @param {any} map
+ * @param {string} label  The settings path, for the error message.
+ * @returns {Record<string, string>}
+ */
+function safeOverrides(map, label) {
+  if (map == null) return {};
+  if (typeof map !== 'object' || Array.isArray(map)) {
+    throw new ApplyError(`${label} must be an object mapping skill names to one of ${SKILL_OVERRIDE_ENUM.join(', ')}`);
+  }
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [name, value] of Object.entries(map)) {
+    if (typeof value !== 'string' || !(/** @type {readonly string[]} */ (SKILL_OVERRIDE_ENUM).includes(value))) {
+      throw new ApplyError(`${label}['${name}'] must be one of ${SKILL_OVERRIDE_ENUM.join(', ')}`);
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * Add the entries of `incoming` that are ABSENT from the map at `container[key]`, mutating
+ * `container` (always a clone by the time we get here). Returns the entries actually
+ * added, or `null` when there is nothing to add.
+ *
+ * An entry the user already set is left as it is — that is what "merge, never overwrite"
+ * means for a map, and it is load-bearing here: `off` is stricter than `name-only`, so
+ * rewriting it would silently re-expose a skill the user hid. The lever adds; it never
+ * walks a setting back down.
+ *
+ * An existing value that is present but not a plain object is REFUSED, for the same
+ * reason the array branch refuses a non-array.
+ *
+ * @param {Record<string, any>} container
+ * @param {string} key
+ * @param {Record<string, string>} incoming
+ * @param {string} label  The settings path, for the error message.
+ * @returns {Record<string, string> | null}
+ */
+function mergeMapInto(container, key, incoming, label) {
+  const existing = container[key] ?? {};
+  if (typeof existing !== 'object' || Array.isArray(existing)) {
+    throw new ApplyError(`existing ${label} is not an object — refusing to overwrite it`);
+  }
+  /** @type {Record<string, string>} */
+  const added = {};
+  for (const [name, value] of Object.entries(incoming)) {
+    // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so a skill named
+    // `constructor` or `toString` would read as already-set and be silently skipped.
+    if (Object.hasOwn(existing, name)) continue; // the user's own entry wins, whatever it says
+    added[name] = value;
+  }
+  if (Object.keys(added).length === 0) return null;
+  container[key] = { ...existing, ...added };
+  return added;
+}
+
+/**
  * The pure merge of the safe subset into `existing` settings (ADR-0004 safe
  * tier). Returns the merged object, the per-key additions, and whether anything
  * changed — without I/O and without mutating either input.
  *
- * "Merge, never overwrite": `permissions.deny` and `disabledMcpjsonServers` are
- * UNIONED with the existing arrays (deduped, existing-first order); every other
- * key in `existing` (foreign or ccsnoop) is preserved untouched. Unknown keys
- * in the incoming subset are REFUSED — the advice tier (`hooks`,
- * `claudeMdExcludes`) can never reach the writer through this function. So is
- * any malformed value, incoming or existing, that we would have to clobber.
+ * "Merge, never overwrite" takes two shapes, one per value kind:
+ *   • `permissions.deny` / `disabledMcpjsonServers` are ARRAYS, UNIONED with the existing
+ *     lists (deduped, existing-first order);
+ *   • `skillOverrides` is a MAP (issue #118) — absent entries are added, entries the user
+ *     already set are left untouched.
+ * Every other key in `existing` (foreign or ccsnoop) is preserved untouched. Unknown keys
+ * in the incoming subset are REFUSED — the advice tier (`hooks`, `claudeMdExcludes`) can
+ * never reach the writer through this function — and so is an unknown `skillOverrides`
+ * VALUE. So is any malformed value, incoming or existing, that we would have to clobber.
  *
  * @param {Record<string, any>} existing   The current settings.json object.
  * @param {Record<string, any>} safeSubset The contract's `settings.auto` block.
- * @returns {{ merged: Record<string, any>, added: { permissionsDeny?: string[], disabledMcpjsonServers?: string[] }, changed: boolean }}
+ * @returns {{ merged: Record<string, any>, added: { permissionsDeny?: string[], disabledMcpjsonServers?: string[], skillOverrides?: Record<string, string> }, changed: boolean }}
  */
 export function computeMergeSettings(existing, safeSubset) {
   if (!safeSubset || typeof safeSubset !== 'object' || Array.isArray(safeSubset)) {
@@ -147,13 +224,14 @@ export function computeMergeSettings(existing, safeSubset) {
   // Deep-clone the caller's object (JSON round-trip is enough — settings are
   // JSON-serializable) so we never mutate the input nor alias its arrays.
   const merged = JSON.parse(JSON.stringify(existing));
-  /** @type {{ permissionsDeny?: string[], disabledMcpjsonServers?: string[] }} */
+  /** @type {{ permissionsDeny?: string[], disabledMcpjsonServers?: string[], skillOverrides?: Record<string, string> }} */
   const added = {};
 
-  // Validate both incoming lists up front, so a malformed report is refused
-  // whether or not the other lever happens to have something to add.
+  // Validate every incoming value up front, so a malformed report is refused
+  // whether or not the other levers happen to have something to add.
   const denyIn = safeNames(safeSubset.permissions?.deny, 'permissions.deny');
   const mcpIn = safeNames(safeSubset.disabledMcpjsonServers, 'disabledMcpjsonServers');
+  const skillsIn = safeOverrides(safeSubset.skillOverrides, 'skillOverrides');
 
   if (denyIn.length > 0) {
     if (merged.permissions != null && (typeof merged.permissions !== 'object' || Array.isArray(merged.permissions))) {
@@ -167,6 +245,11 @@ export function computeMergeSettings(existing, safeSubset) {
   if (mcpIn.length > 0) {
     const newOnes = unionInto(merged, 'disabledMcpjsonServers', mcpIn, 'disabledMcpjsonServers');
     if (newOnes) added.disabledMcpjsonServers = newOnes;
+  }
+
+  if (Object.keys(skillsIn).length > 0) {
+    const newOnes = mergeMapInto(merged, 'skillOverrides', skillsIn, 'skillOverrides');
+    if (newOnes) added.skillOverrides = newOnes;
   }
 
   return { merged, added, changed: Object.keys(added).length > 0 };
@@ -208,14 +291,20 @@ export function safeMergeSettings(file, safeSubset) {
 
 /**
  * Build structured + textual diff lines from a merge's `added` map. Each entry
- * is one safe key with the names being appended to settings.json.
- * @param {{ permissionsDeny?: string[], disabledMcpjsonServers?: string[] }} added
+ * is one safe key with the names being appended to settings.json. A map-valued key
+ * renders as `name=value`, because for `skillOverrides` the value is the whole point of
+ * the diff the user is approving — a bare skill name would not say what happens to it.
+ * @param {{ permissionsDeny?: string[], disabledMcpjsonServers?: string[], skillOverrides?: Record<string, string> }} added
  * @returns {{ key: string, added: string[] }[]}
  */
 function diffEntries(added) {
   const entries = [];
   if (added.permissionsDeny?.length) entries.push({ key: 'permissions.deny', added: added.permissionsDeny });
   if (added.disabledMcpjsonServers?.length) entries.push({ key: 'disabledMcpjsonServers', added: added.disabledMcpjsonServers });
+  const skills = Object.entries(added.skillOverrides ?? {});
+  if (skills.length > 0) {
+    entries.push({ key: 'skillOverrides', added: skills.map(([name, value]) => `${name}=${value}`) });
+  }
   return entries;
 }
 

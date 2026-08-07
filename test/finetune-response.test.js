@@ -22,7 +22,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
-import { toolUseNames, calledToolSet } from '../src/finetune-response.js';
+import { toolUseNames, toolUseCalls, calledToolSet, SKILL_TOOL } from '../src/finetune-response.js';
 
 const FIXTURES_DIR = fileURLToPath(new URL('./fixtures/finetune', import.meta.url));
 
@@ -144,6 +144,122 @@ test('toolUseNames needs no usage — it reads SSE bytes only, never token accou
   assert.deepEqual(toolUseNames(s), ['Edit']);
 });
 
+// ── toolUseCalls: the ARGUMENTS half, for the skills lever (issue #118) ───────
+//
+// A skill is invoked through the `Skill` tool, so "which skill" lives in the call's
+// INPUT, not its name — and on a streamed response that input arrives as
+// `input_json_delta` fragments, never in the `content_block_start` event. The lever's
+// disuse predicate ("never invoked by the model") is only as good as this reassembly.
+
+/** A streamed turn calling one tool with `input`, split across two `input_json_delta`s. */
+function turnCallingWithInput(name, input, { split = true } = {}) {
+  const json = JSON.stringify(input);
+  const cut = split ? Math.ceil(json.length / 2) : json.length;
+  let out = sse('message_start', { message: { id: 'msg_1', role: 'assistant', content: [] } });
+  out += sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_0', name, input: {} } });
+  out += sse('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: json.slice(0, cut) } });
+  if (cut < json.length) {
+    out += sse('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: json.slice(cut) } });
+  }
+  out += sse('content_block_stop', { index: 0 });
+  out += sse('message_stop', {});
+  return out;
+}
+
+test('toolUseCalls reassembles a streamed tool input from its input_json_delta fragments', () => {
+  const calls = toolUseCalls(turnCallingWithInput(SKILL_TOOL, { skill: 'tdd', args: 'go' }));
+  assert.deepEqual(
+    calls.map((c) => [c.name, c.input]),
+    [[SKILL_TOOL, { skill: 'tdd', args: 'go' }]]
+  );
+});
+
+test('toolUseCalls reads the input of a non-streaming JSON body', () => {
+  const body = JSON.stringify({
+    type: 'message',
+    content: [{ type: 'tool_use', id: 'toolu_1', name: SKILL_TOOL, input: { skill: 'dataviz' } }],
+  });
+  assert.deepEqual(toolUseCalls(body), [{ name: SKILL_TOOL, input: { skill: 'dataviz' } }]);
+});
+
+test('toolUseCalls yields a null input when the fragments never form valid JSON', () => {
+  // A capture cut mid-stream leaves a half-written argument object. The call still
+  // happened — the NAME is sound evidence — so the record must survive with input null
+  // rather than take the turn down or invent an empty object.
+  let s = sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_0', name: SKILL_TOOL } });
+  s += sse('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '{"skill": "td' } });
+  assert.deepEqual(toolUseCalls(s), [{ name: SKILL_TOOL, input: null }]);
+});
+
+test('toolUseCalls attributes each input to its own block index', () => {
+  // Two skills invoked in one turn interleave their deltas by `index`; keying on
+  // anything else would attribute the second skill's name to the first call.
+  let s = sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 't0', name: SKILL_TOOL } });
+  s += sse('content_block_start', { index: 1, content_block: { type: 'tool_use', id: 't1', name: SKILL_TOOL } });
+  s += sse('content_block_delta', { index: 1, delta: { type: 'input_json_delta', partial_json: '{"skill":"b"}' } });
+  s += sse('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '{"skill":"a"}' } });
+  assert.deepEqual(
+    toolUseCalls(s).map((c) => c.input?.skill),
+    ['a', 'b']
+  );
+});
+
+test('a block reported twice still collects the arguments that follow it', () => {
+  // `message_start` may inline the block with an EMPTY input, the arguments arriving as
+  // deltas afterwards. The block is one call (deduped by id), but the deltas must still land
+  // in it — otherwise a `Skill` call loses its skill name and an invoked skill reads as
+  // never-invoked: a false-positive `name-only` verdict.
+  let s = sse('message_start', {
+    message: { id: 'msg_1', content: [{ type: 'tool_use', id: 'toolu_1', name: SKILL_TOOL, input: {} }] },
+  });
+  s += sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: SKILL_TOOL, input: {} } });
+  s += sse('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '{"skill":"tdd"}' } });
+  assert.deepEqual(toolUseCalls(s), [{ name: SKILL_TOOL, input: { skill: 'tdd' } }], 'one call, arguments intact');
+});
+
+test('toolUseNames stays the names view of toolUseCalls (one decoder, not two)', () => {
+  const s = turnCalling(['Read', 'Bash']);
+  assert.deepEqual(
+    toolUseCalls(s).map((c) => c.name),
+    toolUseNames(s)
+  );
+});
+
+test('calledToolSet reports the skills the MODEL invoked, keyed by the Skill input', () => {
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'sess-skills');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '0001.response.sse'),
+    zlib.gzipSync(Buffer.from(turnCallingWithInput(SKILL_TOOL, { skill: 'tdd' }), 'utf8'))
+  );
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, response_blob: '0001.response.sse' }) + '\n'
+  );
+  const called = calledToolSet(dir, 'sess-skills');
+  assert.deepEqual([...called.skills], ['tdd']);
+  assert.deepEqual([...called.names], [SKILL_TOOL], 'the tool itself is still a called tool');
+});
+
+test('calledToolSet reports no skill for a Skill call whose input never decoded', () => {
+  // No name, no verdict: an unreadable input must not silently read as "no skill was
+  // invoked" for a session that did invoke one — the whole set is what the lever's
+  // "never invoked" predicate rests on, so a blank entry would be worse than none.
+  const root = mkTmpDir();
+  const dir = path.join(root, 'sessions', 'sess-partial');
+  fs.mkdirSync(dir, { recursive: true });
+  const s = sse('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 't0', name: SKILL_TOOL } });
+  fs.writeFileSync(path.join(dir, '0001.response.sse'), Buffer.from(s, 'utf8'));
+  fs.writeFileSync(
+    path.join(dir, 'manifest.jsonl'),
+    JSON.stringify({ turn: 1, response_blob: '0001.response.sse' }) + '\n'
+  );
+  const called = calledToolSet(dir, 'sess-partial');
+  assert.deepEqual([...called.skills], []);
+  assert.deepEqual([...called.names], [SKILL_TOOL]);
+});
+
 // ── calledToolSet: a session dir → its called-tool set ────────────────────────
 
 /** Write a captured session dir with one response blob per turn (gzip, as captured). */
@@ -256,7 +372,7 @@ test('calledToolSet counts a manifest line naming no response blob as missing', 
   const called = calledToolSet(dir, 'sess-h');
   assert.deepEqual([...called.names], ['Read']);
   assert.equal(called.missing, 1);
-  assert.deepEqual(called.perTurn[1], { turn: 2, blob: null, names: [], decoded: false });
+  assert.deepEqual(called.perTurn[1], { turn: 2, blob: null, names: [], skills: [], decoded: false });
 });
 
 test('calledToolSet accounts for every manifest line: responses + missing === perTurn', () => {

@@ -322,6 +322,55 @@ export function loadExchanges(dir) {
 }
 
 /**
+ * Yield every captured REQUEST BODY of a session, in capture order, degrading rather than
+ * throwing on anything unreadable — a half-written manifest line, a line naming no request
+ * blob, a blob that never landed (aborted exchange) each contribute nothing while the turns
+ * around them still yield.
+ *
+ * That tolerance is why this is not {@link loadExchanges}: the fine-tune levers must not lose
+ * a whole session (and so hand their guards a falsely-empty evidence set — i.e. act on a
+ * lever that WAS used) because one turn was cut mid-append. It is the one walk the
+ * request-scanning levers share — the MCP lever's shipped half and the skills lever's
+ * catalog half both read bodies and nothing else (issues #74, #118).
+ *
+ * The only hard error is a session dir with no readable `manifest.jsonl`: that is a caller
+ * mistake, not a corrupt capture.
+ *
+ * @param {string} dir  The `sessions/<session_id>/` directory.
+ * @returns {Generator<any>}  Parsed request JSON per readable turn (may be null for a body
+ *                            that did not parse — callers are null-safe by contract).
+ */
+export function* eachRequestBody(dir) {
+  const manifestPath = path.join(dir, 'manifest.jsonl');
+  /** @type {string} */
+  let manifest;
+  try {
+    manifest = fs.readFileSync(manifestPath, 'utf8');
+  } catch (err) {
+    throw new Error(`could not read manifest.jsonl in ${dir}: ${/** @type {Error} */ (err)?.message ?? err}`);
+  }
+  for (const rawLine of manifest.split('\n')) {
+    if (rawLine.trim().length === 0) continue;
+    /** @type {any} */
+    let line;
+    try {
+      line = JSON.parse(rawLine);
+    } catch {
+      continue; // a half-written manifest line — skip, don't crash
+    }
+    if (!line || typeof line !== 'object' || typeof line.request_blob !== 'string') continue;
+    /** @type {Buffer} */
+    let buf;
+    try {
+      buf = fs.readFileSync(path.join(dir, line.request_blob));
+    } catch {
+      continue; // aborted exchange (request blob never landed) — contributes nothing
+    }
+    yield parseRequestBlob(buf).json;
+  }
+}
+
+/**
  * Project a loaded exchange onto the input shape the analyses consume
  * (`computeWaste` and `diagnoseCache` take the same shape).
  *

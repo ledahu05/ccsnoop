@@ -44,6 +44,7 @@ a consumer from it.
 | change | effect on a consumer |
 | ------ | -------------------- |
 | **[#116](https://github.com/ledahu05/ccsnoop/issues/116)** — `catalog` added; `safeLevers[mcp].shipped` **narrowed** to the connecting-servers sub-list. | ⚠ **Behavioural, not just additive.** `safeLevers[mcp].shipped` used to carry the *whole* deferred listing — the built-in tool names, and on some captures the agent-types and skills catalogs riding the same block. It now carries only the "MCP servers still connecting" sub-list, so **a session with no MCP server reports `0`** where it previously reported tens of kilobytes. That is the intended correction: no MCP setting could ever have recovered those bytes. A consumer that read `gain.mcp` / `safeLevers[mcp].shipped` to describe the catalog must read [`catalog`](#catalog) instead. **`totals.shipped` also GROWS**: the agent-types and skills catalogs ride `messages[0].content`, where the old model dropped them as conversation — they contributed zero. Naming them is what makes them countable (+7.8 KB on the reference capture). `totals.recoverable` is unaffected. |
+| **[#118](https://github.com/ledahu05/ccsnoop/issues/118)** — `safeLevers` gains a third entry, `skills`; `settings.auto` gains `skillOverrides` (a MAP, the first non-array safe key). | **Additive, with one thing to not double-count.** `safeLevers[skills].shipped` is the same measurement as `catalog.populations[skills-catalog].shipped` — the lever acts on those bytes, it does not add new ones, and `totals.shipped` counts them once through `catalog`. `totals.recoverable` GROWS when the verdict fires: it now includes the descriptions the emitted `name-only` entries stop shipping (capped by what the catalog block actually re-pays). A consumer that writes `settings.auto` must handle a map-valued key: merge entry by entry, never overwrite an entry the user already set, and refuse a value outside `on` / `name-only` / `user-invocable-only` / `off`. The `catalog` section still carries no verdict. |
 | **[#117](https://github.com/ledahu05/ccsnoop/issues/117)** — the message surface is charged by **lever**, not by position; the header-less MCP fallback now needs the `<system-reminder>` envelope there. | Additive in the normal case, **narrowing in one**: a turn-1 *user message* that merely names an `mcp__<server>__<tool>` used to be swept into `safeLevers[mcp].shipped` by the coarse fallback, because the marker is a bare tool name with no header to key on. On the `messages[*]` surface that fallback is now trusted only inside the `<system-reminder>` envelope Claude Code wraps its injections in, so prose about an MCP tool contributes `0` instead of the whole message. A real listing — headers recognized, or an unrecognized one still wrapped — is unaffected, and the `system[]` surface is unchanged (nothing there is conversation). `totals.recoverable` can only shrink, never grow, from this. |
 
 ### Reuse by `floor --json`
@@ -108,13 +109,14 @@ places:
 
 | Tier | Levers | Why | settings key |
 | ---- | ------ | --- | ------------ |
-| **safe** (auto-writable) | `tools`, `mcp` | Carry **dynamic proof** — a pre-validated denylist; sent-vs-used across a corpus. May be auto-applied on approval. | `settings.auto` |
+| **safe** (auto-writable) | `tools`, `mcp`, `skills` | Carry **dynamic proof** — a pre-validated denylist; sent-vs-used across a corpus; a skills catalog shipped for sessions and never model-invoked. May be auto-applied on approval. | `settings.auto` |
 | **advice** (paste-only) | `hooks`, `claudeMd` | **No dynamic proof** — injected every session by construction. The skill surfaces them; it never writes them. | `settings.advice` |
 
-- **`safeLevers`** — `[tools, mcp]`. Each entry has `tier: "safe"`.
+- **`safeLevers`** — `[tools, mcp, skills]`. Each entry has `tier: "safe"`.
 - **`adviceLevers`** — `[hooks, claudeMd]`. Each entry has `tier: "advice"`.
 - **`settings.auto`** — the keys the skill may **write** to `settings.json` on explicit
-  approval of a presented diff (`permissions.deny`, `disabledMcpjsonServers`).
+  approval of a presented diff (`permissions.deny`, `disabledMcpjsonServers`,
+  `skillOverrides`).
 - **`settings.advice`** — the keys the skill must only surface **paste-ready**
   (`hooks.SessionStart`, `claudeMdExcludes`); never written.
 
@@ -139,7 +141,7 @@ makes — it does not invent a second block. (Asserted by the test suite.)
   "totals":         { shipped, recoverable },
   "floor":          { shipped, waste, action, note },
   "catalog":        { shipped, waste, action, note, populations[] },
-  "safeLevers":     [ <tools>, <mcp> ],
+  "safeLevers":     [ <tools>, <mcp>, <skills> ],
   "adviceLevers":   [ <hooks>, <claudeMd> ],
   "settings":       { auto, advice },
   "tokens":         { input, output, cacheRead, cacheCreation, source }   // only with --include-tokens
@@ -172,9 +174,12 @@ you'd stop re-paying" figure because the floor is never cut.
 The `<system-reminder>` catalogs Claude Code injects into the first user message: the
 ToolSearch **deferred-tools** listing, the Agent-tool **agent types**, and the Skill-tool
 **skills catalog**. Byte cost only — this section carries no `tier`, no `verdict` and no
-settings key, because no lever acts on these populations yet
-([ADR-0005](adr/0005-skills-catalog-lever-name-only.md) lever 5a is a later slice). None of
-these bytes is in `totals.recoverable`.
+settings key. The `deferred-tools` and `agent-types` populations have no lever at all, so
+none of *their* bytes is in `totals.recoverable`. The `skills-catalog` population does have
+one since [#118](https://github.com/ledahu05/ccsnoop/issues/118)
+([ADR-0005](adr/0005-skills-catalog-lever-name-only.md) lever 5a): its verdict lives in
+`safeLevers[skills]`, which reports **these same bytes** — read one or the other, never the
+sum.
 
 | field | meaning |
 | ----- | ------- |
@@ -191,10 +196,10 @@ Every lever entry (in `safeLevers` / `adviceLevers`) carries the common fields:
 
 | field | meaning |
 | ----- | ------- |
-| `lever` | `tools` / `mcp` / `hooks` / `claudeMd`. |
+| `lever` | `tools` / `mcp` / `skills` / `hooks` / `claudeMd`. |
 | `tier` | `safe` or `advice` (see the split above). |
 | `verdict` | What `fine-tune` concludes: `deny` / `flag-only` / `remove` / `exclude` / `below-floor` / `none`. |
-| `action` | The `settings.json` key this lever writes (`permissions.deny`, `disabledMcpjsonServers`, `hooks.SessionStart`, `claudeMdExcludes`). |
+| `action` | The `settings.json` key this lever writes (`permissions.deny`, `disabledMcpjsonServers`, `skillOverrides`, `hooks.SessionStart`, `claudeMdExcludes`). |
 | `evidence` | Why the verdict holds — the proof (or its absence) behind the claim. |
 
 Lever-specific fields follow.
@@ -240,6 +245,43 @@ single-session scope.
   server now reports `0` here instead of tens of kilobytes. If you were reading this figure
   to talk about the catalog, read [`catalog`](#catalog) instead.
 
+### `skills` (safe)
+
+`skillOverrides` emits `{ "<skill>": "name-only" }` for every skill the corpus shipped in
+its turn-1 catalog and the **model** never invoked, under the MCP lever's guard verbatim
+(`sessionCount >= 3 AND invokedCount == 0`, never in single-session scope — the threshold is
+on the *corpus size*, exactly as the MCP lever's is; `items[].shippedSessions` tells you how
+many of those sessions listed the skill); otherwise
+`flag-only`, or `none` when no catalog shipped at all. `name-only` keeps the skill listed
+and fully invocable — `/name` still works — and stops shipping its description
+([ADR-0005](adr/0005-skills-catalog-lever-name-only.md) decision 1). **`off` and
+`user-invocable-only` are never emitted.**
+
+- `population` — `"skills-catalog"`: the `catalog.populations[]` row whose bytes this lever
+  acts on. The join between the verdict and the cost row, as a field rather than as prose.
+- `guard` — `{ sessionCount, minSessions, singleSession }`, like the MCP lever's.
+- `names` — the skills the verdict covers (the keys of `settings.auto.skillOverrides`).
+- `items` — per skill `{ name, bytes, shippedSessions, invokedCount, reachable, override }`,
+  **ranked bytes-descending**: the whole population, so a spared skill is visible with the
+  invocation count that spared it.
+- `reachable: false` — a scope-qualified name (`plugin:skill`). No `skillOverrides` entry
+  reaches a plugin skill (the resolver returns `"on"` before reading settings), so such a
+  skill is **reported and never written** — that is lever 5b, advice tier. Directory-scoped
+  names are listed qualified too and share the exclusion: a conservative miss, never a
+  phantom write.
+- **Invocation means a `Skill` tool_use.** A `/name` the user typed is not one, and does
+  **not** spare a skill — sound precisely because `name-only` leaves `/name` working, so a
+  slash-only skill is one whose description bought nothing (decision 4).
+- lever-level `shipped` — the `skills-catalog` population's bytes, i.e. the **same
+  measurement** as `catalog.populations[skills-catalog].shipped`. It is *not* added into
+  `totals.shipped` a second time.
+- `waste` — the recovery: Σ (each qualifying skill's `bytes` − its `- <name>\n` residue),
+  **capped by the block's own re-payment** (a fully-cached catalog recovers 0, like every
+  other lever here). Per-skill `bytes` are raw entry bytes (the `floor --detail` basis), a
+  **lower bound** on the canonical bytes the block loses — the block is measured as escaped
+  JSON, so a quote-heavy description loses more (measured: 1 843 canonical vs 1 807 raw,
+  [#115](https://github.com/ledahu05/ccsnoop/issues/115)).
+
 ### `hooks` (advice)
 
 `hooks.SessionStart` removal only when the injected output ≥ the floor (`floorBytes`).
@@ -267,7 +309,8 @@ sources above the floor. Never "unused".
 
 ```
 "settings": {
-  "auto":   { "permissions": { "deny": [...] }, "disabledMcpjsonServers": [...] },  // safe — may write
+  "auto":   { "permissions": { "deny": [...] }, "disabledMcpjsonServers": [...],
+              "skillOverrides": { "<skill>": "name-only" } },                     // safe — may write
   "advice": { "hooks": { "SessionStart": [] }, "claudeMdExcludes": [...] }          // advice — paste only
 }
 ```
@@ -276,6 +319,11 @@ Key-presence rules (identical to the text renderer's block):
 
 - `permissions.deny` — **always present** in `auto` (even when `[]`).
 - `disabledMcpjsonServers` — only in `auto` when the guard denies ≥ 1 server.
+- `skillOverrides` — only in `auto` when ≥ 1 skill qualifies; a map, never an empty one.
+  The writer MERGES it entry by entry: a skill the user already set (`off`, or a manual
+  `name-only`) is left untouched — the lever adds, it never relaxes a stricter setting —
+  and a value outside the four-member enum (`on`, `name-only`, `user-invocable-only`,
+  `off`) is refused rather than written.
 - `hooks.SessionStart` — only in `advice` when the hook is above-floor.
 - `claudeMdExcludes` — only in `advice` when ≥ 1 excludable source is above-floor.
 
@@ -337,6 +385,18 @@ error) contributes nothing.
       "scope": "Deny verdicts are corpus-scoped; per-server shipped/waste are summed from mcp__<server>__* …",
       "shipped": 1001, "waste": 0, "names": [],
       "items": [{ "name": "stub", "shipped": 0, "waste": 0, "shippedSessions": 1, "calledCount": 0, "deny": false }]
+    },
+    {
+      "lever": "skills", "population": "skills-catalog", "tier": "safe",
+      "verdict": "name-only", "action": "skillOverrides",
+      "evidence": "corpus guard: sessionCount >= 3 AND the MODEL never invoked the skill (a Skill tool_use). …",
+      "guard": { "sessionCount": 3, "minSessions": 3, "singleSession": false },
+      "scope": "The action is always name-only, never off or user-invocable-only. …",
+      "shipped": 5119, "waste": 1147, "names": ["dataviz"],
+      "items": [
+        { "name": "dataviz", "bytes": 1157, "shippedSessions": 3, "invokedCount": 0, "reachable": true, "override": true },
+        { "name": "tdd", "bytes": 400, "shippedSessions": 3, "invokedCount": 2, "reachable": true, "override": false }
+      ]
     }
   ],
   "adviceLevers": [
