@@ -568,12 +568,12 @@ const SKILLS_TXT =
  * `shape: 'combined'` rides all three in ONE block (the only shape that can produce the
  * single ~30 KB row issue #109 reports from a real session — 19 tool names are not 30 KB).
  */
-function catalogModel(shape, { surface = 'message' } = {}) {
+function catalogModel(shape, { surface = 'message', skillsText = SKILLS_TXT } = {}) {
   const wrap = (t) => `<system-reminder>\n${t}</system-reminder>`;
   const blocks =
     shape === 'combined'
-      ? [{ type: 'text', text: wrap(`${DEFERRED_TXT}\n${AGENTS_TXT}\n${SKILLS_TXT}`) }]
-      : [DEFERRED_TXT, AGENTS_TXT, SKILLS_TXT].map((t) => ({ type: 'text', text: wrap(t) }));
+      ? [{ type: 'text', text: wrap(`${DEFERRED_TXT}\n${AGENTS_TXT}\n${skillsText}`) }]
+      : [DEFERRED_TXT, AGENTS_TXT, skillsText].map((t) => ({ type: 'text', text: wrap(t) }));
   const body = {
     model: 'claude-test',
     system: [{ type: 'text', text: 'harness preamble' + 'H'.repeat(400) }, ...(surface === 'system' ? blocks : [])],
@@ -684,6 +684,57 @@ test('computeFloor: catalog entries are parsed, ranked, and sum to under the blo
     const sum = b.entries.reduce((s, e) => s + e.bytes, 0);
     assert.ok(sum > 0 && sum < b.bytes, `${kind} entries sum under the block (headers are the remainder)`);
   }
+});
+
+// ── name-only entries (issue #115) ────────────────────────────────────────────
+//
+// A skill listed WITHOUT its description renders as a bare `- <name>` line — no colon.
+// Two independent paths produce it, so this shape is not exotic:
+//   • `skillOverrides: { "<name>": "name-only" }` in settings.json — the key Claude Code's
+//     own `/skills` UI writes, and the action lever 5a will emit (ADR-0005);
+//   • Claude Code's own catalog budget: on overflow it degrades the biggest entries to
+//     `- <name>`, biggest-first (`budgetTruncatedSkills`) — no user setting involved.
+// Both were confirmed on the bench-pinned build; see docs/research/skill-overrides-name-only.md.
+
+/** The `- name` (no colon) shape, alongside a normal `- name: description` entry. */
+const SKILLS_NAME_ONLY_TXT =
+  'The following skills are available for use with the Skill tool:\n\n- dataviz\n- claude-api: Reference for the Claude API.\nTRIGGER — read BEFORE opening the target file.\n';
+
+test('computeFloor: a name-only skill is its own entry, not bytes folded into its neighbour (issue #115)', () => {
+  const model = catalogModel('separate', { skillsText: SKILLS_NAME_ONLY_TXT });
+  const skills = computeFloor(model).attribution.find((a) => a.kind === 'skills-catalog');
+  assert.deepEqual(skills.entries.map((e) => e.name).sort(), ['claude-api', 'dataviz'], 'the name-only skill is named');
+  const viz = skills.entries.find((e) => e.name === 'dataviz');
+  // This is the whole point of `name-only`: the entry costs its name and nothing else.
+  assert.equal(viz.bytes, Buffer.byteLength('- dataviz\n', 'utf8'), 'a name-only entry costs exactly its name line');
+  // The failure mode being pinned: a no-colon line read as a CONTINUATION would charge
+  // dataviz's bytes to whatever entry precedes it, inflating a skill that is in active use.
+  // So claude-api must weigh its OWN two lines exactly — not a byte more.
+  const api = skills.entries.find((e) => e.name === 'claude-api');
+  const apiOwnLines =
+    '- claude-api: Reference for the Claude API.\nTRIGGER — read BEFORE opening the target file.\n';
+  assert.equal(api.bytes, Buffer.byteLength(apiOwnLines, 'utf8'), 'no cross-charge to the neighbour');
+});
+
+test('computeFloor: a bulleted description is never mistaken for a name-only entry (issue #115)', () => {
+  // The discriminator is "a single bare token after the dash". A description whose
+  // continuation line happens to start with `- ` is prose — it must still fold in.
+  const txt =
+    'The following skills are available for use with the Skill tool:\n\n- tdd: Test-driven development.\n- when the user wants red-green-refactor\n';
+  const model = catalogModel('separate', { skillsText: txt });
+  const skills = computeFloor(model).attribution.find((a) => a.kind === 'skills-catalog');
+  assert.deepEqual(skills.entries.map((e) => e.name), ['tdd'], 'the prose line folded into tdd, it is not an entry');
+});
+
+test('computeFloor: an empty description is still a named entry, colon not swallowed (issue #115)', () => {
+  // `- tdd:` — a skill whose description is empty renders as a bullet with a TRAILING colon.
+  // The name-only pattern must not claim it, or the name carries the colon (`tdd:`) and stops
+  // matching the same skill across two captures — which is exactly what a before/after diff
+  // of an override joins on.
+  const txt = 'The following skills are available for use with the Skill tool:\n\n- tdd:\n- dataviz\n';
+  const model = catalogModel('separate', { skillsText: txt });
+  const skills = computeFloor(model).attribution.find((a) => a.kind === 'skills-catalog');
+  assert.deepEqual(skills.entries.map((e) => e.name).sort(), ['dataviz', 'tdd'], 'names carry no trailing colon');
 });
 
 test('renderFloor: --detail adds a per-entry section below the total, leaving the table intact', () => {

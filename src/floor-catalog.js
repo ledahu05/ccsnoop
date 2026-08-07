@@ -74,6 +74,25 @@ const MCP_CONNECTING_HDR = /^The following MCP servers are still connecting/m;
 const BARE_TOKEN = /^[A-Za-z0-9_.-]+$/;
 /** A bulleted catalog entry: `- <name>: <rest>`. The name stops at the first colon. */
 const BULLET_ENTRY = /^-\s+([^:]+):\s*(.*)$/;
+/**
+ * A catalog entry listed WITHOUT its description: `- <name>`, nothing else on the line
+ * (issue #115). Claude Code emits this shape from two independent paths — a
+ * `skillOverrides` entry set to `name-only` (the action ADR-0005's lever 5a writes, and
+ * the one `/skills` writes today), and its own catalog budget degrading the biggest
+ * entries on overflow (`budgetTruncatedSkills`). Both were confirmed on the bench-pinned
+ * build; see docs/research/skill-overrides-name-only.md.
+ *
+ * The discriminator is deliberately tight — ONE bare token after the dash, no space. A
+ * description's continuation line that happens to start with `- ` is prose (it has
+ * spaces) and must keep folding into the entry above, which is what the second #115 test
+ * pins. A colon may JOIN two tokens so a scope-qualified name (`plugin:skill`, the shape
+ * budget truncation can produce) stays whole rather than being split at its colon by
+ * BULLET_ENTRY — hence this pattern is tried FIRST. It may not TRAIL: `- tdd:` is a skill
+ * with an empty description, and belongs to BULLET_ENTRY, which strips the colon off the
+ * name. Letting it match here would name that entry `tdd:` and break the join between two
+ * captures of the same skill — the join a before/after override diff runs on.
+ */
+const NAME_ONLY_ENTRY = /^-\s+([A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)\s*$/;
 /** The `<system-reminder>` wrapper lines that carry these blocks. */
 const REMINDER_TAG = /^<\/?system-reminder>/;
 
@@ -273,8 +292,13 @@ function parseDeferredTools(text) {
  * description spans several physical lines) folds into the preceding entry. The trailing
  * caveat paragraph (no bullet) and the wrapper tag are not entries.
  *
- * The name stops at the first colon. Scope-prefixed names (`plugin:name`) are issue #105's
- * territory and are not split here — none appears in the committed fixture.
+ * An entry may also arrive WITHOUT its description (`- <name>`, no colon) — see
+ * NAME_ONLY_ENTRY, which is tried first.
+ *
+ * For a described entry the name stops at the first colon. Scope-prefixed names
+ * (`plugin:name`) are issue #105's territory and are not split here — none appears in the
+ * committed fixture. A name-only entry is the one exception: there is no description to
+ * separate, so its colons are part of the name.
  * @param {string} text
  * @returns {CatalogEntry[]}
  */
@@ -286,7 +310,7 @@ function parseBulleted(text) {
   for (const raw of text.split('\n')) {
     const line = raw.trim();
     if (REMINDER_TAG.test(line)) continue;
-    const m = line.match(BULLET_ENTRY);
+    const m = line.match(NAME_ONLY_ENTRY) ?? line.match(BULLET_ENTRY);
     if (m) {
       if (cur) flushBulleted(cur, out);
       cur = { name: m[1].trim(), lines: [raw] };

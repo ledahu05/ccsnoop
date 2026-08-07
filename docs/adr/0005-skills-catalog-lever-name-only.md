@@ -4,6 +4,8 @@
 - **Date**: 2026-08-07
 - **Context**: ccsnoop fine-tune — the skills catalog is the first line item of the turn-1 floor
 - **Ticket**: [#105](https://github.com/ledahu05/ccsnoop/issues/105); builds on [#109](https://github.com/ledahu05/ccsnoop/issues/109) (floor ventilation), governed by [ADR-0004](./0004-skill-auto-applies-safe-levers.md)
+- **Confirmed**: [#115](https://github.com/ledahu05/ccsnoop/issues/115) — see the amendment at the
+  end of this ADR
 
 ## Context
 
@@ -131,3 +133,41 @@ invocable, stop paying for its description**.
   whether a false positive is *bounded*, and dynamic proof is how boundedness is usually
   established — but the *action's* reach matters too. Lever 5b has proof and is still
   advice; lever 5a is safe partly because `name-only` is a gentler action than removal.
+
+## Amendment — the reserve is lifted, and measured (#115, 2026-08-07)
+
+Full working: [`docs/research/skill-overrides-name-only.md`](../research/skill-overrides-name-only.md).
+
+**The three facts hold on the bench-pinned version.** All three were re-read on `2.1.220`
+(`bench/SPEC.md` §0) as well as on the local `2.1.224`: same resolver body, and schema
+`describe` strings that are byte-identical between the two builds. The drift the reserve feared
+has started, but has not touched anything this ADR stands on.
+
+**The action is no longer postulated — it is measured on the wire.** Two live arms differing only
+by `skillOverrides`: `dataviz` (bundled) **1 157 → 10 B**, a project skill **674 → 14 B**, the
+whole `skills-catalog` block **5 744 → 3 901 B (−32.1 %)** while naming two skills out of twelve.
+Ten bytes is exactly `- dataviz\n`. Residue: nil. `name-only` therefore recovers **99.2 %** of what
+`off` would recover, without removing the skill — which is the quantified form of this ADR's
+"gentler action" argument. And `/name` was exercised, not merely listed: under `name-only` the
+command still runs, under `off` it is as dead as a command that does not exist.
+
+Three corrections to the record:
+
+1. **The minified symbols quoted in #105's grilling comment (`p4e`, `ho`, `O4_`) are `2.1.224`'s,
+   not `2.1.220`'s.** On `2.1.220` the same code minifies to `jFe`, `eo`, `sPy`. Same code, same
+   behaviour — but a future reader grepping `2.1.220` for `p4e` will find nothing. (This ADR's own
+   body quotes no symbols, so nothing in it is wrong.)
+
+2. **`disableBundledSkills` costs `/name` too.** It drops bundled skills from the slash-command
+   list as well as from the model's, not only from the model's as consequence 5 implies. The
+   advice-tier bulk action of lever 5b must be presented as losing `/dataviz`, not just its
+   description.
+
+3. **The wire measurement was possible only on `2.1.224`** — the sole build installed on the
+   measuring host. The static reads cover both versions and the rendering code is identical in
+   them, so no different delta is expected; re-measure if the bench unpins.
+
+One implementation consequence found while measuring, and fixed in the same change:
+`parseCatalogEntries` required a colon, so a `- name` line was read as a *continuation* and its
+bytes charged to the entry above. That shape is not exotic — Claude Code's own catalog budget
+emits it (`budgetTruncatedSkills`) with no user setting involved.
