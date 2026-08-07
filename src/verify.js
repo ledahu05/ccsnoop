@@ -184,8 +184,11 @@ function relPhrase(rel) {
 
 /**
  * The pure delta core: compute the floor on each side via `computeFloor`, then diff.
- * Turn-1 isolation is inherited from `computeFloor` (each side profiles only its first
- * exchange); the headline delta is the real captured `usage`; the per-block delta is a
+ * Turn-1 isolation is inherited from `computeFloor` — each side profiles only its OPENING,
+ * which is not always its first exchange: an interactive capture starts with a preflight
+ * probe (#107) and a `-p` capture with an auxiliary round-trip (#120), and both sides of a
+ * before/after pair get the same treatment. The headline delta is the real captured
+ * `usage`; the per-block delta is a
  * byte proxy. Never re-tokenizes. Null-safe: a side with no usage yields a null token
  * headline, and the verdict then falls back to the byte proxy — unless that side (or
  * either) also has 0 attributed bytes, in which case the verdict is `'unknown'`: a

@@ -100,6 +100,18 @@ _Avoid_: reminder tag, wrapper
 The test that `floor`'s total and the gain model's total are the same number reached two ways. They differ by route only: `floor` shows the deferred listing whole (the connecting-servers sub-list **folded back in**, its own MCP row dropped), while the gain model splits the same bytes into `catalog` + `mcp`. A span already charged to a lever is *replaced or deducted, never added* — which is what "no byte is counted twice" means operationally (#117, `test/floor.test.js`).
 _Avoid_: the totals check, double-count test
 
+**Prompt surface**:
+A non-empty `tools[]` or a catalog population — the strong signal that a captured request is the **opening**. Deliberately *not* "a non-empty `system[]`", which is also carried by requests that are not the opening (see **Auxiliary round-trip**). Sufficient but not necessary: a legitimate opening can ship neither (a restricted sub-agent, or a run with every tool denied), so a *substantial* `system[]` qualifies too.
+_Avoid_: the floor test, carriesFloor, has tools
+
+**Opening**:
+The request `floor` and `verify` attribute the static floor from — the **first** exchange that either ships a **prompt surface** or is substantial (≥ 4 KB) and ships a `system[]`. First-match, never a session-wide ranking: preferring the strongest signal across the whole capture would let a later sub-agent side-call, which ships its own small `tools[]`, outrank a tool-less opening. Distinct from `exchanges[0]`, which is an **auxiliary round-trip** on both interactive and `-p` captures (#107, #120, `findTurn1`).
+_Avoid_: turn 1 (that is the metric, not the request), the first request, exchanges[0]
+
+**Auxiliary round-trip**:
+A captured request that is not part of the conversation — Claude Code's own side-call. Two shapes, and each broke turn-1 isolation differently: the **interactive preflight** carries neither `tools[]` nor `system[]` (#107), while the one a `claude -p` session opens with carries a real `system[]` and no prompt surface, so it *passed* the #107 test and anchored the floor on ~500 tokens of a call the user never made (#120). `-p` is the shape the probes and the bench use, which is what made the second one costly.
+_Avoid_: preflight (that is only the interactive shape), the probe request, turn 0
+
 **MCP deferred listing**:
 The *"MCP servers still connecting"* sub-list, and nothing else — the only part of the deferred listing an MCP setting can act on. Before #116 the name covered the whole listing, so a repo with no MCP server was told it shipped tens of kilobytes of "MCP"; it now reports zero.
 _Avoid_: the deferred listing (that is the built-in tools population), the MCP block

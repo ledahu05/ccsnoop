@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { floor, computeFloor, renderFloor, DEFAULT_WINDOW_TOKENS } from '../src/floor.js';
 import { buildRequestBlob } from '../src/capture.js';
 import { canonicalize } from '../src/waste.js';
-import { loadSession } from '../src/report.js';
+import { loadSession, parseRequestBlob } from '../src/report.js';
 import { chargedBytes, computeGain } from '../src/finetune-gain.js';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -350,6 +350,163 @@ test('computeFloor falls back to the first substantial exchange when none carrie
   const f = computeFloor({ sessionId: 'degraded', exchanges: [tiny, big] });
   assert.equal(f.turn1Index, 1, 'the substantial exchange, not the tiny one');
   assert.equal(f.headline.tokens, 500, 'usage read from the picked exchange');
+});
+
+// ── computeFloor: the auxiliary round-trip on a `-p` capture (issue #120) ───────
+//
+// #107 fixed the INTERACTIVE preflight, which carries neither tools[] nor system[]. A
+// `claude -p` capture opens with a different parasite: an auxiliary round-trip that
+// ships a real, non-empty `system[]` and NO tools[] and NO catalog. The #107 predicate
+// ("tools[] or system[] non-empty") reads that as the floor and anchors on it, so the
+// whole metric reports the ~500 tokens of an auxiliary call — and `--detail` announces
+// "no catalog blocks" on a capture carrying three.
+//
+// `-p` is the shape the probes and the bench use, so every measurement taken through
+// `floor` on a scripted capture was wrong. The discriminator is the one all three
+// probes had already re-implemented for themselves: the opening ships a real prompt
+// SURFACE — a non-empty tools[] or a catalog — not merely some system[].
+
+/**
+ * The auxiliary round-trip a `-p` session opens with: a real (small) `system[]`, no
+ * tools[], no catalog, and its own usage. Sized from the capture in #120 — ~2.3 KB, under
+ * floor's 4096-byte "substantial" threshold, which is the half of the predicate that
+ * rejects it (its non-empty `system[]` satisfies the other half).
+ */
+function auxiliaryExchange() {
+  return {
+    turn: 1,
+    usage: { inputTokens: 531, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0 },
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(
+        JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          system: [
+            { type: 'text', text: 'You are a helpful assistant.' + 'a'.repeat(600) },
+            { type: 'text', text: 'Analyze the following.' + 'b'.repeat(600) },
+            { type: 'text', text: 'Respond with one word.' + 'c'.repeat(600) },
+          ],
+          messages: [{ role: 'user', content: 'classify this' }],
+        })
+      ),
+    }),
+    segments: [],
+  };
+}
+
+/** A `-p` session: the auxiliary round-trip at [0], the real catalog-carrying opening at [1]. */
+function scriptedModel() {
+  const opening = catalogModel('separate').exchanges[0];
+  return { sessionId: 'scripted', exchanges: [auxiliaryExchange(), { ...opening, turn: 2 }] };
+}
+
+test('computeFloor skips a `-p` capture\'s auxiliary round-trip for the real opening (issue #120)', () => {
+  const f = computeFloor(scriptedModel());
+  assert.equal(f.turns, 2, 'sees both exchanges');
+  assert.equal(f.turn1Index, 1, 'turn-1 is the opening at [1], NOT the auxiliary call at [0]');
+  // The auxiliary call's own usage (531 tokens) is exactly the wrong headline to report.
+  assert.equal(f.headline.tokens, 100, 'headline is the opening\'s usage, not the auxiliary call\'s');
+  const byKind = new Map(f.attribution.map((a) => [a.kind, a]));
+  assert.ok(byKind.has('skills-catalog'), 'the skills catalog is attributed, not missed');
+  assert.ok(byKind.has('deferred-tools'), 'and so is the deferred listing');
+  assert.ok(byKind.has('agent-types'), 'and the agent-types catalog');
+});
+
+test('computeFloor: a non-empty system[] alone no longer anchors turn 1 (issue #120)', () => {
+  // The narrow statement of the regression: the auxiliary exchange satisfies the #107
+  // predicate — `system[]` is non-empty — and must still be rejected. Paired with the
+  // guard below, this pins the criterion as "tools or catalog", not "any system".
+  const aux = auxiliaryExchange();
+  const solo = computeFloor({ sessionId: 'aux-only', exchanges: [aux] });
+  assert.equal(solo.turn1Index, 0, 'alone, it is all there is — floor still renders it');
+  const withOpening = computeFloor({ sessionId: 'both', exchanges: [aux, catalogModel('separate').exchanges[0]] });
+  assert.equal(withOpening.turn1Index, 1, 'given a real opening, the system-only exchange loses');
+});
+
+/**
+ * A tool-less opening: a substantial `system[]`, no tools[], no catalog — a restricted
+ * sub-agent, or a run with every tool denied. Padded well past the byte floor, because
+ * "substantial" is half of what makes it recognizable as an opening at all.
+ */
+function toolLessOpening() {
+  return {
+    turn: 1,
+    usage: { inputTokens: 20000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0 },
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(
+        JSON.stringify({
+          model: 'claude-test',
+          system: [
+            { type: 'text', text: 'harness preamble' + 'H'.repeat(400) },
+            { type: 'text', text: 'Contents of ./CLAUDE.md (project instructions)' + 'C'.repeat(8000) },
+          ],
+          messages: [{ role: 'user', content: 'hello' }],
+        })
+      ),
+    }),
+    segments: [],
+  };
+}
+
+test('computeFloor still anchors an opening that ships system[] but no tools and no catalog (issue #120)', () => {
+  // The guard on the fix: a legitimate opening CAN have an empty tools[]. The richer
+  // criterion must therefore be one WAY of recognizing an opening, not a requirement —
+  // anything stricter would trade #120 for a fresh zeroed floor on those captures.
+  const f = computeFloor({ sessionId: 'tool-less', exchanges: [toolLessOpening()] });
+  assert.equal(f.turn1Index, 0, 'the tool-less opening is still turn 1');
+  assert.equal(f.headline.tokens, 20000, 'and its usage is the headline');
+  const md = f.attribution.find((a) => a.kind === 'claude-md');
+  assert.ok(md && md.bytes > 8000, 'its system[] floor is attributed');
+});
+
+test('computeFloor does not let a later tool-carrying side-call outrank a tool-less opening (issue #120)', () => {
+  // The trap the #120 fix must not fall into. Preferring a prompt surface across the
+  // WHOLE session — rather than taking the first exchange that looks like an opening —
+  // makes any later sub-agent side-call (which ships its own small tools[]) outrank a
+  // legitimate tool-less opening, and re-zeroes exactly the captures the guard above
+  // protects. Selection is first-match on one predicate, not a session-wide preference.
+  const sideCall = {
+    turn: 2,
+    usage: { inputTokens: 300, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 0 },
+    requestBlob: buildRequestBlob({
+      method: 'POST',
+      url: '/v1/messages',
+      rawHeaders: ['Content-Type', 'application/json'],
+      body: Buffer.from(
+        JSON.stringify({
+          model: 'claude-test',
+          system: [{ type: 'text', text: 'sub-agent' }],
+          tools: [{ name: 'Read' }],
+          messages: [{ role: 'user', content: 'x' }],
+        })
+      ),
+    }),
+    segments: [{ slot: 'tool:Read', bytes: 40, kind: 'reused-cached' }],
+  };
+  const f = computeFloor({ sessionId: 'mixed', exchanges: [toolLessOpening(), sideCall] });
+  assert.equal(f.turn1Index, 0, 'the opening at [0], NOT the tool-carrying side-call at [1]');
+  assert.equal(f.headline.tokens, 20000, 'the opening\'s usage, not the side-call\'s 300');
+});
+
+test('computeFloor: an exchange with system[] but under the byte floor is not an opening (issue #120)', () => {
+  // What separates the auxiliary round-trip from a tool-less opening is SIZE — the spec's
+  // "première requête substantielle". Both ship a system[] and neither ships a prompt
+  // surface; only one is a floor. Pinned as its own case so the byte guard cannot be
+  // dropped from the predicate without a failure naming why it was there.
+  const f = computeFloor({ sessionId: 'aux-then-real', exchanges: [auxiliaryExchange(), toolLessOpening()] });
+  assert.equal(f.turn1Index, 1, 'the substantial tool-less opening, not the 2.3 KB auxiliary call');
+});
+
+test('renderFloor --detail no longer claims "no catalog blocks" on a `-p` capture (issue #120)', () => {
+  // The user-visible symptom of #120, verbatim from the report.
+  const out = renderFloor(computeFloor(scriptedModel()), { detail: true }).lines.join('\n');
+  assert.doesNotMatch(out, /no catalog blocks in this floor/i, 'three catalogs are present and broken down');
+  assert.match(out, /skills — Skill tool catalog/, 'the skills catalog is drilled into');
 });
 
 // ── renderFloor: text output ───────────────────────────────────────────────────
